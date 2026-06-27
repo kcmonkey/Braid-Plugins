@@ -1,0 +1,14 @@
+{
+  "id": "knowledge",
+  "name": "Knowledge vault",
+  "version": "1.0.0",
+  "description": "Durable project knowledge vault under .braid/knowledge/: a dormant context provider tells the agent to record reusable facts as notes and read them on demand.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "boardElements": ["knowledge"],
+    "contextProviders": ["knowledge"]
+  }
+}

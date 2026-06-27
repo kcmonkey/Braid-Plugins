@@ -1,0 +1,13 @@
+{
+  "id": "context-ref",
+  "name": "Context provider (reference)",
+  "version": "1.0.0",
+  "description": "Reference context-provider plugin: when enabled, injects a marker block into every turn. The e2e / delete gate for the contextProviders seam — not a real feature.",
+  "defaultEnabled": false,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "contextProviders": ["context-ref"]
+  }
+}

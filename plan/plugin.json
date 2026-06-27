@@ -1,0 +1,15 @@
+{
+  "id": "plan",
+  "name": "Plan",
+  "version": "1.0.0",
+  "description": "Bind a board to a .braid/plans/<name> plan: shows its current phase (read-only) and injects a plan pointer into the board's turns.",
+  "defaultEnabled": false,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "boardElements": ["plan"],
+    "contextProviders": ["plan"],
+    "runPolicies": ["plan"]
+  }
+}

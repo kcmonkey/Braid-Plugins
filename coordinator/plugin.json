@@ -1,0 +1,21 @@
+{
+  "id": "coordinator",
+  "name": "Coordinator",
+  "version": "1.0.0",
+  "description": "Coordinates shared workspace resources across Braid boards.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "agentTools": ["coordinate"],
+    "toolMiddleware": ["coordinationToolMiddleware"],
+    "hostProjectState": ["coordinationState"],
+    "hostServices": ["coordinatorHostService"],
+    "turnContext": ["coordinationContext"],
+    "liveMessages": ["coordinationLiveMessages"],
+    "workspacePanels": ["coordinationPanel"],
+    "workspaceBadges": ["coordinationBadge"],
+    "webviewMessages": ["coordinationWebviewMessages"]
+  }
+}

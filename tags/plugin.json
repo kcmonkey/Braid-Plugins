@@ -1,0 +1,13 @@
+{
+  "id": "tags",
+  "name": "Tags",
+  "version": "1.0.0",
+  "description": "Derive and render board topic tags.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "boardElements": ["tags"]
+  }
+}

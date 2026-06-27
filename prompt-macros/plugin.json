@@ -1,0 +1,13 @@
+{
+  "id": "prompt-macros",
+  "name": "Prompt macros",
+  "version": "1.0.0",
+  "description": "Add configurable prompt buttons to settled boards.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "boardActions": ["prompt-macros"]
+  }
+}

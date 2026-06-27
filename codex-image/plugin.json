@@ -1,0 +1,14 @@
+{
+  "id": "codex-image",
+  "name": "Image Board",
+  "version": "1.0.0",
+  "description": "Generate image artifacts from a board and reuse them as visual input.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "boardForms": ["codex-image"],
+    "boardPins": ["codex-image"]
+  }
+}
