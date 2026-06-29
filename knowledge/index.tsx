@@ -15,6 +15,7 @@ import {
   knowledgeSeedArtifacts,
 } from './methodology';
 import { notesFromEntries, parseKnowledgeIndex, routableKnowledgeEntries, type KnowledgeNote } from './parse';
+import { lessonRecordingGap } from './detect';
 // The full usage doc, shipped IN this plugin (esbuild `.md` text loader inlines it). This is the SSOT;
 // seedArtifacts drops a copy at `.braid/knowledge/_README.md` so the agent reads the convention on demand.
 import USAGE_DOC from './knowledge-usage.md';
@@ -88,6 +89,12 @@ function KnowledgePanel({ boardId, board, api }: { boardId: string; board: Board
         <span style={{ flex: 1 }} />
         {count ? <span className="knowledge-panel__toggle" style={{ color: '#8c857b' }}>{open ? '▾ hide' : '▸ list'}</span> : null}
       </div>
+      {lessonRecordingGap(board) ? (
+        <div className="knowledge-panel__nudge" style={{ marginTop: 6, color: '#e3b341', display: 'flex', gap: 6, lineHeight: 1.4 }}>
+          <span style={{ flexShrink: 0 }}>⚠</span>
+          <span>This turn described lessons but recorded nothing to the vault — if they are durable, RECORD them.</span>
+        </div>
+      ) : null}
       {open && notes && count ? (
         <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3, maxHeight: '32vh', overflow: 'auto' }}>
           {notes.slice(0, 60).map((n, i) => (
@@ -130,7 +137,11 @@ export const knowledgeContextProvider: ContextProviderPlugin<KnowledgeConfig> = 
   manifest,
   defaultConfig: {},
   provide({ board }) {
-    return { text: knowledgeContextText(cachedRoutingEntries(board.elements?.knowledge)) };
+    return {
+      text: knowledgeContextText(cachedRoutingEntries(board.elements?.knowledge), {
+        recordingGap: lessonRecordingGap(board),
+      }),
+    };
   },
   seedArtifacts(): SeedArtifact[] {
     return knowledgeSeedArtifacts(USAGE_DOC);

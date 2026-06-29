@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginManifest, RunPolicyPlugin, SeedArtifact } from '../../../src/plugin-api/types';
 import { boardTurns, hasPendingAsk, latestAnswer, type BoardLike as BoardData } from '../shared/board';
-import { runStep, runArm, MAX_CONTINUES, RUN_DONE_SENTINEL, type RunState } from './runStep';
-import { detectCreatedPlan, planWriteSignal } from './detect';
+import { runStep, runArm, runDoneVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, type RunState } from './runStep';
+import { detectCreatedPlan, latestCreatedPlan, planWriteSignal } from './detect';
 import { planContextText } from './methodology';
 import { firstHeading, parseGates, parsePlanSnapshot, type PlanSnapshot } from './parse';
 // The FULL authoring methodology, shipped IN this plugin (esbuild `.md` text loader inlines it). This is the
@@ -52,6 +52,9 @@ function runOf(state: PlanState | undefined): RunState | undefined {
   const r = (state as { run?: RunState } | undefined)?.run;
   return r && (r.status === 'running' || r.status === 'paused') && typeof r.continues === 'number' ? r : undefined;
 }
+function withoutRun(planId: string, state: PlanState | undefined): PlanState {
+  return { planId, ...(state?.open ? { open: true } : {}) };
+}
 
 // The auto-continue prompt the run loop re-drives with (the loop lives in `planRunPolicy`, driven at the canvas
 // level so a run advances regardless of whether the card is rendered).
@@ -59,11 +62,13 @@ const CONTINUE_PROMPT =
   "Continue the Braid plan execution scope the user requested — do NOT stop to ask for confirmation, and do NOT " +
   "just summarize and wait. Always read current-phase.md and contract.md first. If the user asked to complete " +
   "only the current phase, finish every acceptance gate in current-phase.md, run the phase/global verification " +
-  `the plan requires, then reply with exactly one line containing ${RUN_DONE_SENTINEL} and nothing else. If the ` +
+  "the plan requires, then reply with a concise completion summary covering what changed, which acceptance " +
+  `gates / verification passed, and any remaining gaps. Put exactly ${RUN_DONE_SENTINEL} on the last line, with ` +
+  "no text after it. If the " +
   "user asked to complete the full/entire/whole plan or all phases, then after each phase passes: update " +
   "evidence/history as needed, promote the next Phase Roadmap item into current-phase.md, and keep working. For " +
   `a full-plan run, emit ${RUN_DONE_SENTINEL} only after the roadmap has no remaining phases and global ` +
-  "verification passes. If you genuinely need a human decision, or hit an error you cannot recover from, explain " +
+  "verification passes, again after a concise completion summary and as the final line. If you genuinely need a human decision, or hit an error you cannot recover from, explain " +
   "briefly and stop.";
 
 // Refetch plan files when the board settles, and while live only when this board writes the bound plan files. That
@@ -400,6 +405,13 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
   defaultConfig: {},
   // Also consulted for UNBOUND boards so a board that just created a plan can auto-bind.
   observeUnbound: true,
+  // A board is "running plan X" (for the sequential-overlap warning) only while its run is ACTIVELY `running`.
+  // A paused/absent run is not an overlap — so a board and its own continuation only warn when BOTH are live.
+  runGroupKey(state) {
+    const ps = asPlanState(state);
+    const planId = safePlanId(ps?.planId ?? '');
+    return planId && runOf(ps)?.status === 'running' ? planId : undefined;
+  },
   step({ board, state, interrupted }) {
     const planState = asPlanState(state);
     const planId = safePlanId(planState?.planId ?? '');
@@ -412,20 +424,58 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
       return null;
     }
     const run = runOf(planState);
+    // RE-BIND: a board already bound to plan A that GENERATES a new plan B (writes B/contract.md) should follow B —
+    // the binding tracks the plan the board is actually authoring. Only when SETTLED and NOT mid-run, so an
+    // in-progress execution of A isn't hijacked; switching drops A's run/open state (a fresh plan starts clean). The
+    // detector keys on the most-recent contract.md write, so editing/referencing another plan does NOT switch.
+    if (!run && board.status === 'done') {
+      const created = latestCreatedPlan(board);
+      if (created && created !== planId) return { state: { planId: created } };
+    }
     // `seenTurns` is stamped on every action so arming can EDGE-trigger on a newer turn (see runArm). turnCount
     // grows by one per turn (the arming turn, then each auto-continue), so a stopped/completed turn is "seen".
     const turnCount = boardTurns(board).length;
+    const la = latestAnswer(board);
+    // A board with FEWER turns than when the run last acted was truncated in place by a ChatView fork/split
+    // (splitBoardAtTurn / splitBoardIntoTurnBoards rewrite a board's turns[]). Its answer no longer matches the
+    // run's lastSig, so the auto-continue loop would re-drive it as a phantom "Generating…" turn. A manual
+    // fork/split is the user taking over → pause once. seenTurns stays above the new turn count, so a stale BEGIN
+    // marker now sitting in the top turn can't re-arm it, and the next tick reads `paused` → wait (no churn loop).
+    if (run?.status === 'running' && turnCount < (run.seenTurns ?? 0)) {
+      return { state: { planId, run: { ...run, status: 'paused' } } };
+    }
+    const liveCompletion = (board.status === 'streaming' || board.status === 'waiting') && runDoneVisible(la);
+    if (liveCompletion) {
+      const answerSig = sig(la);
+      if (!(run?.status === 'paused' && run.lastSig === answerSig && run.note === 'completed ✓')) {
+        return {
+          state: { planId, run: { status: 'paused', continues: run?.continues ?? 0, lastSig: answerSig, seenTurns: turnCount, note: 'completed ✓' } },
+          stop: true,
+        };
+      }
+    }
     // Manual Stop (core ■) disarms an active run — otherwise the loop would auto-continue right past the stop.
     // Stamp seenTurns so the just-stopped turn's lingering BEGIN marker can't immediately re-arm (review fix).
     if (interrupted && run?.status === 'running') {
       return { state: { planId, run: { ...run, status: 'paused', seenTurns: turnCount, note: 'paused — you stopped it' } } };
     }
-    const la = latestAnswer(board);
+    // An interrupted board with NO active run but a (possibly stale) BEGIN marker that runArm WOULD fire on must
+    // not auto-(re)start. This is the ChatView fork/split case: truncating a board in place can surface an old
+    // arming turn as the new latest answer, which would otherwise re-arm the run as a phantom "Generating…" turn
+    // (the fork marks the source board interrupted). Stamp it seen so the stale marker can't arm; a genuinely new
+    // run request on a LATER turn still arms (turnCount climbs past seenTurns).
+    if (interrupted && !run && runArm(run, la, turnCount)) {
+      return { state: { planId, run: { status: 'paused', continues: 0, seenTurns: turnCount } } };
+    }
     // ARM by natural language: the agent emits a BRAID_RUN_BEGIN line when YOU ask it to execute the plan. No
     // keyword matching — the agent classifies intent. `runArm` edge-triggers on turnCount > seenTurns so a stale
     // marker (after a Stop / completion) can't restart the run; only a genuinely new request does.
     const armed = runArm(run, la, turnCount);
     if (armed) return { state: { planId, run: armed } };
+    // A paused run note describes the turn it stopped/completed on. Once a newer turn has moved on without
+    // re-arming, the old "you stopped it" / cap / needs-answer label is stale UI state; drop it instead of
+    // continuing to pin the plan header to an old interruption.
+    if (run?.status === 'paused' && turnCount > (run.seenTurns ?? 0)) return { state: withoutRun(planId, planState) };
     // CONTINUE / PAUSE / WAIT. A pending AskUserQuestion is a real human decision → pause. A permission prompt is
     // NOT a pause (continues bypass approvals; turn 1 just waits for your approval, then the run resumes).
     const d = runStep(run, board.status, la, hasPendingAsk(board));
@@ -433,6 +483,6 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
     const next: RunState = { ...d.next, seenTurns: turnCount };
     return d.action === 'continue'
       ? { drive: CONTINUE_PROMPT, state: { planId, run: next }, permissionMode: 'bypassPermissions' }
-      : { state: { planId, run: next } };
+      : { state: { planId, run: next }, ...(d.stop ? { stop: true } : {}) };
   },
 };

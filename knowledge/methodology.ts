@@ -21,6 +21,9 @@ export const KNOWLEDGE_PROTOCOL =
   'RECORD: when you confirm durable knowledge, write or update a typed note with Claim, Scope, Evidence, ' +
   'Metadata, and Keywords. Set lifecycle status (`current`, `stale`, `superseded`, or `disputed`) and update ' +
   '`.braid/knowledge/_index.md`. Update or supersede existing notes instead of duplicating them.\n' +
+  'HONESTY: never say you have recorded, saved, noted, or 记下 a lesson unless you actually wrote it to a ' +
+  '`.braid/knowledge/` note with a file-writing tool in this same turn. If you only described it in prose, say ' +
+  'plainly it is not yet recorded.\n' +
   'RECALL: before relying on memory for project-specific facts, use the routing metadata to choose relevant ' +
   'notes, then read only those note bodies. Ignore non-current notes unless the user asks for history.\n' +
   'The full schema and context-budget rules are in `.braid/knowledge/_README.md` - read it on demand.';
@@ -69,13 +72,28 @@ function routingLine(e: KnowledgeRoutingEntry): string {
   return `- ${e.title}${meta ? ` (${meta})` : ''}`;
 }
 
-export function knowledgeContextText(indexEntries?: readonly (KnowledgeRoutingEntry | string)[]): string {
+// Appended (one line) to the injected context ONLY when the prior settled turn narrated a durable lesson without
+// writing it to the vault (ADR-13). It nudges the agent to RECORD on the next turn or admit it is not recorded;
+// it never auto-writes anything.
+export const KNOWLEDGE_RECORDING_NUDGE =
+  'NOTE: your latest turn described durable lessons but wrote nothing to `.braid/knowledge/`. If they are ' +
+  'durable, reusable, and verified, RECORD them now as typed notes; if they are not durable, say so explicitly ' +
+  'instead of implying they were saved.';
+
+export function knowledgeContextText(
+  indexEntries?: readonly (KnowledgeRoutingEntry | string)[],
+  opts?: { recordingGap?: boolean },
+): string {
   const entries = normalizeRoutingEntries(indexEntries);
-  if (!entries.length) return KNOWLEDGE_PROTOCOL;
-  const listed = entries.slice(0, 40);
-  const list = listed.map(routingLine).join('\n');
-  const omitted = entries.length > listed.length ? `\n- ... ${entries.length - listed.length} more current notes in ${VAULT_INDEX}` : '';
-  return `${KNOWLEDGE_PROTOCOL}\nCurrent vault routing (${entries.length} note${entries.length === 1 ? '' : 's'}; bodies not injected):\n${list}${omitted}`;
+  let text = KNOWLEDGE_PROTOCOL;
+  if (entries.length) {
+    const listed = entries.slice(0, 40);
+    const list = listed.map(routingLine).join('\n');
+    const omitted = entries.length > listed.length ? `\n- ... ${entries.length - listed.length} more current notes in ${VAULT_INDEX}` : '';
+    text += `\nCurrent vault routing (${entries.length} note${entries.length === 1 ? '' : 's'}; bodies not injected):\n${list}${omitted}`;
+  }
+  if (opts?.recordingGap) text += `\n${KNOWLEDGE_RECORDING_NUDGE}`;
+  return text;
 }
 
 export function cachedRoutingEntries(elementState: unknown): KnowledgeRoutingEntry[] {

@@ -12,7 +12,7 @@ import type {
 } from '../../../src/plugin-api/types';
 import type { AgentToolContext } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
-import type { EngineId, WebviewMessage } from '../../../src/protocol';
+import type { EngineId } from '../../../src/protocol';
 import {
   addBoardMessage,
   claimFile,
@@ -21,17 +21,19 @@ import {
   emptyCoordinationState,
   findClaimConflict,
   findResourceClaimConflict,
+  isLiveOwner,
   markStaleClaims,
   matchResourceTriggers,
-  normalizeResourceList,
+  negotiationOriginatorBoardId,
   projectSnapshot,
+  pruneRetiredCoordination,
   releaseBoardClaims,
   releaseBoardTransientClaims,
+  retireBoardCoordination,
   setProviderCapabilities,
   setWorkspaceResources,
   snapshotForCanvas,
   updateNegotiation,
-  upsertWorkIntent,
   type ClaimConflict,
   type CoordinationState,
   type FileClaim,
@@ -44,7 +46,6 @@ import { createCoordinatorLiveMessages, createCoordinatorProjectState, createCoo
 import manifestJson from './plugin.json';
 import { loadWorkspaceResourceCatalog } from './resources';
 import { createCoordinatorToolMiddleware } from './toolMiddleware';
-import { createCoordinatorWebviewMessages, type CoordinatorWebviewMessage } from './webviewMessages';
 
 const COORD_WAIT_CAP_MIN = 15;
 const COORD_WAIT_CAP_MS = COORD_WAIT_CAP_MIN * 60_000;
@@ -113,10 +114,6 @@ class CoordinatorHostService implements HostService {
     return [createCoordinatorLiveMessages()];
   }
 
-  webviewMessages() {
-    return [createCoordinatorWebviewMessages((ctx) => this.handleWebviewMessage(ctx.canvasId, ctx.message))];
-  }
-
   onCanvasReady(canvasId: string): void {
     this.syncWorkspaceResources();
     this.publishCoordination(canvasId);
@@ -160,7 +157,7 @@ class CoordinatorHostService implements HostService {
   }
 
   onBoardAbort(event: HostRunBoardEvent): void {
-    this.releaseBoard(event.canvasId, event.boardId, 'Released after board abort.');
+    this.releaseBoard(event.canvasId, event.boardId, event.message);
   }
 
   onRunSettled(event: HostRunLifecycleEvent): void {
@@ -189,20 +186,6 @@ class CoordinatorHostService implements HostService {
     return true;
   }
 
-  private coordinationClaimRequests(canvasId: string, claim: WebviewMessage & { type: 'coordinationResourceClaim' }): ResourceClaimRequest[] {
-    const actor = claim.claim.actor ?? this.topLevelActor(claim.claim.boardId);
-    const items = claim.claim.claims?.length ? claim.claim.claims : [claim.claim];
-    return items.map((item) => ({
-      ...item,
-      canvasId,
-      boardId: claim.claim.boardId,
-      actor,
-      ttlMs: item.ttlMs ?? claim.claim.ttlMs,
-      priority: item.priority ?? claim.claim.priority,
-      summary: item.summary ?? claim.claim.summary,
-    }));
-  }
-
   private claimResources(reqs: ResourceClaimRequest[]): ReturnType<typeof claimResourceSet> {
     return claimResourceSet(this.coordination, reqs, this.ctx.liveOwnerKeys());
   }
@@ -211,6 +194,7 @@ class CoordinatorHostService implements HostService {
     const now = Date.now();
     const liveOwners = this.ctx.liveOwnerKeys();
     this.coordination = markStaleClaims(this.coordination, now, liveOwners);
+    this.coordination = pruneRetiredCoordination(this.coordination, now); // drop long-dead tombstones (memory-footprint P4)
     this.tryResolveWaiters();
     const canvasIds = workspaceStateTargetCanvases(this.ctx, originCanvasId);
     this.ctx.publishWorkspaceState({
@@ -313,6 +297,10 @@ class CoordinatorHostService implements HostService {
     this.coordination = transientOnly
       ? releaseBoardTransientClaims(this.coordination, canvasId, boardId)
       : releaseBoardClaims(this.coordination, canvasId, boardId);
+    // Part A (retire-on-end): a FULL board end also retires the request footprint it left behind (negotiations it
+    // originated + its conflict/request messages), so other boards stop seeing "<board> requested X" once its
+    // session is gone. Async-idle (transientOnly) keeps it — that board is still a live contender that may resume.
+    if (!transientOnly) this.coordination = retireBoardCoordination(this.coordination, canvasId, boardId);
     let text = summary;
     if (summary || beforeCount) {
       const added = addBoardMessage(this.coordination, {
@@ -514,14 +502,28 @@ class CoordinatorHostService implements HostService {
 
   private coordinationContextForBoard(canvasId: string, boardId: string): string {
     this.syncWorkspaceResources();
-    const snapshot = projectSnapshot(this.coordination, canvasId, Date.now(), this.ctx.liveOwnerKeys());
+    const liveOwners = this.ctx.liveOwnerKeys();
+    const snapshot = projectSnapshot(this.coordination, canvasId, Date.now(), liveOwners);
+    // Part B (liveness backstop): only INJECT a request/negotiation while its ORIGINATING board is a live owner.
+    // Once that board's session is gone (settled/released, not live), its request is a leftover that must not be
+    // narrated to other boards as an active contender. Applied here (agent-facing context) only — the published
+    // snapshot stays the full ledger; Part A keeps it truthful. Claims have their own liveness (markStaleClaims).
+    const ownerLive = (cid: string, bid: string | undefined): boolean => !!bid && isLiveOwner({ canvasId: cid, boardId: bid }, liveOwners);
     const isOwn = (c: { canvasId: string; boardId: string }) => c.canvasId === canvasId && c.boardId === boardId;
-    const activeFiles = snapshot.claims.filter((claim) => claim.status !== 'released');
+    // D21 (file-claim liveness parity): drop OTHER boards' file locks from the agent-facing context once their
+    // owning board is no longer a live owner — a settled board's leftover edit-lock must not be narrated as held
+    // (it self-heals at run-end / TTL). Keep the recipient's OWN claims. Mirrors the Part B gate on messages/negs.
+    const activeFiles = snapshot.claims.filter((claim) =>
+      claim.status !== 'released' && (isOwn(claim) || ownerLive(claim.canvasId, claim.boardId)));
     const ownFiles = activeFiles.filter(isOwn);
     const otherFiles = activeFiles
       .filter((claim) => !isOwn(claim))
       .sort((a, b) => a.boardId.localeCompare(b.boardId) || a.path.localeCompare(b.path))
       .slice(0, 4);
+    // Liveness divergence (ADR-8/ADR-10, deliberate): resource context injection is intentionally NOT gated by
+    // `ownerLive` (unlike the file filter above). Non-live + expired resource claims are already downgraded to
+    // `stale` by `markStaleClaims` inside `projectSnapshot`; a non-live owner's still-within-TTL resource claim is
+    // left visible here on purpose ("保留现语义 / 不收紧资源"). Closing this asymmetry = add `&& ownerLive(...)` here.
     const activeResources = snapshot.resourceClaims.filter((claim) => claim.status !== 'released');
     const ownResources = activeResources.filter(isOwn);
     const ownPending = ownResources.filter((claim) => claim.status === 'pending');
@@ -542,12 +544,16 @@ class CoordinatorHostService implements HostService {
       .filter((message) =>
         !(message.canvasId === canvasId && message.fromBoardId === boardId) &&
         !releaseSuperseded(message) &&
+        // Part B: a conflict(note)/request(question) message from a board that is no longer live is a leftover.
+        ((message.kind !== 'note' && message.kind !== 'question') || ownerLive(message.canvasId, message.fromBoardId)) &&
         (!message.toBoardId || message.toBoardId === boardId || message.relatedResources.some((resource) => resourcesInView.has(resource))))
       .slice(-2);
     const negotiations = snapshot.negotiations
       .filter((thread) =>
         thread.status !== 'resolved' &&
         thread.status !== 'rejected' &&
+        // Part B: only surface a negotiation while its originating (requesting) board is still a live owner.
+        ownerLive(thread.canvasId, negotiationOriginatorBoardId(thread)) &&
         (thread.boardIds.includes(boardId) ||
           thread.relatedResources.some((resource) => resourcesInView.has(resource)) ||
           thread.relatedPaths.some((path) => ownFiles.some((claim) => claim.path === path) || otherFiles.some((claim) => claim.path === path))))
@@ -613,6 +619,7 @@ class CoordinatorHostService implements HostService {
     if (!paths.length) return { matched: false, paths: [], conflicts: [] };
     const actor = this.topLevelActor(boardId, provider);
     const now = Date.now();
+    const liveOwners = this.ctx.liveOwnerKeys();
     const requests = paths.map((path) => ({
       canvasId,
       boardId,
@@ -623,7 +630,7 @@ class CoordinatorHostService implements HostService {
       now,
     }));
     const conflicts = requests
-      .map((req) => findClaimConflict(this.coordination, req))
+      .map((req) => findClaimConflict(this.coordination, req, liveOwners))
       .filter((conflict): conflict is ClaimConflict => !!conflict);
     if (conflicts.length) {
       this.recordFileConflicts(canvasId, boardId, actor, conflicts);
@@ -640,7 +647,7 @@ class CoordinatorHostService implements HostService {
         access: 'edit',
         summary: `${toolName} write`,
         now,
-      });
+      }, liveOwners);
       this.coordination = result.state;
       if (result.conflict) {
         this.recordFileConflicts(canvasId, boardId, actor, [result.conflict]);
@@ -829,83 +836,6 @@ class CoordinatorHostService implements HostService {
         this.emitCoordinationEscalation(canvasId, cycle, cycleResources.length ? cycleResources : [resource], 'deadlock');
       }
     });
-  }
-
-  private handleWebviewMessage(canvasId: string, msg: CoordinatorWebviewMessage): { handled: true } {
-    switch (msg.type) {
-      case 'coordinationIntent':
-        this.coordination = upsertWorkIntent(this.coordination, {
-          ...msg.intent,
-          canvasId,
-          plannedPaths: this.coordinationPathList(msg.intent.plannedPaths),
-          plannedResources: normalizeResourceList(msg.intent.plannedResources),
-        }).state;
-        this.publishCoordination(canvasId);
-        break;
-      case 'coordinationMessage':
-        this.coordination = addBoardMessage(this.coordination, {
-          ...msg.message,
-          canvasId,
-          relatedPaths: this.coordinationPathList(msg.message.relatedPaths),
-          relatedResources: normalizeResourceList(msg.message.relatedResources),
-        }).state;
-        this.publishCoordination(canvasId);
-        break;
-      case 'coordinationResourceClaim': {
-        this.syncWorkspaceResources();
-        const actor = msg.claim.actor ?? this.topLevelActor(msg.claim.boardId);
-        const result = this.claimResources(this.coordinationClaimRequests(canvasId, msg));
-        this.coordination = result.state;
-        this.recordResourceConflicts(canvasId, msg.claim.boardId, actor, result.claims, result.conflicts, msg.claim.summary);
-        this.publishCoordination(canvasId);
-        break;
-      }
-      case 'coordinationNegotiate': {
-        const existing = !!msg.negotiation.id &&
-          this.coordination.negotiations.some((thread) => thread.canvasId === canvasId && thread.id === msg.negotiation.id);
-        if (msg.negotiation.action !== 'propose' && !existing) {
-          this.coordination = addBoardMessage(this.coordination, {
-            canvasId,
-            fromBoardId: msg.negotiation.actor?.boardId ?? msg.negotiation.boardIds[0] ?? 'unknown',
-            kind: 'note',
-            text: `Ignored ${msg.negotiation.action} for unknown negotiation ${msg.negotiation.id ?? '(missing id)'}.`,
-          }).state;
-          this.publishCoordination(canvasId);
-          break;
-        }
-        this.coordination = updateNegotiation(this.coordination, {
-          ...msg.negotiation,
-          canvasId,
-          relatedPaths: this.coordinationPathList(msg.negotiation.relatedPaths),
-          relatedResources: normalizeResourceList(msg.negotiation.relatedResources),
-        }).state;
-        this.publishCoordination(canvasId);
-        break;
-      }
-      case 'coordinationRelease':
-        this.releaseBoard(canvasId, msg.release.boardId, msg.release.summary);
-        break;
-      case 'coordinationWait':
-        this.coordination = addBoardMessage(this.coordination, {
-          canvasId,
-          fromBoardId: msg.wait.boardId,
-          toBoardId: msg.wait.targetBoardId,
-          kind: 'status',
-          text: msg.wait.reason ?? 'Waiting for coordination.',
-        }).state;
-        this.publishCoordination(canvasId);
-        break;
-      case 'coordinationOverride':
-        this.coordination = addBoardMessage(this.coordination, {
-          canvasId,
-          fromBoardId: msg.override.boardId,
-          kind: 'note',
-          text: msg.override.reason ?? 'Override requested. User confirmation is required before any lock is bypassed.',
-        }).state;
-        this.publishCoordination(canvasId);
-        break;
-    }
-    return { handled: true };
   }
 }
 

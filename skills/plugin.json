@@ -1,0 +1,14 @@
+{
+  "id": "skills",
+  "name": "Skills",
+  "version": "1.0.0",
+  "description": "Provider-neutral agent skills under .braid/skills/: a dormant context provider lists available skills (name + description) so the agent reads and follows the right SKILL.md on demand, on any engine.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "boardElements": ["skills"],
+    "contextProviders": ["skills"]
+  }
+}

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runStep, runArm, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, RUN_BEGIN_SENTINEL, type RunState } from './runStep';
+import { runStep, runArm, runDoneVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, RUN_BEGIN_SENTINEL, type RunState } from './runStep';
 
 const running = (over: Partial<RunState> = {}): RunState => ({ status: 'running', continues: 0, ...over });
 
@@ -53,6 +53,26 @@ describe('runStep — Plan run controller safety state machine (P3c / Gap E)', (
     const d = runStep(running({ continues: 1 }), 'done', `all gates pass.\n${RUN_DONE_SENTINEL}`, false);
     expect(d.action).toBe('pause');
     expect(d.action === 'pause' && d.next.note).toContain('completed');
+  });
+
+  it('PAUSES and asks the driver to stop when completion is visible before the live turn settles', () => {
+    const d = runStep(running({ continues: 1 }), 'streaming', `final report\n${RUN_DONE_SENTINEL}`, false);
+    expect(d.action).toBe('pause');
+    expect(d.action === 'pause' && d.stop).toBe(true);
+    expect(d.action === 'pause' && d.next.note).toContain('completed');
+  });
+
+  it('recognizes the observed whitespace completion marker variant', () => {
+    expect(runDoneVisible('final report\nBRAID RUN DONE')).toBe(true);
+    const d = runStep(running({ continues: 1 }), 'streaming', 'final report\nBRAID RUN DONE', false);
+    expect(d.action).toBe('pause');
+    expect(d.action === 'pause' && d.stop).toBe(true);
+  });
+
+  it('asks the driver to stopWaiting when completion is visible during a waiting hold', () => {
+    const d = runStep(running({ continues: 1 }), 'waiting', `final report\n${RUN_DONE_SENTINEL}`, false);
+    expect(d.action).toBe('pause');
+    expect(d.action === 'pause' && d.stop).toBe(true);
   });
 
   it('PAUSES at the hard cap — a runaway is structurally impossible', () => {

@@ -21,6 +21,8 @@ describe('plan methodology run scope', () => {
     expect(text).toContain('promote the next roadmap item into current-phase.md');
     expect(text).toContain(`Emit a line containing exactly ${RUN_DONE_SENTINEL} only when`);
     expect(text).toContain('every roadmap phase is complete');
+    expect(text).toContain('Before that final marker, include a concise execution summary');
+    expect(text).toContain('final line');
   });
 
   it('routes bound-board plan context without forcing every tactical task through the plan', () => {

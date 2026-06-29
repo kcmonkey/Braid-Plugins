@@ -68,7 +68,9 @@ function boundBlock(planId: string): string {
     `phase passes, update evidence/history as needed, promote the next roadmap item into current-phase.md, and ` +
     `continue without stopping for confirmation. Emit a line containing exactly ${RUN_DONE_SENTINEL} only when ` +
     `the requested scope is complete: for current-phase scope, every current-phase gate passes; for full-plan ` +
-    `scope, every roadmap phase is complete and global verification passes. If you are only discussing or ` +
+    `scope, every roadmap phase is complete and global verification passes. Before that final marker, include ` +
+    `a concise execution summary covering what changed, which acceptance gates / verification passed, and any ` +
+    `remaining gaps; make ${RUN_DONE_SENTINEL} the final line with no text after it. If you are only discussing or ` +
     `answering a question, do NOT emit either marker.\n` +
     `When a decision is locked in, append it to .braid/plans/${planId}/decisions.md as a new ` +
     `\`## ADR-<n> — <Title>\` block (Status / Decision / Why / Implications) using the next number.`

@@ -41,7 +41,7 @@ function makeHarness(project: string, opts: {
   const tool = service.agentTools?.()[0] as AgentToolPlugin<Record<string, unknown>>;
   const call = (canvasId: string, boardId: string, args: Record<string, unknown>, signal = new AbortController().signal): Promise<AgentToolResult> =>
     tool.call({ canvasId, boardId, turnIndex: 0, provider: 'claude', signal }, args);
-  return { service, call, delivered, states };
+  return { service, call, delivered, states, liveKeys };
 }
 
 describe('coordinator host service', () => {
@@ -97,6 +97,82 @@ describe('coordinator host service', () => {
 
       expect(result.result).toContain('notified now');
       expect(delivered.map((msg) => msg.targetKey)).toEqual(['c1::target']);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('Part A: a finished board\'s request negotiation/messages are retired on run settle', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-coord-retire-'));
+    try {
+      writeResources(project, [{ id: 'editor', kind: 'state', states: ['open', 'closed'] }]);
+      const { service, call, states } = makeHarness(project, { liveKeys: ['c1::requester'] });
+
+      await call('c1', 'requester', { action: 'request', resource: 'editor', text: 'please free the editor' });
+      let snap = states.at(-1)!.data as any;
+      expect(snap.negotiations.some((n: any) => n.boardIds.includes('requester') && n.status === 'proposed')).toBe(true);
+      expect(snap.messages.some((m: any) => m.fromBoardId === 'requester' && m.kind === 'question')).toBe(true);
+
+      // The requester's run ends → Part A resolves the negotiation it originated and drops its request message,
+      // so other boards stop seeing "requester requested editor" once its session is gone.
+      service.onRunSettled?.({ canvasId: 'c1', boardIds: ['requester'], provider: 'claude' });
+      snap = states.at(-1)!.data as any;
+      expect(snap.negotiations.find((n: any) => n.boardIds.includes('requester'))?.status).toBe('resolved');
+      expect(snap.messages.some((m: any) => m.fromBoardId === 'requester' && m.kind === 'question')).toBe(false);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('Part B: a non-live board\'s request is NOT injected into another board\'s context (panel ledger keeps it)', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-coord-livegate-'));
+    try {
+      writeResources(project, [{ id: 'editor', kind: 'state', states: ['open', 'closed'] }]);
+      // Only `viewer` is a live owner; `holder`/`requester` issued claims but are no longer running.
+      const { call, states } = makeHarness(project, { liveKeys: ['c1::viewer'] });
+
+      await call('c1', 'holder', { action: 'claim', resource: 'editor', mode: 'state', desiredState: 'closed' });
+      await call('c1', 'requester', { action: 'claim', resource: 'editor', mode: 'state', desiredState: 'open' });
+
+      const status = await call('c1', 'viewer', { action: 'status' });
+      // Part B: requester is not live → its conflict negotiation/request is NOT narrated to viewer's context.
+      expect(status.result).not.toContain('Resource conflict: editor');
+      expect(status.result).not.toMatch(/requester requested/);
+      // But the published snapshot (panel ledger) still records it — Part B is injection-only.
+      const snap = states.at(-1)!.data as any;
+      expect(snap.negotiations.some((n: any) => n.topic === 'Resource conflict: editor')).toBe(true);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('D21: a settled board\'s file edit-lock stops blocking live boards and leaves their context', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-coord-file-livegate-'));
+    try {
+      writeResources(project, []);
+      const { service, liveKeys } = makeHarness(project, { liveKeys: ['c1::holder'] });
+      const gate = service.toolMiddleware!()[0];
+      const turnContext = service.turnContext!()[0];
+      const sig = new AbortController().signal;
+      const edit = (boardId: string) => gate.gateToolUse!({
+        canvasId: 'c1', boardId, source: 'preToolUse', toolName: 'Edit',
+        input: { file_path: 'src/shared.ts' }, signal: sig,
+      });
+
+      // holder (live) takes the edit-lock; a second LIVE board's write to the same file is blocked.
+      await edit('holder');
+      const blockedWhileLive = await edit('writer');
+      expect((blockedWhileLive as any)?.deny).toBe(true);
+
+      // holder's run ends → no longer a live owner, but its claim is still in state (a missed/late release).
+      liveKeys.delete('c1::holder');
+
+      // The settled holder's leftover lock no longer blocks a live board's write...
+      const afterSettle = await edit('writer2');
+      expect((afterSettle as any)?.deny).toBeFalsy();
+      // ...and is not narrated into another live board's injected coordination context.
+      const ctxText = turnContext.provideTurnContext?.({ canvasId: 'c1', boardId: 'viewer' }) ?? '';
+      expect(ctxText).not.toContain('src/shared.ts');
     } finally {
       fs.rmSync(project, { recursive: true, force: true });
     }

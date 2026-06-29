@@ -11,6 +11,10 @@ import type { BoardLike as BoardData, ToolStepLike as ToolStep } from '../shared
 //  - If writes touch EXACTLY ONE plan id, return it; zero or several (ambiguous) → undefined (do not bind).
 
 const PLAN_DIR = /(?:^|\/)\.braid\/plans\/([^/]+)\//;
+const PLAN_DIR_IN_TEXT = /(?:^|[^a-zA-Z0-9._-])\.braid\/plans\/([^/\\\s"'`;&|]+)\//g;
+const SHELL_WRITE_SEGMENT = /\b(?:Set-Content|Add-Content|Out-File|New-Item|mkdir|md|touch|tee|install)\b[^\r\n;&|]*/gi;
+const SHELL_SED_INPLACE_SEGMENT = /\bsed\b[^\r\n;&|]*\s-i\b[^\r\n;&|]*/gi;
+const SHELL_REDIRECT_SEGMENT = /(?:^|[\s;&|])(?:\d?>|>>)(?!=)[ \t]*[^\r\n;&|]*/g;
 
 export function writePathsOf(step: ToolStep): string[] {
   const input = step.input ?? {};
@@ -29,7 +33,40 @@ export function writePathsOf(step: ToolStep): string[] {
       }
     }
   }
+  out.push(...shellWritePlanPaths(step));
   return out;
+}
+
+function commandTextOf(step: ToolStep): string | undefined {
+  const input = step.input ?? {};
+  const command = (input as { command?: unknown }).command;
+  if (typeof command === 'string') return command;
+  if (Array.isArray(command)) return command.filter((c) => typeof c === 'string').join(' ');
+  return undefined;
+}
+
+function planPathsInText(text: string): string[] {
+  const found = new Set<string>();
+  for (const m of text.replace(/\\/g, '/').matchAll(PLAN_DIR_IN_TEXT)) {
+    const id = m[1];
+    if (id && !id.startsWith('_') && !id.startsWith('.')) found.add(`.braid/plans/${id}/`);
+  }
+  return [...found];
+}
+
+function shellWritePlanPaths(step: ToolStep): string[] {
+  const name = step.name;
+  if (name !== 'Bash' && name !== 'PowerShell' && name !== 'Command') return [];
+  const command = commandTextOf(step);
+  if (!command) return [];
+  const found = new Set<string>();
+  const scan = (segment: string) => {
+    for (const p of planPathsInText(segment)) found.add(p);
+  };
+  for (const m of command.matchAll(SHELL_WRITE_SEGMENT)) scan(m[0]);
+  for (const m of command.matchAll(SHELL_SED_INPLACE_SEGMENT)) scan(m[0]);
+  for (const m of command.matchAll(SHELL_REDIRECT_SEGMENT)) scan(m[0]);
+  return [...found];
 }
 
 function planIdFromPath(path: string): string | undefined {
@@ -76,4 +113,23 @@ export function detectCreatedPlan(board: BoardData): string | undefined {
     if (id) found.add(id);
   }
   return found.size === 1 ? [...found][0] : undefined;
+}
+
+// The id of the MOST RECENTLY GENERATED plan in this board — used to RE-BIND a board that is ALREADY bound to one
+// plan but then generates another (the binding should follow the new plan). The reliable "a NEW plan was generated"
+// signal is a write to that plan's `contract.md`: contract.md is the mandatory scaffold file of every Braid plan, so
+// a write to it means the agent authored a plan there. Editing a plan's OTHER files (current-phase.md / evidence /
+// decisions / history) is NOT creation and is ignored here — that's what keeps a board from false-switching when it
+// merely edits or references a different plan. Scans top-level + turns[] steps IN ORDER (same source as detect/
+// signal); the LAST contract.md write wins. Shell-created plans aren't covered (writePathsOf yields only the dir for
+// shell, so contract.md can't be confirmed) — those still first-bind via detectCreatedPlan and re-bind manually.
+export function latestCreatedPlan(board: BoardData): string | undefined {
+  let latest: string | undefined;
+  for (const { path } of boardWriteSteps(board)) {
+    const norm = path.replace(/\\/g, '/');
+    if (!/\/contract\.md$/.test(norm)) continue;
+    const id = planIdFromPath(norm);
+    if (id) latest = id;
+  }
+  return latest;
 }

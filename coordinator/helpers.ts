@@ -1,6 +1,6 @@
 import * as nodePath from 'path';
 import type { HostServiceContext } from '../../../src/plugin-api/types';
-import { normalizeWorkspacePath } from './model';
+import { normalizeWorkspacePath, ownerKey } from './model';
 
 const hasWindowsPathSyntax = (p: string): boolean => /^[a-z]:[\\/]/i.test(p) || /^\\\\/.test(p) || p.includes('\\');
 
@@ -10,8 +10,10 @@ const pathOpsFor = (cwd: string, filePath: string): typeof nodePath.win32 | type
 const isInsideRelative = (ops: typeof nodePath.win32 | typeof nodePath.posix, rel: string): boolean =>
   !!rel && rel !== '..' && !rel.startsWith(`..${ops.sep}`) && !ops.isAbsolute(rel);
 
+// Same board-identity key shape as the host's live-owner / live-board sets — delegated to the model `ownerKey`
+// chokepoint so the `${canvasId}::${boardId}` format has exactly one definition.
 export function actorKey(canvasId: string, boardId: string): string {
-  return `${canvasId}::${boardId}`;
+  return ownerKey({ canvasId, boardId });
 }
 
 export function coordinationPath(cwd: string, filePath: string): string {

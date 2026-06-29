@@ -5,6 +5,7 @@
 
 export const MAX_CONTINUES = 6;
 export const RUN_DONE_SENTINEL = 'BRAID_RUN_DONE';
+const RUN_DONE_SENTINEL_ALIASES = ['BRAID RUN DONE'];
 // The agent emits this (told via the plan context provider) when the USER asks it to EXECUTE/RUN the plan — as
 // opposed to merely discussing it. That is what ARMS the auto-continue loop, so a run starts from natural
 // language ("run the plan" / "一口气跑完") rather than a button. The agent classifies intent (it understands the
@@ -23,9 +24,14 @@ function sentinelOnLine(text: string, sentinel: string): boolean {
   return new RegExp(`^\\s*${sentinel}\\s*$`, 'm').test(text);
 }
 
+export function runDoneVisible(text: string): boolean {
+  return sentinelOnLine(text, RUN_DONE_SENTINEL)
+    || RUN_DONE_SENTINEL_ALIASES.some((sentinel) => sentinelOnLine(text, sentinel));
+}
+
 export type RunDecision =
   | { action: 'continue'; next: RunState } // persist `next`, then re-drive the board
-  | { action: 'pause'; next: RunState }    // persist `next` (paused), do NOT re-drive
+  | { action: 'pause'; next: RunState; stop?: boolean } // persist `next`; optionally stop the live turn
   | { action: 'wait' };                    // do nothing this render
 
 // FNV-1a hash of a settled turn's answer. `lastSig` makes each settled turn drive AT MOST ONCE — the guard
@@ -64,14 +70,17 @@ export function runArm(run: RunState | undefined, answer: string, turnCount: num
 export function runStep(run: RunState | undefined, status: string, answer: string, needsUser: boolean): RunDecision {
   if (!run || run.status !== 'running') return { action: 'wait' };
   if (needsUser) return { action: 'pause', next: { ...run, status: 'paused', note: 'paused — needs your answer' } };
+  const s = sig(answer);
+  if (runDoneVisible(answer)) {
+    const next = { ...run, status: 'paused' as const, lastSig: s, note: 'completed ✓' };
+    return { action: 'pause', next, ...(status === 'streaming' || status === 'waiting' ? { stop: true } : {}) };
+  }
   // `waiting` = the board launched a background task / scheduled wakeup and is holding its session to AUTO-RESUME;
   // it is NOT a blocker — wait it out (it settles to `done` later) rather than pausing. (was a wrong pause before)
   if (status === 'streaming' || status === 'idle' || status === 'waiting') return { action: 'wait' };
   if (status === 'error') return { action: 'pause', next: { ...run, status: 'paused', note: 'paused — error' } };
   // status === 'done'
-  const s = sig(answer);
   if (run.lastSig === s) return { action: 'wait' };
-  if (sentinelOnLine(answer, RUN_DONE_SENTINEL)) return { action: 'pause', next: { ...run, status: 'paused', lastSig: s, note: 'completed ✓' } };
   if (run.continues >= MAX_CONTINUES) return { action: 'pause', next: { ...run, status: 'paused', lastSig: s, note: `paused — hit the ${MAX_CONTINUES}-continue cap` } };
   return { action: 'continue', next: { ...run, continues: run.continues + 1, lastSig: s, note: undefined } };
 }

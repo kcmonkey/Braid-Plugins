@@ -106,6 +106,18 @@ describe('plan parse', () => {
     expect(matchPhaseIndex(phases, 'Phase 9 — out of range')).toBe(0); // ordinal out of range → fall back; no overlap → 0
   });
 
+  it('does not let a stale leading ordinal override a strong current-phase content match', () => {
+    const phases = [
+      'Establish the current BP impact boundary, then expand ShadowCompare from rig binding to behavior snapshots for the VR seams that will move: pose/tick',
+      'Move VR pose sampling + tick orchestration ownership into UVRComponent; AZomboyVRCharacter forwards and remains Legacy-authoritative until compare is green.',
+      'Move motion-controller offsets, hand pose, and gunstock ergonomics into UVRComponent; preserve existing control-setting replication and local tuning behavior.',
+    ];
+    expect(matchPhaseIndex(phases, [
+      'Phase 1 - Controller, Hand Pose, and Gunstock Ownership',
+      'Move motion-controller offsets, hand-pose calculation, and gunstock/control-setting ergonomics into UVRComponent.',
+    ].join('\n'))).toBe(3);
+  });
+
   it('matchPhaseIndex locates the current phase by word overlap, 0 when unsure', () => {
     const phases = [
       'Phase 1: Plugin skeleton + context provider + seeded usage doc + registration, enabled',

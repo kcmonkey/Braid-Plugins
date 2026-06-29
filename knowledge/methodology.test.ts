@@ -77,6 +77,20 @@ describe('knowledge methodology', () => {
     expect(VAULT_INDEX).toBe('.braid/knowledge/_index.md');
     expect(README_PATH).toBe('.braid/knowledge/_README.md');
   });
+
+  it('includes an honesty clause forbidding unverified recording claims', () => {
+    expect(KNOWLEDGE_PROTOCOL).toMatch(/HONESTY/);
+    expect(KNOWLEDGE_PROTOCOL).toMatch(/not yet recorded/);
+  });
+
+  it('appends a bounded recording-gap nudge only when requested, leaving no-gap output unchanged', () => {
+    expect(knowledgeContextText()).toBe(KNOWLEDGE_PROTOCOL);
+    const gap = knowledgeContextText([], { recordingGap: true });
+    expect(gap.startsWith(KNOWLEDGE_PROTOCOL)).toBe(true);
+    expect(gap).toContain('wrote nothing to `.braid/knowledge/`');
+    // exactly one extra line appended
+    expect(gap.split('\n').length).toBe(KNOWLEDGE_PROTOCOL.split('\n').length + 1);
+  });
 });
 
 describe('knowledge seed + manifest', () => {

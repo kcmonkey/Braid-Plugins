@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { BoardLike as BoardData, ToolStepLike as ToolStep } from '../shared/board';
-import { detectCreatedPlan, planWriteSignal } from './detect';
+import { detectCreatedPlan, latestCreatedPlan, planWriteSignal } from './detect';
 
 function board(steps: ToolStep[]): BoardData {
   return { prompt: '', answer: '', status: 'done', steps } as unknown as BoardData;
@@ -28,10 +28,32 @@ describe('detectCreatedPlan', () => {
     expect(detectCreatedPlan(b)).toBe('p1');
   });
 
+  it('binds when a shell command writes a plan file', () => {
+    const b = board([step('Bash', {
+      command: "@'x'@ | Set-Content -LiteralPath 'D:\\proj\\.braid\\plans\\quest-ios-store\\contract.md'",
+      action: 'run',
+    })]);
+    expect(detectCreatedPlan(b)).toBe('quest-ios-store');
+  });
+
+  it('binds when shell redirection writes a plan file', () => {
+    const b = board([step('Bash', { command: "printf x > '.braid/plans/quest-ios-store/current-phase.md'" })]);
+    expect(detectCreatedPlan(b)).toBe('quest-ios-store');
+  });
+
   it('ignores reads/searches of a plan (opening is not creating)', () => {
     const b = board([
       step('Read', { file_path: '.braid/plans/p1/contract.md' }),
       step('Grep', { pattern: 'x', path: '.braid/plans/p1' }),
+    ]);
+    expect(detectCreatedPlan(b)).toBeUndefined();
+  });
+
+  it('ignores read/list/search shell commands that mention plan paths', () => {
+    const b = board([
+      step('Bash', { command: 'Get-Content .braid/plans/p1/contract.md', action: 'read' }),
+      step('Bash', { command: 'rg -n "Goal" .braid/plans/p1', action: 'search' }),
+      step('Bash', { command: 'Get-ChildItem .braid/plans', action: 'list' }),
     ]);
     expect(detectCreatedPlan(b)).toBeUndefined();
   });
@@ -41,6 +63,13 @@ describe('detectCreatedPlan', () => {
       step('Write', { file_path: '.braid/plans/a/contract.md' }),
       step('Write', { file_path: '.braid/plans/b/contract.md' }),
     ]);
+    expect(detectCreatedPlan(b)).toBeUndefined();
+  });
+
+  it('is ambiguous when one shell command writes two different plans', () => {
+    const b = board([step('Bash', {
+      command: "Set-Content .braid/plans/a/contract.md x; Set-Content .braid/plans/b/current-phase.md y",
+    })]);
     expect(detectCreatedPlan(b)).toBeUndefined();
   });
 
@@ -106,5 +135,55 @@ describe('detectCreatedPlan', () => {
 
     targetWrite.result = 'edited';
     expect(planWriteSignal(b, 'p1')).toContain(':done:6:0');
+  });
+
+  it('latestCreatedPlan returns the most recently generated plan (last contract.md write wins)', () => {
+    // A board bound to plan A later generates plan B — the binding should follow B. Scans turns in order.
+    const b = {
+      prompt: '', answer: '', status: 'done',
+      turns: [
+        { prompt: 'make plan A', answer: 'ok', steps: [step('Write', { file_path: '.braid/plans/a/contract.md' })] },
+        { prompt: 'now make plan B', answer: 'ok', steps: [
+          step('Write', { file_path: '.braid/plans/b/contract.md' }),
+          step('Write', { file_path: '.braid/plans/b/current-phase.md' }),
+        ] },
+      ],
+    } as unknown as BoardData;
+    expect(latestCreatedPlan(b)).toBe('b');
+  });
+
+  it('latestCreatedPlan ignores non-contract writes (editing/referencing another plan is not creation)', () => {
+    // Bound to A (wrote A/contract.md), then only edits B's current-phase.md + adds B evidence — NOT a new plan.
+    const b = board([
+      step('Write', { file_path: '.braid/plans/a/contract.md' }),
+      step('Edit', { file_path: '.braid/plans/b/current-phase.md' }),
+      step('Write', { file_path: '.braid/plans/b/evidence/note.md' }),
+    ]);
+    expect(latestCreatedPlan(b)).toBe('a');
+  });
+
+  it('latestCreatedPlan is undefined when no contract.md was written', () => {
+    const b = board([
+      step('Write', { file_path: '.braid/plans/a/current-phase.md' }),
+      step('Edit', { file_path: '.braid/plans/a/evidence/x.md' }),
+    ]);
+    expect(latestCreatedPlan(b)).toBeUndefined();
+  });
+
+  it('latestCreatedPlan handles Codex fileChange + Windows paths', () => {
+    const b = board([
+      step('fileChange', { changes: [{ path: '.braid/plans/old/contract.md' }] }),
+      step('Write', { file_path: 'D:\\proj\\.braid\\plans\\fresh-one\\contract.md' }),
+    ]);
+    expect(latestCreatedPlan(b)).toBe('fresh-one');
+  });
+
+  it('planWriteSignal includes shell writes to the target plan', () => {
+    const shell = step('Bash', { command: "Set-Content .braid/plans/p1/current-phase.md '# Current Phase'", action: 'run' });
+    const b = board([shell]);
+    expect(planWriteSignal(b, 'p1')).toContain('.braid/plans/p1/:pending');
+
+    shell.result = 'ok';
+    expect(planWriteSignal(b, 'p1')).toContain(':done:2:0');
   });
 });

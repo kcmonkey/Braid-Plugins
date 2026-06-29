@@ -106,35 +106,46 @@ function sigWords(s: string): Set<string> {
 export function matchPhaseIndex(phases: string[], phaseName?: string): number {
   if (!phases.length) return 0;
   const name = phaseName ?? '';
-  // Strongest signal: the current-phase name often carries its ordinal ("Phase 2 — …", "P2:"). If present and in
-  // range, trust it directly — more reliable than word overlap when several roadmap items share wording (e.g.
-  // "AI parallel slice" vs "Player parallel slice"). Falls back to overlap when the name has no leading ordinal.
-  const ord = name.match(/^\s*(?:phase|p)\s*0*(\d{1,3})\b/i);
-  if (ord) {
-    const n = parseInt(ord[1], 10);
-    if (n >= 1 && n <= phases.length) return n;
-  }
   const target = sigWords(name);
-  if (!target.size) return 0;
-  let best = 0;
-  let bestScore = 1;
-  phases.forEach((p, i) => {
+  const scorePhase = (p: string): number => {
     const w = sigWords(p);
     let score = 0;
     for (const t of target) if (w.has(t)) score++;
-    if (score > bestScore) { bestScore = score; best = i + 1; }
-  });
+    return score;
+  };
+  let best = 0;
+  let bestScore = 1;
+  if (target.size) {
+    phases.forEach((p, i) => {
+      const score = scorePhase(p);
+      if (score > bestScore) { bestScore = score; best = i + 1; }
+    });
+  }
+  // Strong signal: the current-phase name often carries its ordinal ("Phase 2 — …", "P2:"). Trust it directly
+  // unless the current phase text/goal has a clearly stronger content match elsewhere; this catches stale copied
+  // headings like "Phase 5 - ..." after the agent already promoted the phase body to Phase 7.
+  const ord = name.match(/^\s*(?:phase|p)\s*0*(\d{1,3})\b/i);
+  if (ord) {
+    const n = parseInt(ord[1], 10);
+    if (n >= 1 && n <= phases.length) {
+      const ordinalScore = target.size ? scorePhase(phases[n - 1]) : 0;
+      if (best && best !== n && bestScore >= 3 && bestScore >= ordinalScore + 2) return best;
+      return n;
+    }
+  }
+  if (!target.size) return 0;
   return best;
 }
 
 export function parsePlanSnapshot(docs: { phaseMd: string; decisionsMd: string; contractMd: string }): PlanSnapshot {
   const gates = parseGates(docs.phaseMd);
   const phase = firstHeading(docs.phaseMd);
+  const phaseGoal = parseSection(docs.phaseMd, PHASE_GOAL_HEADING) || undefined;
   const phases = parsePhases(docs.contractMd);
   return {
     phase,
     goal: parseSection(docs.contractMd, GOAL_HEADING) || undefined,
-    phaseGoal: parseSection(docs.phaseMd, PHASE_GOAL_HEADING) || undefined,
+    phaseGoal,
     gates,
     done: gates.filter((g) => g.done).length,
     total: gates.length,
@@ -143,6 +154,6 @@ export function parsePlanSnapshot(docs: { phaseMd: string; decisionsMd: string; 
     // Carry-Forward); merge both, contract first.
     deferred: [...parseDeferred(docs.contractMd), ...parseDeferred(docs.phaseMd)],
     phases,
-    phaseIndex: matchPhaseIndex(phases, phase),
+    phaseIndex: matchPhaseIndex(phases, [phase, phaseGoal].filter(Boolean).join('\n')),
   };
 }
