@@ -80,6 +80,7 @@ export const codexImagePinPlugin: BoardPinPlugin<CodexImageConfig> = {
           id: 'generated-image',
           kind: 'source' as const,
           dataType: 'image',
+          autoAttachToChild: true,
           position: 'right' as const,
           offsetPct: IMAGE_PIN_OFFSET_PCT,
           title: 'Generated image',

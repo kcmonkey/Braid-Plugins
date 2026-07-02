@@ -9,6 +9,10 @@
   "runtime": "builtin",
   "contributes": {
     "boardElements": ["knowledge"],
-    "contextProviders": ["knowledge"]
+    "contextProviders": ["knowledge"],
+    "toolMiddleware": ["knowledgeUsageMiddleware"],
+    "hostServices": ["knowledgeUsageHostService"],
+    "workspacePanels": ["knowledgeUsagePanel"],
+    "workspaceBadges": ["knowledgeUsageBadge"]
   }
 }

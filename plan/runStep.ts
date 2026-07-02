@@ -15,7 +15,7 @@ export const RUN_BEGIN_SENTINEL = 'BRAID_RUN_BEGIN';
 // `seenTurns` = the board's turn count at the last action this run took (arm / continue / pause / stop). Arming
 // is EDGE-triggered on it: a run arms only on a turn NEWER than `seenTurns`, so a stale BEGIN marker left in the
 // just-stopped (or just-completed) turn's answer can't re-arm the run — only a genuinely new request can.
-export interface RunState { status: 'running' | 'paused'; continues: number; lastSig?: string; seenTurns?: number; note?: string }
+export interface RunState { status: 'running' | 'paused'; continues: number; lastSig?: string; seenTurns?: number; note?: string; summaryRepairSent?: boolean; userPrompt?: string }
 
 // True only when `sentinel` appears on its OWN line (ignoring surrounding whitespace). The markers are
 // alphanumeric+underscore, so no regex escaping is needed. Line-anchoring stops a false trigger when the agent
@@ -24,13 +24,31 @@ function sentinelOnLine(text: string, sentinel: string): boolean {
   return new RegExp(`^\\s*${sentinel}\\s*$`, 'm').test(text);
 }
 
+function firstRunDoneSentinelMatch(text: string): RegExpExecArray | null {
+  let first: RegExpExecArray | null = null;
+  for (const sentinel of [RUN_DONE_SENTINEL, ...RUN_DONE_SENTINEL_ALIASES]) {
+    const m = new RegExp(`^\\s*${sentinel}\\s*$`, 'm').exec(text);
+    if (m && (!first || m.index < first.index)) first = m;
+  }
+  return first;
+}
+
 export function runDoneVisible(text: string): boolean {
-  return sentinelOnLine(text, RUN_DONE_SENTINEL)
-    || RUN_DONE_SENTINEL_ALIASES.some((sentinel) => sentinelOnLine(text, sentinel));
+  return firstRunDoneSentinelMatch(text) != null;
+}
+
+export function runCompletionSummaryVisible(text: string): boolean {
+  const done = firstRunDoneSentinelMatch(text);
+  const heading = /^\s*#{2,3}\s*Execution Summary\s*$/im.exec(text);
+  if (!heading) return false;
+  if (done && heading.index > done.index) return false;
+  const body = text.slice(heading.index + heading[0].length, done?.index ?? text.length).trim();
+  const hasLine = (label: string) => new RegExp(`^\\s*[-*]?\\s*(?:\\*\\*)?${label}(?:\\*\\*)?:(?:\\*\\*)?\\s*\\S`, 'im').test(body);
+  return hasLine('Completed') && hasLine('Verification') && hasLine('Remaining');
 }
 
 export type RunDecision =
-  | { action: 'continue'; next: RunState } // persist `next`, then re-drive the board
+  | { action: 'continue'; next: RunState; reason?: 'completionSummaryMissing' } // persist `next`, then re-drive the board
   | { action: 'pause'; next: RunState; stop?: boolean } // persist `next`; optionally stop the live turn
   | { action: 'wait' };                    // do nothing this render
 
@@ -72,8 +90,19 @@ export function runStep(run: RunState | undefined, status: string, answer: strin
   if (needsUser) return { action: 'pause', next: { ...run, status: 'paused', note: 'paused — needs your answer' } };
   const s = sig(answer);
   if (runDoneVisible(answer)) {
-    const next = { ...run, status: 'paused' as const, lastSig: s, note: 'completed ✓' };
-    return { action: 'pause', next, ...(status === 'streaming' || status === 'waiting' ? { stop: true } : {}) };
+    if (runCompletionSummaryVisible(answer)) {
+      const next = { ...run, status: 'paused' as const, lastSig: s, note: 'completed ✓' };
+      return { action: 'pause', next, ...(status === 'streaming' || status === 'waiting' ? { stop: true } : {}) };
+    }
+    if (status === 'streaming' || status === 'idle' || status === 'waiting') return { action: 'wait' };
+    if (run.summaryRepairSent) {
+      return { action: 'pause', next: { ...run, status: 'paused', lastSig: s, note: 'paused — completion marker missing Execution Summary' } };
+    }
+    return {
+      action: 'continue',
+      reason: 'completionSummaryMissing',
+      next: { ...run, lastSig: s, note: 'repairing completion summary', summaryRepairSent: true },
+    };
   }
   // `waiting` = the board launched a background task / scheduled wakeup and is holding its session to AUTO-RESUME;
   // it is NOT a blocker — wait it out (it settles to `done` later) rather than pausing. (was a wrong pause before)

@@ -4,8 +4,9 @@ import type { BoardLike as BoardData, ToolStepLike as ToolStep } from '../shared
 // to the plan it produced (plans/Plan-Plugin — the agent-creates-plan flow). Pure → unit-tested.
 //
 // Rules (conservative, to avoid false binds):
-//  - Only WRITE-like tool steps count (Write/Edit/MultiEdit/create_file → input.file_path; Codex fileChange →
-//    input.changes[].path). Reads/searches/listings are ignored — opening a plan is not creating one.
+//  - Only WRITE-like tool steps count (Write/Edit/MultiEdit/create_file → input.file_path; Codex FileChange /
+//    legacy fileChange → input.changes[].path). Reads/searches/listings are ignored — opening a plan is not
+//    creating one.
 //  - The path must sit under `.braid/plans/<id>/…`. The `<id>` is extracted (slashes normalized both ways).
 //  - Plan ids starting with `_` (e.g. `_archive`, `_index`) or `.` are skipped — they are not bindable plans.
 //  - If writes touch EXACTLY ONE plan id, return it; zero or several (ambiguous) → undefined (do not bind).
@@ -24,7 +25,7 @@ export function writePathsOf(step: ToolStep): string[] {
     const fp = (input as { file_path?: unknown }).file_path;
     if (typeof fp === 'string') out.push(fp);
   }
-  if (name === 'fileChange') {
+  if (name === 'FileChange' || name === 'fileChange') {
     const changes = (input as { changes?: unknown }).changes;
     if (Array.isArray(changes)) {
       for (const c of changes) {

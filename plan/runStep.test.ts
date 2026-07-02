@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runStep, runArm, runDoneVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, RUN_BEGIN_SENTINEL, type RunState } from './runStep';
+import { runStep, runArm, runDoneVisible, runCompletionSummaryVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, RUN_BEGIN_SENTINEL, type RunState } from './runStep';
 
 const running = (over: Partial<RunState> = {}): RunState => ({ status: 'running', continues: 0, ...over });
 
@@ -49,28 +49,48 @@ describe('runStep — Plan run controller safety state machine (P3c / Gap E)', (
     expect(runStep(running({ continues: 1, lastSig: afterSig }), 'done', answer, false).action).toBe('wait');
   });
 
-  it('PAUSES when the agent signals completion (the sentinel)', () => {
-    const d = runStep(running({ continues: 1 }), 'done', `all gates pass.\n${RUN_DONE_SENTINEL}`, false);
+  it('recognizes the required execution-summary block before the final sentinel', () => {
+    expect(runCompletionSummaryVisible(`## Execution Summary\n- Completed: fixed it\n- Verification: tests passed\n- Remaining: none\n${RUN_DONE_SENTINEL}`)).toBe(true);
+    expect(runCompletionSummaryVisible(`## Execution Summary\n- **Completed:** fixed it\n- **Verification:** tests passed\n- **Remaining:** none\n${RUN_DONE_SENTINEL}`)).toBe(true);
+    expect(runCompletionSummaryVisible(`all gates pass.\n${RUN_DONE_SENTINEL}`)).toBe(false);
+    expect(runCompletionSummaryVisible(`## Execution Summary\n- Completed: fixed it\n${RUN_DONE_SENTINEL}`)).toBe(false);
+  });
+
+  it('PAUSES when the agent signals completion with the required execution summary', () => {
+    const d = runStep(running({ continues: 1 }), 'done', `## Execution Summary\n- Completed: all gates pass.\n- Verification: command passed\n- Remaining: none\n${RUN_DONE_SENTINEL}`, false);
     expect(d.action).toBe('pause');
     expect(d.action === 'pause' && d.next.note).toContain('completed');
   });
 
-  it('PAUSES and asks the driver to stop when completion is visible before the live turn settles', () => {
-    const d = runStep(running({ continues: 1 }), 'streaming', `final report\n${RUN_DONE_SENTINEL}`, false);
+  it('does not complete on a bare sentinel; it requests one repair turn for the missing execution summary', () => {
+    const d = runStep(running({ continues: 1 }), 'done', `final check passed\n${RUN_DONE_SENTINEL}`, false);
+    expect(d.action).toBe('continue');
+    expect(d.action === 'continue' && d.reason).toBe('completionSummaryMissing');
+    expect(d.action === 'continue' && d.next.summaryRepairSent).toBe(true);
+  });
+
+  it('pauses instead of looping if the summary repair also omits the required execution summary', () => {
+    const d = runStep(running({ continues: 1, summaryRepairSent: true }), 'done', `still no report\n${RUN_DONE_SENTINEL}`, false);
+    expect(d.action).toBe('pause');
+    expect(d.action === 'pause' && d.next.note).toContain('missing Execution Summary');
+  });
+
+  it('PAUSES and asks the driver to stop when summarized completion is visible before the live turn settles', () => {
+    const d = runStep(running({ continues: 1 }), 'streaming', `## Execution Summary\n- Completed: done\n- Verification: passed\n- Remaining: none\n${RUN_DONE_SENTINEL}`, false);
     expect(d.action).toBe('pause');
     expect(d.action === 'pause' && d.stop).toBe(true);
     expect(d.action === 'pause' && d.next.note).toContain('completed');
   });
 
   it('recognizes the observed whitespace completion marker variant', () => {
-    expect(runDoneVisible('final report\nBRAID RUN DONE')).toBe(true);
-    const d = runStep(running({ continues: 1 }), 'streaming', 'final report\nBRAID RUN DONE', false);
+    expect(runDoneVisible('## Execution Summary\n- Completed: done\n- Verification: passed\n- Remaining: none\nBRAID RUN DONE')).toBe(true);
+    const d = runStep(running({ continues: 1 }), 'streaming', '## Execution Summary\n- Completed: done\n- Verification: passed\n- Remaining: none\nBRAID RUN DONE', false);
     expect(d.action).toBe('pause');
     expect(d.action === 'pause' && d.stop).toBe(true);
   });
 
   it('asks the driver to stopWaiting when completion is visible during a waiting hold', () => {
-    const d = runStep(running({ continues: 1 }), 'waiting', `final report\n${RUN_DONE_SENTINEL}`, false);
+    const d = runStep(running({ continues: 1 }), 'waiting', `## Execution Summary\n- Completed: done\n- Verification: passed\n- Remaining: none\n${RUN_DONE_SENTINEL}`, false);
     expect(d.action).toBe('pause');
     expect(d.action === 'pause' && d.stop).toBe(true);
   });

@@ -19,7 +19,8 @@ export const DEFAULT_METHODOLOGY =
   '`history.md`, and an `evidence/` dir. ONE active phase at a time: `current-phase.md` is the single task card ' +
   'the next implementer runs; the full phase list lives in contract.md → Phase Roadmap and is promoted into ' +
   'current-phase.md as work advances (do NOT write every phase file up front).\n' +
-  '`contract.md` — `##` sections IN ORDER: `## Goal` (why it exists + what "done" means), `## Current Decisions` ' +
+  '`contract.md` — `##` sections IN ORDER: `## Goal` (why it exists + structured final-target checks: ' +
+  '`Final Target:`, `Done means:`, `Not done until:`, `Not enough:` when useful), `## Current Decisions` ' +
   '(effective locked decisions, `D1: … + why`; superseded go to history.md), `## Key Interfaces / Contracts` ' +
   '(signatures + confirmed asset/resource identifiers every phase must preserve), `## Invariants`, ' +
   '`## Phase Roadmap` (ordered phase list), `## Global Verification` (gates run after EVERY phase — the ' +
@@ -31,6 +32,25 @@ export const DEFAULT_METHODOLOGY =
   'that must finish first), `## Ground Truth 🔴` (verified facts about EXISTING code the phase relies on, each ' +
   'with its verification method — only when modifying existing code/assets), `## Constraints` (a named ' +
   'downstream contract that must not break).\n' +
+  'Agent-authored information is a navigation aid, not authority: plan Ground Truth, evidence summaries, ' +
+  'memory notes, previous assistant messages, old test conclusions, script/scene-name explanations, and agent ' +
+  'interpretations of screenshots/logs/traces must be rechecked against current authoritative evidence before ' +
+  'use. Current authoritative evidence means current code or asset readback, Blueprint graph/compile/readback, ' +
+  'current runtime logs, current raw test output, current screenshot/trace/video, or an explicit user ' +
+  'correction. If a claim cannot be reverified, treat it as an assumption or historical reference, not Ground Truth.\n' +
+  'For systematic plans, lock the final target before phase gates: every acceptance criterion must trace to ' +
+  '`Final Target:` / `Done means:` / `Not done until:` and add negative grep/runtime proof when old ownership, ' +
+  'paths, or behavior must disappear.\n' +
+  'For migration/replacement/cutover plans, contract.md must name the old owner/path/transport that will ' +
+  'disappear, the new owner/path/transport that becomes mandatory, the fallback/rollback policy, and the ' +
+  'parity dimensions to preserve; also decide whether the old API shape or any compatibility shim is allowed, ' +
+  'because preserving the old seam under a new transport can be false completion. If an alternative approach or follow-up migration appears, split it into a ' +
+  'separate plan or ADR instead of blurring scope. Acceptance gates need positive proof the new path is active ' +
+  'and negative proof the old path/fallback is gone before completion.\n' +
+  'Before presenting or scaffolding any systematic plan, do an adversarial plan review: try to invalidate the ' +
+  'proposed contract against the actual code owner, data granularity, lifecycle owner, integration/load path, ' +
+  'fallback/rollback behavior, and whether each gate would catch a wrong plan. If the review finds a serious ' +
+  'issue, revise the plan before presenting or scaffolding; do not outsource basic plan review to the user.\n' +
   '`decisions.md` — current ADRs only, each a `## ADR-<n> — <Title>` block with Status / Decision / Why / ' +
   'Implications; when a decision is replaced, move the old ADR to history.md.\n' +
   'FORBIDDEN in current-phase.md: "Technical Approach" / "Implementation Steps" / pseudocode / code blocks / ' +
@@ -59,6 +79,9 @@ function boundBlock(planId: string): string {
     `do not advance past the current phase before its \`- [ ]\` acceptance gates pass. If the user asks for an ` +
     `unrelated tactical change, local question, simple review, or single-file edit, do not read plan files just ` +
     `because this board is bound, and do not turn that task into plan execution.\n` +
+    `If the user says the goal is wrong, not done, 不达标, or that phase gates passed while missing the real ` +
+    `outcome, update .braid/plans/${planId}/contract.md first (Goal final-target labels and affected decisions), ` +
+    `then rewrite current-phase.md acceptance gates to prove that corrected target.\n` +
     `Any change to the Braid plan system itself (plan prompting, context routing, authoring docs, plan file ` +
     `format, or run policy) must first be recorded in a Braid plan before code work starts.\n` +
     `If the user asks you to EXECUTE / RUN / 完成 / 跑完 this plan (do the work, not merely discuss it), START ` +
@@ -69,8 +92,10 @@ function boundBlock(planId: string): string {
     `continue without stopping for confirmation. Emit a line containing exactly ${RUN_DONE_SENTINEL} only when ` +
     `the requested scope is complete: for current-phase scope, every current-phase gate passes; for full-plan ` +
     `scope, every roadmap phase is complete and global verification passes. Before that final marker, include ` +
-    `a concise execution summary covering what changed, which acceptance gates / verification passed, and any ` +
-    `remaining gaps; make ${RUN_DONE_SENTINEL} the final line with no text after it. If you are only discussing or ` +
+    `a concise execution summary with the exact Markdown heading \`## Execution Summary\` and bullets named ` +
+    `\`Completed:\`, \`Verification:\`, and \`Remaining:\`; make ${RUN_DONE_SENTINEL} the final line with no text after it. ` +
+    `A bare ${RUN_DONE_SENTINEL} marker without \`## Execution Summary\` is not considered complete. ` +
+    `Do NOT emit either marker for ordinary questions or "continue testing" / "继续测试"; those are not plan execution requests. If you are only discussing or ` +
     `answering a question, do NOT emit either marker.\n` +
     `When a decision is locked in, append it to .braid/plans/${planId}/decisions.md as a new ` +
     `\`## ADR-<n> — <Title>\` block (Status / Decision / Why / Implications) using the next number.`

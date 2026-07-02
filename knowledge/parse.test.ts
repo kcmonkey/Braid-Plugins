@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { notesFromEntries, parseKnowledgeIndex, routableKnowledgeEntries, validateKnowledgeVault } from './parse';
+import { hasSubstantiveRecallCue, notesFromEntries, parseKnowledgeIndex, recallCueOf, routableKnowledgeEntries, validateKnowledgeVault } from './parse';
 
 describe('knowledge index parse', () => {
   it('parses rich table entries with routing metadata', () => {
@@ -76,7 +76,7 @@ describe('knowledge index parse', () => {
 });
 
 describe('knowledge vault validation', () => {
-  const goodText = '# Auth\n\n## Evidence\n- verified_by: test\n';
+  const goodText = '# Auth\n\n## Recall cue\nWhen wiring OAuth token refresh and hitting 401s.\n\n## Evidence\n- verified_by: test\n';
 
   it('accepts a current note with evidence and an existing path', () => {
     const index = parseKnowledgeIndex('| Title | Path | Type | Status |\n|---|---|---|---|\n| Auth | auth.md | semantic | current |');
@@ -116,5 +116,27 @@ describe('knowledge vault validation', () => {
       '| Disputed | disputed.md | semantic | disputed |',
     ].join('\n'));
     expect(routableKnowledgeEntries(index).map((e) => e.title)).toEqual(['Current']);
+  });
+});
+
+describe('recall cue (ADR-16)', () => {
+  it('extracts the Recall cue section body', () => {
+    expect(recallCueOf('# T\n\n## Recall cue\nWhen the editor freezes after PIE.\n\n## Evidence\n- x\n'))
+      .toBe('When the editor freezes after PIE.');
+    expect(recallCueOf('# T\n\n## Evidence\n- x\n')).toBe('');
+  });
+
+  it('accepts a substantive query-framed cue, rejects missing / trivial / title-echo cues', () => {
+    expect(hasSubstantiveRecallCue('# Editor freeze\n## Recall cue\nWhen the editor is unresponsive after PIE.\n', 'Editor freeze')).toBe(true);
+    expect(hasSubstantiveRecallCue('# Editor freeze\n## Evidence\n- x\n', 'Editor freeze')).toBe(false); // missing
+    expect(hasSubstantiveRecallCue('# Editor freeze\n## Recall cue\nEditor freeze\n', 'Editor freeze')).toBe(false); // echoes the title
+    expect(hasSubstantiveRecallCue('# Editor freeze\n## Recall cue\nfreeze\n', 'Editor freeze')).toBe(false); // too short
+  });
+
+  it('warns (not errors) when a current note has evidence but no substantive recall cue', () => {
+    const index = parseKnowledgeIndex('| Title | Path | Type | Status |\n|---|---|---|---|\n| No cue | no-cue.md | semantic | current |');
+    const result = validateKnowledgeVault(index, [{ path: 'no-cue.md', text: '# No cue\n\n## Evidence\n- verified_by: test\n' }]);
+    expect(result.errors).toEqual([]); // has evidence + path → no error
+    expect(result.warnings).toEqual(expect.arrayContaining(['No cue: current note is missing a substantive Recall cue']));
   });
 });

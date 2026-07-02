@@ -28,6 +28,12 @@ describe('detectCreatedPlan', () => {
     expect(detectCreatedPlan(b)).toBe('p1');
   });
 
+  it('reads Codex FileChange tool-card change paths', () => {
+    const b = board([step('FileChange', { changes: [{ path: '.braid/plans/p1/current-phase.md', kind: { type: 'update' } }] })]);
+    expect(detectCreatedPlan(b)).toBe('p1');
+    expect(planWriteSignal(b, 'p1')).toContain('.braid/plans/p1/current-phase.md:pending');
+  });
+
   it('binds when a shell command writes a plan file', () => {
     const b = board([step('Bash', {
       command: "@'x'@ | Set-Content -LiteralPath 'D:\\proj\\.braid\\plans\\quest-ios-store\\contract.md'",
@@ -175,6 +181,11 @@ describe('detectCreatedPlan', () => {
       step('fileChange', { changes: [{ path: '.braid/plans/old/contract.md' }] }),
       step('Write', { file_path: 'D:\\proj\\.braid\\plans\\fresh-one\\contract.md' }),
     ]);
+    expect(latestCreatedPlan(b)).toBe('fresh-one');
+  });
+
+  it('latestCreatedPlan handles Codex FileChange contract writes', () => {
+    const b = board([step('FileChange', { changes: [{ path: '.braid/plans/fresh-one/contract.md' }] })]);
     expect(latestCreatedPlan(b)).toBe('fresh-one');
   });
 

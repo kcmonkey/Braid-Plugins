@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { firstHeading, parseGates, parseDecisions, parseDeferred, parseSection, parsePlanSnapshot, parsePhases, matchPhaseIndex } from './parse';
+import { firstHeading, parseGates, parseDecisions, parseDeferred, parseSection, parsePlanSnapshot, parsePhases, matchPhaseIndex, parseFinalTarget } from './parse';
 
 describe('plan parse', () => {
   it('firstHeading strips the "Current Phase:" prefix', () => {
@@ -59,6 +59,27 @@ describe('plan parse', () => {
     expect(parseSection(md, /^#{1,6}\s+missing\b/i)).toBe('');
   });
 
+  it('parseFinalTarget extracts structured goal-fidelity checks from the contract goal body', () => {
+    const groups = parseFinalTarget([
+      'Decouple VR interaction ownership.',
+      '',
+      'Final Target:',
+      '- UVRComponent owns the VR rig and legacy VR interaction seams.',
+      'Done means:',
+      '- AZomboyVRCharacter only forwards compatibility calls.',
+      'Not done until:',
+      '- Source grep proves legacy Tick/SetupPlayerInputComponent seams moved.',
+      'Not enough:',
+      '- A generic gameplay consumer decouple without rig ownership migration.',
+    ].join('\n'));
+    expect(groups).toEqual([
+      { key: 'finalTarget', label: 'Final target', items: ['UVRComponent owns the VR rig and legacy VR interaction seams.'] },
+      { key: 'doneMeans', label: 'Done means', items: ['AZomboyVRCharacter only forwards compatibility calls.'] },
+      { key: 'notDoneUntil', label: 'Not done until', items: ['Source grep proves legacy Tick/SetupPlayerInputComponent seams moved.'] },
+      { key: 'notEnough', label: 'Not enough', items: ['A generic gameplay consumer decouple without rig ownership migration.'] },
+    ]);
+  });
+
   it('parsePlanSnapshot pulls the overall goal + the current-phase intent', () => {
     const snap = parsePlanSnapshot({
       phaseMd: '# Current Phase: Smoke\n## Goal\nFinish the smoke run.\n## Acceptance Criteria\n- [ ] a\n',
@@ -67,6 +88,18 @@ describe('plan parse', () => {
     });
     expect(snap.phaseGoal).toBe('Finish the smoke run.');
     expect(snap.goal).toBe('The overall objective.');
+  });
+
+  it('parsePlanSnapshot surfaces final target checks for Plan details', () => {
+    const snap = parsePlanSnapshot({
+      phaseMd: '# Current Phase: Smoke\n## Acceptance Criteria\n- [x] a\n',
+      decisionsMd: '',
+      contractMd: '## Goal\nEnd state: real owner migration.\nNot enough:\n- Pure consumer rename.\n## Phase Roadmap\n- Phase 1: smoke\n',
+    });
+    expect(snap.finalTarget).toEqual([
+      { key: 'finalTarget', label: 'Final target', items: ['real owner migration.'] },
+      { key: 'notEnough', label: 'Not enough', items: ['Pure consumer rename.'] },
+    ]);
   });
 
   it('parsePlanSnapshot composes phase + progress + decisions + gaps', () => {
@@ -137,5 +170,28 @@ describe('plan parse', () => {
     });
     expect(snap.phases).toHaveLength(2);
     expect(snap.phaseIndex).toBe(1);
+  });
+
+  it('parsePlanSnapshot prefers the phase heading over goal-body collisions with an earlier phase', () => {
+    // Real braid-core-architecture bug: heading "Cleanup Retention Compatibility" uniquely names Phase 8, but the
+    // goal body ("plugin aggregate state ...") collides 3 ways with Phase 1's roadmap text. A name+goal blob tied
+    // at 3 and the first-match tie-break wrongly reported Phase 1/8. The heading match must win → Phase 8/8.
+    const roadmap = [
+      'Phase 1: Plugin aggregate and event-state primitive (host-owned; append/order/replay).',
+      'Phase 2: Board-to-board message envelope and correlation lifecycle.',
+      'Phase 3: Atomic visible board materialization transaction.',
+      'Phase 4: Aggregate-level run controller and lifecycle fan-in.',
+      'Phase 5: Scoped context substrate for aggregate-owned intel and status.',
+      'Phase 6: Plugin semantic graph projection for non-lineage edges.',
+      'Phase 7: Orchestration cutover + negative proof old ownership is gone.',
+      'Phase 8: Cleanup, retention, and compatibility hardening.',
+    ];
+    const snap = parsePlanSnapshot({
+      phaseMd: '# Current Phase: Cleanup Retention Compatibility\n## Goal\nCore exposes bounded cleanup and retention controls for plugin aggregate state while preserving compatibility for existing plugin behavior.\n## Acceptance Criteria\n- [x] a\n',
+      decisionsMd: '',
+      contractMd: `## Phase Roadmap\n${roadmap.map((p) => `- ${p}`).join('\n')}\n## Global Verification\n- npm test\n`,
+    });
+    expect(snap.phases).toHaveLength(8);
+    expect(snap.phaseIndex).toBe(8);
   });
 });

@@ -3,7 +3,107 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('./plan-authoring.md', () => ({ default: '' }));
 
 describe('planRunPolicy live completion cleanup', () => {
+  it('does not arm auto-run when the model emits BEGIN for an ordinary "continue testing" prompt', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          prompt: '继续测试',
+          answer: 'BRAID_RUN_BEGIN\n我会继续检查一下。',
+          turns: [{ prompt: '继续测试', answer: 'BRAID_RUN_BEGIN\n我会继续检查一下。' }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1' },
+        interrupted: false,
+      });
+
+      expect(r).toBeNull();
+    });
+  });
+
+  it('arms auto-run when the latest user prompt explicitly asks to run the current phase', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          prompt: 'Run the current phase',
+          answer: 'BRAID_RUN_BEGIN\nStarting the current phase.',
+          turns: [{ prompt: 'Run the current phase', answer: 'BRAID_RUN_BEGIN\nStarting the current phase.' }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1' },
+        interrupted: false,
+      });
+
+      expect(r).toEqual({
+        state: {
+          planId: 'p1',
+          run: { status: 'running', continues: 0, seenTurns: 1, userPrompt: 'Run the current phase' },
+        },
+      });
+    });
+  });
+
   it('asks for a visible completion summary before the final sentinel on auto-continue', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          prompt: 'Run the current phase',
+          answer: 'phase work progressed',
+          turns: [{ prompt: 'Run the current phase', answer: 'phase work progressed' }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 0, userPrompt: 'Run the current phase' } },
+        interrupted: false,
+      });
+
+      expect(r).toMatchObject({ permissionMode: 'bypassPermissions' });
+      expect((r as any).displayPrompt).toBe('Run the current phase');
+      expect((r as any).event).toMatchObject({
+        kind: 'continue',
+        title: 'Plan auto-continued',
+        detail: 'Continuing the current phase without adding a user-authored prompt.',
+      });
+      expect((r as any).drive).toContain('completion-report');
+      expect((r as any).drive).toContain('final line');
+      expect((r as any).drive).not.toContain('nothing else');
+    });
+  });
+
+  it('keeps the original user prompt as displayPrompt when driving a completion-summary repair', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          prompt: 'Run the current phase',
+          answer: 'Checkin succeeded.\nBRAID_RUN_DONE',
+          turns: [{ prompt: 'Run the current phase', answer: 'Checkin succeeded.\nBRAID_RUN_DONE' }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 1, lastSig: 'old', userPrompt: 'Run the current phase' } },
+        interrupted: false,
+      });
+
+      expect((r as any).drive).toContain('You emitted the completion marker without the required');
+      expect((r as any).displayPrompt).toBe('Run the current phase');
+      expect((r as any).displayPrompt).not.toContain('You emitted the completion marker');
+      expect((r as any).event).toMatchObject({
+        kind: 'repair',
+        title: 'Plan requested execution summary',
+      });
+    });
+  });
+
+  it('uses a stricter execution-summary report block in the auto-continue prompt', () => {
     return import('./index').then(({ planRunPolicy }) => {
       const r = planRunPolicy.step({
         boardId: 'b1',
@@ -18,21 +118,21 @@ describe('planRunPolicy live completion cleanup', () => {
         interrupted: false,
       });
 
-      expect(r).toMatchObject({ permissionMode: 'bypassPermissions' });
-      expect((r as any).drive).toContain('completion summary');
-      expect((r as any).drive).toContain('last line');
-      expect((r as any).drive).not.toContain('nothing else');
+      expect((r as any).drive).toContain('## Execution Summary');
+      expect((r as any).drive).toContain('Completed:');
+      expect((r as any).drive).toContain('Verification:');
+      expect((r as any).drive).toContain('Remaining:');
     });
   });
 
-  it('stops a bound streaming board when completion is visible even if run state is missing', () => {
+  it('stops a bound streaming board when summarized completion is visible even if run state is missing', () => {
     return import('./index').then(({ planRunPolicy }) => {
     const r = planRunPolicy.step({
       boardId: 'b1',
       board: {
         status: 'streaming',
-        answer: 'done\nBRAID RUN DONE',
-        turns: [{ answer: 'done\nBRAID RUN DONE' }],
+        answer: '## Execution Summary\n- Completed: done\n- Verification: passed\n- Remaining: none\nBRAID RUN DONE',
+        turns: [{ answer: '## Execution Summary\n- Completed: done\n- Verification: passed\n- Remaining: none\nBRAID RUN DONE' }],
         elements: { plan: { planId: 'p1' } },
       } as any,
       config: {},
@@ -44,6 +144,80 @@ describe('planRunPolicy live completion cleanup', () => {
       stop: true,
       state: { planId: 'p1', run: { status: 'paused', note: 'completed ✓' } },
     });
+    });
+  });
+
+  it('accepts the screenshot-style bold execution-summary labels and stops the live board', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const answer = [
+        '## Execution Summary',
+        '- **Completed:** Added the packed move data container and checked all gates.',
+        '- **Verification:** build wrapper passed with BUILD_EXIT_CODE=0.',
+        '- **Remaining:** none for the current phase.',
+        '',
+        'BRAID_RUN_DONE',
+      ].join('\n');
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'streaming',
+          answer,
+          turns: [{ answer }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 1 } },
+        interrupted: false,
+      });
+
+      expect(r).toMatchObject({
+        stop: true,
+        state: { planId: 'p1', run: { status: 'paused', note: 'completed ✓' } },
+      });
+    });
+  });
+
+  it('does not accept a bare completion marker as done; it stops the live turn and schedules a summary repair', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'streaming',
+          answer: 'Checkin succeeded.\nBRAID_RUN_DONE',
+          turns: [{ answer: 'Checkin succeeded.\nBRAID_RUN_DONE' }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 1 } },
+        interrupted: false,
+      });
+
+      expect(r).toMatchObject({
+        stop: true,
+        state: { planId: 'p1', run: { status: 'running', note: 'completion marker missing Execution Summary' } },
+      });
+    });
+  });
+
+  it('re-drives a settled bare completion marker with a dedicated completion-report repair prompt', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          answer: 'Checkin succeeded.\nBRAID_RUN_DONE',
+          turns: [{ answer: 'Checkin succeeded.\nBRAID_RUN_DONE' }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 1, lastSig: 'old' } },
+        interrupted: false,
+      });
+
+      expect(r).toMatchObject({ permissionMode: 'bypassPermissions' });
+      expect((r as any).drive).toContain('You emitted the completion marker without the required');
+      expect((r as any).drive).toContain('## Execution Summary');
+      expect((r as any).state.run.summaryRepairSent).toBe(true);
     });
   });
 

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginManifest, RunPolicyPlugin, SeedArtifact } from '../../../src/plugin-api/types';
-import { boardTurns, hasPendingAsk, latestAnswer, type BoardLike as BoardData } from '../shared/board';
-import { runStep, runArm, runDoneVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, type RunState } from './runStep';
+import { boardTurns, hasPendingAsk, latestAnswer, latestPrompt, type BoardLike as BoardData } from '../shared/board';
+import { runStep, runArm, runDoneVisible, runCompletionSummaryVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, type RunState } from './runStep';
 import { detectCreatedPlan, latestCreatedPlan, planWriteSignal } from './detect';
 import { planContextText } from './methodology';
 import { firstHeading, parseGates, parsePlanSnapshot, type PlanSnapshot } from './parse';
@@ -52,6 +52,21 @@ function runOf(state: PlanState | undefined): RunState | undefined {
   const r = (state as { run?: RunState } | undefined)?.run;
   return r && (r.status === 'running' || r.status === 'paused') && typeof r.continues === 'number' ? r : undefined;
 }
+function runDisplayPrompt(board: BoardData, run: RunState | undefined): string {
+  return (run?.userPrompt || latestPrompt(board) || 'Run the bound Braid plan').trim();
+}
+function userRequestedPlanExecution(prompt: string): boolean {
+  const text = prompt.trim();
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  const hasPlanObject = /\b(plan|phase|roadmap)\b/.test(lower) || /(计划|阶段|当前阶段|整个|全部)/.test(text);
+  if (/\b(run|execute|complete|finish)\b/.test(lower) && hasPlanObject) return true;
+  if (/\b(continue|resume)\b/.test(lower) && (/\b(running|executing|execution)\b/.test(lower) || /\b(plan|phase|roadmap)\b/.test(lower))) return true;
+  if (/(一口气跑完|完整执行|跑完整个)/.test(text)) return true;
+  if (/(执行|完成|跑完)/.test(text) && hasPlanObject) return true;
+  if (/(继续|接着).*(执行|跑|完成)/.test(text)) return true;
+  return false;
+}
 function withoutRun(planId: string, state: PlanState | undefined): PlanState {
   return { planId, ...(state?.open ? { open: true } : {}) };
 }
@@ -62,14 +77,29 @@ const CONTINUE_PROMPT =
   "Continue the Braid plan execution scope the user requested — do NOT stop to ask for confirmation, and do NOT " +
   "just summarize and wait. Always read current-phase.md and contract.md first. If the user asked to complete " +
   "only the current phase, finish every acceptance gate in current-phase.md, run the phase/global verification " +
-  "the plan requires, then reply with a concise completion summary covering what changed, which acceptance " +
-  `gates / verification passed, and any remaining gaps. Put exactly ${RUN_DONE_SENTINEL} on the last line, with ` +
-  "no text after it. If the " +
+  "the plan requires, then reply with the exact completion-report shape below. The run policy will NOT treat a " +
+  `bare ${RUN_DONE_SENTINEL} marker as complete without this heading:\n\n` +
+  "## Execution Summary\n" +
+  "- Completed: <what changed>\n" +
+  "- Verification: <acceptance gates / commands / checks that passed>\n" +
+  "- Remaining: <gaps, risks, or none>\n\n" +
+  `${RUN_DONE_SENTINEL}\n\n` +
+  `Keep ${RUN_DONE_SENTINEL} as the final line with no text after it. If the ` +
   "user asked to complete the full/entire/whole plan or all phases, then after each phase passes: update " +
   "evidence/history as needed, promote the next Phase Roadmap item into current-phase.md, and keep working. For " +
   `a full-plan run, emit ${RUN_DONE_SENTINEL} only after the roadmap has no remaining phases and global ` +
-  "verification passes, again after a concise completion summary and as the final line. If you genuinely need a human decision, or hit an error you cannot recover from, explain " +
+  "verification passes, using the same `## Execution Summary` report shape and final marker. If you genuinely need a human decision, or hit an error you cannot recover from, explain " +
   "briefly and stop.";
+
+const COMPLETION_REPORT_PROMPT =
+  `You emitted the completion marker without the required \`## Execution Summary\` report. Do not do more ` +
+  "implementation work unless it is strictly needed to verify the report. Read current-phase.md, contract.md, " +
+  "and evidence files if needed, then reply only with this Markdown shape:\n\n" +
+  "## Execution Summary\n" +
+  "- Completed: <what changed>\n" +
+  "- Verification: <acceptance gates / commands / checks that passed>\n" +
+  "- Remaining: <gaps, risks, or none>\n\n" +
+  `${RUN_DONE_SENTINEL}`;
 
 // Refetch plan files when the board settles, and while live only when this board writes the bound plan files. That
 // keeps normal token streaming from causing read storms while still reflecting an agent that advances current-phase
@@ -172,9 +202,11 @@ function PlanPanel({ planId, api, board }: { planId: string; api: BoardPluginApi
   const remaining = (snap?.gates ?? []).filter((g) => !g.done);
   const phases = snap?.phases ?? [];
   const phaseIndex = snap?.phaseIndex ?? 0;
+  const finalTarget = snap?.finalTarget ?? [];
   // PLAN-level progress (how many phases) — distinct from the gate fraction (this phase's acceptance criteria).
   const phaseProg = phases.length ? (phaseIndex ? `Phase ${phaseIndex}/${phases.length}` : `${phases.length} phases`) : '';
   const sectionHead = { color: '#8c857b', fontWeight: 700, marginBottom: 3 } as const;
+  const targetColor = (key: string) => key === 'notEnough' ? '#d58b86' : key === 'notDoneUntil' ? '#d2ad6b' : key === 'doneMeans' ? '#8fc7a6' : '#a9c0ff';
 
   return (
     <div className="plan-panel nodrag nopan" style={{ flexShrink: 0, padding: '8px 14px', borderBottom: '1px solid #2a2724', background: '#1d1c1a', fontSize: 12 }}>
@@ -219,6 +251,23 @@ function PlanPanel({ planId, api, board }: { planId: string; api: BoardPluginApi
             <div>
               <div style={sectionHead}>This phase</div>
               <div style={{ color: '#bdb6ac', whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>{clampText(snap.phaseGoal, 400)}</div>
+            </div>
+          ) : null}
+          {finalTarget.length ? (
+            <div>
+              <div style={sectionHead}>Final target</div>
+              {finalTarget.map((group) => (
+                <div key={group.key} style={{ marginBottom: 5 }}>
+                  <div style={{ color: targetColor(group.key), fontWeight: 700, marginBottom: 2 }}>{group.label}</div>
+                  {group.items.slice(0, 6).map((item, i) => (
+                    <div key={i} style={{ color: '#bdb6ac', display: 'flex', gap: 6, marginBottom: 2, lineHeight: 1.4 }}>
+                      <span style={{ color: targetColor(group.key), flexShrink: 0 }}>•</span>
+                      <span style={{ minWidth: 0, wordBreak: 'break-word' }}>{clampText(item, 180)}</span>
+                    </div>
+                  ))}
+                  {group.items.length > 6 ? <div style={{ color: '#6f6a62' }}>+{group.items.length - 6} more</div> : null}
+                </div>
+              ))}
             </div>
           ) : null}
           {snap.phases.length ? (
@@ -436,6 +485,7 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
     // grows by one per turn (the arming turn, then each auto-continue), so a stopped/completed turn is "seen".
     const turnCount = boardTurns(board).length;
     const la = latestAnswer(board);
+    const displayPrompt = runDisplayPrompt(board, run);
     // A board with FEWER turns than when the run last acted was truncated in place by a ChatView fork/split
     // (splitBoardAtTurn / splitBoardIntoTurnBoards rewrite a board's turns[]). Its answer no longer matches the
     // run's lastSig, so the auto-continue loop would re-drive it as a phantom "Generating…" turn. A manual
@@ -447,6 +497,26 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
     const liveCompletion = (board.status === 'streaming' || board.status === 'waiting') && runDoneVisible(la);
     if (liveCompletion) {
       const answerSig = sig(la);
+      if (!runCompletionSummaryVisible(la)) {
+        if (!(run?.status === 'running' && run.lastSig === answerSig && run.note === 'completion marker missing Execution Summary')) {
+          return {
+            state: {
+              planId,
+              run: {
+                status: 'running',
+                continues: run?.continues ?? 0,
+                lastSig: answerSig,
+                seenTurns: turnCount,
+                userPrompt: displayPrompt,
+                ...(run?.summaryRepairSent ? { summaryRepairSent: true } : {}),
+                note: 'completion marker missing Execution Summary',
+              },
+            },
+            stop: true,
+          };
+        }
+        return null;
+      }
       if (!(run?.status === 'paused' && run.lastSig === answerSig && run.note === 'completed ✓')) {
         return {
           state: { planId, run: { status: 'paused', continues: run?.continues ?? 0, lastSig: answerSig, seenTurns: turnCount, note: 'completed ✓' } },
@@ -471,7 +541,13 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
     // keyword matching — the agent classifies intent. `runArm` edge-triggers on turnCount > seenTurns so a stale
     // marker (after a Stop / completion) can't restart the run; only a genuinely new request does.
     const armed = runArm(run, la, turnCount);
-    if (armed) return { state: { planId, run: armed } };
+    if (armed) {
+      // The model's BEGIN marker is necessary but not sufficient: a bound-board answer can misclassify ordinary
+      // prompts like "继续测试" as execution intent. Gate arming on the user's latest prompt so discussion/testing
+      // questions cannot start a bypass-permissions auto-run by accident.
+      if (!userRequestedPlanExecution(latestPrompt(board))) return null;
+      return { state: { planId, run: { ...armed, userPrompt: displayPrompt } } };
+    }
     // A paused run note describes the turn it stopped/completed on. Once a newer turn has moved on without
     // re-arming, the old "you stopped it" / cap / needs-answer label is stale UI state; drop it instead of
     // continuing to pin the plan header to an old interruption.
@@ -480,9 +556,19 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
     // NOT a pause (continues bypass approvals; turn 1 just waits for your approval, then the run resumes).
     const d = runStep(run, board.status, la, hasPendingAsk(board));
     if (d.action === 'wait') return null;
-    const next: RunState = { ...d.next, seenTurns: turnCount };
-    return d.action === 'continue'
-      ? { drive: CONTINUE_PROMPT, state: { planId, run: next }, permissionMode: 'bypassPermissions' }
-      : { state: { planId, run: next }, ...(d.stop ? { stop: true } : {}) };
+    const next: RunState = { ...d.next, seenTurns: turnCount, userPrompt: d.next.userPrompt ?? displayPrompt };
+    if (d.action === 'continue') {
+      const completionRepair = d.reason === 'completionSummaryMissing';
+      return {
+        drive: completionRepair ? COMPLETION_REPORT_PROMPT : CONTINUE_PROMPT,
+        displayPrompt: next.userPrompt,
+        state: { planId, run: next },
+        permissionMode: 'bypassPermissions',
+        event: completionRepair
+          ? { kind: 'repair', title: 'Plan requested execution summary', detail: 'The completion marker was missing the required report block.', status: 'done' }
+          : { kind: 'continue', title: 'Plan auto-continued', detail: 'Continuing the current phase without adding a user-authored prompt.', status: 'done' },
+      };
+    }
+    return { state: { planId, run: next }, ...(d.stop ? { stop: true } : {}) };
   },
 };

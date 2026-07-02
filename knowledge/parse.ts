@@ -191,6 +191,46 @@ function hasEvidence(text: string): boolean {
   return /^##\s+Evidence\b/im.test(text) || /^-\s*(verified_by|migrated_from|source):/im.test(text);
 }
 
+// ---- Recall cue (ADR-16): the reader-query framing a future agent searches by ----
+
+// The `## Recall cue` section body of a note, or '' when absent. Case/space-insensitive heading; the section
+// ends at the next markdown heading.
+export function recallCueOf(text: string): string {
+  const lines = (text ?? '').split(/\r?\n/);
+  let i = 0;
+  for (; i < lines.length; i++) if (/^##\s+recall\s*cue\b/i.test(lines[i].trim())) break;
+  if (i >= lines.length) return '';
+  const body: string[] = [];
+  for (i += 1; i < lines.length; i++) {
+    if (/^#{1,6}\s+/.test(lines[i])) break;
+    body.push(lines[i]);
+  }
+  return body.join('\n').trim();
+}
+
+// The note's first `# Title` heading, or ''.
+export function noteTitleOf(text: string): string {
+  for (const line of (text ?? '').split(/\r?\n/)) {
+    const m = /^#\s+(.+)$/.exec(line.trim());
+    if (m) return m[1].trim();
+  }
+  return '';
+}
+
+function normalizeForCompare(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9一-鿿]+/g, ' ').trim();
+}
+
+// A recall cue is SUBSTANTIVE when it exists, has real content (not a stub), and is not merely a restatement of
+// the note title. Framed from the future reader's query (ADR-16). `title` empty ⇒ skip the echo check.
+export function hasSubstantiveRecallCue(text: string, title = ''): boolean {
+  const cue = recallCueOf(text).replace(/^[-*\s]+/, '').trim();
+  if (cue.length < 8) return false;
+  const t = normalizeForCompare(title);
+  if (t && normalizeForCompare(cue) === t) return false;
+  return true;
+}
+
 function normalizedPath(path: string): string {
   return path.replace(/\\/g, '/').replace(/^\.braid\/knowledge\//, '').replace(/^\.\//, '');
 }
@@ -218,8 +258,15 @@ export function validateKnowledgeVault(index: readonly KnowledgeNote[], files: r
         errors.push(`${entry.title}: current entry is missing path`);
       } else if (!fileMap.has(key)) {
         errors.push(`${entry.title}: current entry path does not exist '${path}'`);
-      } else if (!hasEvidence(fileMap.get(key) ?? '')) {
-        errors.push(`${entry.title}: current note is missing Evidence section`);
+      } else {
+        const noteText = fileMap.get(key) ?? '';
+        if (!hasEvidence(noteText)) errors.push(`${entry.title}: current note is missing Evidence section`);
+        // Recall cue is a retrievability quality bar (ADR-16). Warning-level: the same validated field as
+        // Evidence, but not a hard gate while cleanup of pre-existing cue-less notes is deferred; promotable to
+        // error when that cleanup runs.
+        if (!hasSubstantiveRecallCue(noteText, entry.title)) {
+          warnings.push(`${entry.title}: current note is missing a substantive Recall cue`);
+        }
       }
     }
     if (entry.status !== 'current' && fileMap.has(key) && !entry.updated) {

@@ -5,10 +5,12 @@
 
 export interface PlanGate { text: string; done: boolean }
 export interface PlanDecision { id: string; title: string }
+export interface PlanTargetGroup { key: string; label: string; items: string[] }
 export interface PlanSnapshot {
   phase?: string;
   goal?: string;       // the plan's overall objective (contract.md "## Goal") — the "why"
   phaseGoal?: string;  // what the CURRENT phase is trying to achieve (current-phase.md "## Goal") — the "what now"
+  finalTarget: PlanTargetGroup[]; // structured final-state / anti-drift checks from contract.md "## Goal"
   gates: PlanGate[];
   done: number;
   total: number;
@@ -80,6 +82,54 @@ const GOAL_HEADING = /^#{1,6}\s+goal\b/i;
 // A phase's intent: prefer its "## Goal", else "## What To Deliver" (plan-format current-phase.md section names).
 const PHASE_GOAL_HEADING = /^#{1,6}\s+(?:goal|what\s+to\s+deliver)\b/i;
 
+const TARGET_LABELS: Array<{ key: string; label: string; re: RegExp }> = [
+  { key: 'finalTarget', label: 'Final target', re: /^(?:final\s+target|target|end\s+state(?:\s*\([^)]*\))?|最终目标)\s*[:：]\s*(.*)$/i },
+  { key: 'doneMeans', label: 'Done means', re: /^(?:done\s+means|completion\s+means|done\s*=|完成(?:意味着|标准)?|完成后)\s*[:：]\s*(.*)$/i },
+  { key: 'notDoneUntil', label: 'Not done until', re: /^(?:not\s+done\s+until|must\s+include|completion\s+requires|未完成直到|必须包括)\s*[:：]\s*(.*)$/i },
+  { key: 'notEnough', label: 'Not enough', re: /^(?:not\s+enough|insufficient|does\s+not\s+count|不达标|不算完成)\s*[:：]\s*(.*)$/i },
+];
+function stripListMarker(line: string): string {
+  return line.replace(/^[ \t]*(?:[-*]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?/, '').trim();
+}
+function targetLabel(line: string): { key: string; label: string; inline: string } | undefined {
+  const t = line.trim();
+  for (const l of TARGET_LABELS) {
+    const m = t.match(l.re);
+    if (m) return { key: l.key, label: l.label, inline: (m[1] ?? '').trim() };
+  }
+  return undefined;
+}
+// "Final target" checks live inside contract.md "## Goal" so the contract keeps the canonical section order while
+// still giving the UI something stronger than free prose. These bullets are what prevent "all gates checked" from
+// hiding that the user's actual final state was missed.
+export function parseFinalTarget(goalBody: string): PlanTargetGroup[] {
+  const byKey = new Map<string, PlanTargetGroup>();
+  let current: PlanTargetGroup | undefined;
+  const ensure = (key: string, label: string): PlanTargetGroup => {
+    const existing = byKey.get(key);
+    if (existing) return existing;
+    const next = { key, label, items: [] };
+    byKey.set(key, next);
+    return next;
+  };
+  for (const raw of goalBody.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const lbl = targetLabel(line);
+    if (lbl) {
+      current = ensure(lbl.key, lbl.label);
+      if (lbl.inline) current.items.push(stripListMarker(lbl.inline));
+      continue;
+    }
+    if (!current) continue;
+    const item = stripListMarker(line);
+    if (item) current.items.push(item);
+  }
+  return TARGET_LABELS
+    .map((l) => byKey.get(l.key))
+    .filter((g): g is PlanTargetGroup => !!g && g.items.length > 0);
+}
+
 const PHASE_ROADMAP_HEADING = /^#{1,6}\s+phase\s+roadmap\b/i;
 // The ordered phase list from contract.md "## Phase Roadmap". Each list item is one phase; a wrapped continuation
 // line (roadmap items often span two lines) folds back into the item it belongs to. This is the PLAN-level
@@ -142,10 +192,12 @@ export function parsePlanSnapshot(docs: { phaseMd: string; decisionsMd: string; 
   const phase = firstHeading(docs.phaseMd);
   const phaseGoal = parseSection(docs.phaseMd, PHASE_GOAL_HEADING) || undefined;
   const phases = parsePhases(docs.contractMd);
+  const goal = parseSection(docs.contractMd, GOAL_HEADING);
   return {
     phase,
-    goal: parseSection(docs.contractMd, GOAL_HEADING) || undefined,
+    goal: goal || undefined,
     phaseGoal,
+    finalTarget: parseFinalTarget(goal),
     gates,
     done: gates.filter((g) => g.done).length,
     total: gates.length,
@@ -154,6 +206,10 @@ export function parsePlanSnapshot(docs: { phaseMd: string; decisionsMd: string; 
     // Carry-Forward); merge both, contract first.
     deferred: [...parseDeferred(docs.contractMd), ...parseDeferred(docs.phaseMd)],
     phases,
-    phaseIndex: matchPhaseIndex(phases, [phase, phaseGoal].filter(Boolean).join('\n')),
+    // Prefer the phase HEADING match; the goal body shares generic architecture words with many phases (e.g.
+    // "plugin aggregate state" collides with an early phase's roadmap text), so only fall back to name+goal when
+    // the heading alone can't place the phase. Without this, a plan whose heading uniquely names the LAST phase
+    // (e.g. "Cleanup Retention Compatibility" → Phase 8) shows an early index because the goal tied with Phase 1.
+    phaseIndex: matchPhaseIndex(phases, phase) || matchPhaseIndex(phases, [phase, phaseGoal].filter(Boolean).join('\n')),
   };
 }

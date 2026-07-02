@@ -40,6 +40,12 @@ One durable fact or a small cluster of tightly related durable facts.
 ## Scope
 Where the claim applies: provider, tool, platform, project subsystem, workflow, or environment.
 
+## Recall cue
+The situation, task, question, or symptom under which a FUTURE agent would search for this — framed as the
+reader's query, not your post-hoc mechanism. A symptom for a gotcha ("editor unresponsive after PIE"), a
+use-context or triggering question for a fact ("when a plugin needs to read all boards"), a goal for a workflow
+("when running mutation testing"). Title and keyword the note by this cue so it is actually recalled.
+
 ## Evidence
 - verified_by: command, test, source file path, URL, user decision, or observed runtime evidence
 - date: YYYY-MM-DD
@@ -77,3 +83,7 @@ context small while preserving recall quality.
 - If a fact was learned from a user correction or failed attempt, consider `episodic`.
 - If a fact changes how agents should operate, consider `procedural`.
 - Keep keywords distinctive enough to route future questions to the right note.
+- Give every note a substantive `Recall cue` framed as the future reader's query; a note titled/keyworded only by
+  its internal mechanism will not be recalled from the symptom or task that actually needs it.
+- Before recording, name a DIFFERENT future task that will need the note; if you cannot, fold it into a broader
+  existing note instead of creating a new hyper-specific one.

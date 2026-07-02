@@ -20,7 +20,12 @@ export const KNOWLEDGE_PROTOCOL =
   'workflow lessons, and locked conventions. Do not store transient task status or implementation snapshots.\n' +
   'RECORD: when you confirm durable knowledge, write or update a typed note with Claim, Scope, Evidence, ' +
   'Metadata, and Keywords. Set lifecycle status (`current`, `stale`, `superseded`, or `disputed`) and update ' +
-  '`.braid/knowledge/_index.md`. Update or supersede existing notes instead of duplicating them.\n' +
+  '`.braid/knowledge/_index.md`. Update or supersede existing notes instead of duplicating them. ' +
+  'Frame each note for the FUTURE reader: give it a `Recall cue` — the situation, task, question, or symptom a ' +
+  'future agent would search by (a symptom for a gotcha, a use-context or triggering question for a fact, a goal ' +
+  'for a workflow) — and title/keyword by that cue, NOT by your post-hoc mechanism. Before recording, name a ' +
+  'DIFFERENT future task that will need it; if you cannot, fold it into a broader existing note instead of a new ' +
+  'hyper-specific one.\n' +
   'HONESTY: never say you have recorded, saved, noted, or 记下 a lesson unless you actually wrote it to a ' +
   '`.braid/knowledge/` note with a file-writing tool in this same turn. If you only described it in prose, say ' +
   'plainly it is not yet recorded.\n' +
@@ -80,9 +85,16 @@ export const KNOWLEDGE_RECORDING_NUDGE =
   'durable, reusable, and verified, RECORD them now as typed notes; if they are not durable, say so explicitly ' +
   'instead of implying they were saved.';
 
+// Appended (one line) when the latest settled turn WROTE a vault note with no substantive `Recall cue` (ADR-16).
+// It nudges the agent to reframe the note for retrieval on the next turn; it never auto-writes anything.
+export const KNOWLEDGE_QUALITY_NUDGE =
+  'NOTE: a note you just wrote to `.braid/knowledge/` has no substantive `Recall cue`. Add the situation / task / ' +
+  "question / symptom a future agent would search by (the reader's query, not your mechanism) and title/keyword " +
+  'by it — otherwise it will not be recalled.';
+
 export function knowledgeContextText(
   indexEntries?: readonly (KnowledgeRoutingEntry | string)[],
-  opts?: { recordingGap?: boolean },
+  opts?: { recordingGap?: boolean; qualityGap?: boolean },
 ): string {
   const entries = normalizeRoutingEntries(indexEntries);
   let text = KNOWLEDGE_PROTOCOL;
@@ -93,6 +105,7 @@ export function knowledgeContextText(
     text += `\nCurrent vault routing (${entries.length} note${entries.length === 1 ? '' : 's'}; bodies not injected):\n${list}${omitted}`;
   }
   if (opts?.recordingGap) text += `\n${KNOWLEDGE_RECORDING_NUDGE}`;
+  if (opts?.qualityGap) text += `\n${KNOWLEDGE_QUALITY_NUDGE}`;
   return text;
 }
 

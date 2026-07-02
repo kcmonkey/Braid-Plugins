@@ -1,0 +1,14 @@
+{
+  "id": "orchestration",
+  "name": "Orchestration",
+  "version": "0.1.0",
+  "description": "Visible role-board orchestration for plan-driven multi-agent work.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "runtime": "builtin",
+  "contributes": {
+    "boardElements": ["orchestration"],
+    "boardActions": ["orchestration.actions"],
+    "contextProviders": ["orchestration"]
+  }
+}

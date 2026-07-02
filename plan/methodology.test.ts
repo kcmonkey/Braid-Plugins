@@ -12,6 +12,60 @@ describe('plan methodology run scope', () => {
     expect(text).toContain('Do NOT force a plan for small tactical fixes');
   });
 
+  it('tells the agent to encode final-target checks in contract.md Goal', () => {
+    const text = planContextText('');
+    expect(text).toContain('structured final-target checks');
+    expect(text).toContain('Final Target:');
+    expect(text).toContain('Done means:');
+    expect(text).toContain('Not done until:');
+    expect(text).toContain('Not enough:');
+    expect(text).toContain('lock the final target before phase gates');
+    expect(text).toContain('every acceptance criterion must trace');
+    expect(text).toContain('negative grep/runtime proof');
+  });
+
+  it('tells the agent how to structure migration/replacement/cutover plans', () => {
+    const text = planContextText('');
+    expect(text).toContain('migration/replacement/cutover');
+    expect(text).toContain('old owner/path/transport');
+    expect(text).toContain('new owner/path/transport');
+    expect(text).toContain('fallback/rollback policy');
+    expect(text).toContain('split it into a separate plan or ADR');
+    expect(text).toContain('old API shape');
+    expect(text).toContain('compatibility shim');
+    expect(text).toContain('false completion');
+    expect(text).toContain('positive proof the new path is active');
+    expect(text).toContain('negative proof the old path/fallback is gone');
+  });
+
+  it('requires adversarial plan review before presenting or scaffolding a plan', () => {
+    const text = planContextText('');
+    expect(text).toContain('adversarial plan review');
+    expect(text).toContain('try to invalidate');
+    expect(text).toContain('actual code owner');
+    expect(text).toContain('data granularity');
+    expect(text).toContain('lifecycle owner');
+    expect(text).toContain('revise the plan before presenting or scaffolding');
+  });
+
+  it('treats agent-authored facts as navigation aids, not authority', () => {
+    const text = planContextText('');
+    expect(text).toContain('Agent-authored information is a navigation aid, not authority');
+    expect(text).toContain('plan Ground Truth');
+    expect(text).toContain('evidence summaries');
+    expect(text).toContain('memory notes');
+    expect(text).toContain('current authoritative evidence');
+    expect(text).toContain('cannot be reverified');
+  });
+
+  it('tells a bound board to repair contract-level goal drift before current-phase gates', () => {
+    const text = planContextText('p1');
+    expect(text).toContain('If the user says the goal is wrong');
+    expect(text).toContain('update .braid/plans/p1/contract.md first');
+    expect(text).toContain('then rewrite current-phase.md acceptance gates');
+    expect(text).toContain('prove that corrected target');
+  });
+
   it('tells the agent that full-plan execution continues across roadmap phases', () => {
     const text = planContextText('p1');
     expect(text).toContain(`START your reply with a line containing exactly ${RUN_BEGIN_SENTINEL}`);
@@ -22,6 +76,10 @@ describe('plan methodology run scope', () => {
     expect(text).toContain(`Emit a line containing exactly ${RUN_DONE_SENTINEL} only when`);
     expect(text).toContain('every roadmap phase is complete');
     expect(text).toContain('Before that final marker, include a concise execution summary');
+    expect(text).toContain('## Execution Summary');
+    expect(text).toContain('Completed:');
+    expect(text).toContain('Verification:');
+    expect(text).toContain('Remaining:');
     expect(text).toContain('final line');
   });
 
@@ -33,6 +91,7 @@ describe('plan methodology run scope', () => {
     expect(text).toContain('unrelated tactical change');
     expect(text).toContain('do not read plan files just because this board is bound');
     expect(text).toContain('do not turn that task into plan execution');
+    expect(text).toContain('Do NOT emit either marker for ordinary questions or "continue testing" / "继续测试"');
     expect(text).not.toContain('current-phase.md, contract.md, and decisions.md before acting');
   });
 

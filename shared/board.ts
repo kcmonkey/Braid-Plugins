@@ -43,6 +43,11 @@ export function latestAnswer(board: BoardLike): string {
   return turns[turns.length - 1]?.answer ?? board.answer ?? '';
 }
 
+export function latestPrompt(board: BoardLike): string {
+  const turns = boardTurns(board);
+  return turns[turns.length - 1]?.prompt ?? board.prompt ?? '';
+}
+
 export function hasPendingAsk(board: BoardLike): boolean {
   return boardTurns(board).some((turn) =>
     (turn.steps ?? []).some((step) => step.name === 'AskUserQuestion' && step.result == null),

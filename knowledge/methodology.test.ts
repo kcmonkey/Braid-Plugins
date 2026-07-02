@@ -91,6 +91,18 @@ describe('knowledge methodology', () => {
     // exactly one extra line appended
     expect(gap.split('\n').length).toBe(KNOWLEDGE_PROTOCOL.split('\n').length + 1);
   });
+
+  it('requires reader-query framing: a Recall cue and a reusability test', () => {
+    expect(KNOWLEDGE_PROTOCOL).toMatch(/Recall cue/i);
+    expect(KNOWLEDGE_PROTOCOL).toMatch(/different future task/i);
+  });
+
+  it('appends the note-quality nudge only when a qualityGap is reported', () => {
+    expect(knowledgeContextText()).toBe(KNOWLEDGE_PROTOCOL);
+    const gap = knowledgeContextText([], { qualityGap: true });
+    expect(gap.startsWith(KNOWLEDGE_PROTOCOL)).toBe(true);
+    expect(gap).toContain('no substantive `Recall cue`');
+  });
 });
 
 describe('knowledge seed + manifest', () => {

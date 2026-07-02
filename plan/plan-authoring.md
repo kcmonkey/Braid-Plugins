@@ -53,6 +53,25 @@ For plan execution or review:
 `history.md` is non-authoritative by default. It exists to preserve context without poisoning the active
 contract.
 
+### Agent-Authored Information Is Reference Only
+
+Agent-authored information is a navigation aid, not authority. This includes plan `Ground Truth`, evidence
+summaries, memory notes, previous assistant messages, old test conclusions, script/scene-name explanations, and
+agent interpretations of screenshots, logs, or traces.
+
+Before using any agent-authored claim to make or verify a decision, re-check it against current authoritative
+evidence:
+
+- Current code or asset readback.
+- Blueprint graph / compile / readback.
+- Current runtime logs.
+- Current raw test output.
+- Current screenshot, trace, or video.
+- Explicit user correction.
+
+If the claim cannot be reverified, treat it as an assumption or historical reference, not Ground Truth. A plan
+may summarize evidence, but the summary is only a pointer back to the evidence.
+
 ## 4. WHAT-vs-HOW Boundary
 
 `current-phase.md` states **WHAT** changes. The implementer decides **HOW** using codebase context and
@@ -89,6 +108,31 @@ Mark anything unconfirmed as `[UNVERIFIED]`; do not rely on it until verified.
 No "discovery phase" should exist just to do this later. Ground truth is planner work unless runtime-only
 validation is genuinely impossible during authoring.
 
+### Adversarial Review Before Presenting
+
+Before presenting or scaffolding any systematic plan, run a short adversarial plan review against the real code.
+The goal is to catch the kind of issue a user would otherwise find immediately after asking for a review.
+
+Try to invalidate the proposed contract by checking:
+
+- Actual code owner: the module/component/runtime that owns the behavior today, not just the file names found by
+  grep.
+- Data granularity: whether the plan is operating at the same unit the code uses (board vs turn, item vs list,
+  node vs graph, request vs session, asset vs instance).
+- Lifecycle owner: who owns render, scroll, load, resize, cancel, abort, rollback, exit, cleanup, persistence, or
+  replay for the behavior being changed.
+- Integration/load paths: body loading, lazy loading, virtualized rendering, cached state, provider replay,
+  serialized restore, plugin context, and other non-obvious paths that must still work after the change.
+- Fallback and rollback behavior: whether a proposed fallback resurrects the old slow/buggy path or keeps the old
+  owner authoritative.
+- Gate quality: whether the acceptance criteria would fail if the plan's core assumption were wrong, or whether
+  they only prove a build/test ran.
+
+If the review finds a serious issue, revise the plan before presenting or scaffolding it. Do not outsource basic
+plan review to the user. Capture only durable review facts in `Ground Truth`, `Interfaces / Contracts`,
+`Invariants`, `Prohibited Actions`, or a compact `evidence/review-YYYY-MM-DD.md` note when the review itself is
+likely to be reused.
+
 ## 6. `contract.md` Template
 
 Keep `contract.md` short enough to read every time. It contains only the current effective contract.
@@ -98,6 +142,18 @@ Keep `contract.md` short enough to read every time. It contains only the current
 
 ## Goal
 [1–3 paragraphs: what problem this solves and what the final state means.]
+
+Final Target:
+- [The user-visible end state that must be true when the whole plan is done.]
+
+Done means:
+- [Positive completion signal that proves the final target was reached.]
+
+Not done until:
+- [Required final-state condition that must not be mistaken for optional follow-up.]
+
+Not enough:
+- [Common partial success that does NOT satisfy the user's real target.]
 
 ## Current Decisions
 - ADR-1: [Effective decision and why it still applies.]
@@ -129,6 +185,16 @@ Rules:
 - Long progress logs are forbidden.
 - Do not duplicate `current-phase.md`.
 - Promote one phase at a time from the roadmap into `current-phase.md`; do not write every phase file up front.
+- For systematic work, make the final target explicit inside `## Goal` with the labels `Final Target:`,
+  `Done means:`, `Not done until:`, and `Not enough:` when the user's real outcome could be confused with a
+  partial technical milestone. Plan details render these labels directly, so keep each bullet concrete.
+- Every phase's acceptance criteria should trace back to the final target. If a user correction reveals the target
+  was underspecified, update `contract.md` before changing `current-phase.md`.
+- When a gate can pass while the final target remains false, add a negative proof such as grep/runtime evidence
+  that the old ownership, path, or behavior is gone.
+- If the user says the plan is "not done", "not aligned", `不达标`, or solving the wrong target, treat that as
+  contract drift: repair `contract.md` (`## Goal` labels and affected decisions) first, then rewrite
+  `current-phase.md` acceptance criteria to prove the corrected target.
 
 ## 7. `current-phase.md` Template
 
@@ -172,6 +238,8 @@ Rules:
 - Acceptance criteria are ALWAYS `- [ ]` checkboxes and must be checkable by command output or a tool — never
   prose ("Stages & gates", `### Stage N`, paragraphs). Tick `- [x]` as each gate passes so progress stays
   accurate.
+- Each acceptance criterion must prove a concrete current-phase end state and, for systematic work, the part of the
+  contract-level final target it advances. If it only proves local activity, rewrite it.
 - A phase is normally one implementation slice, not a whole roadmap.
 
 ## 8. `decisions.md` Template
@@ -280,7 +348,41 @@ If a plan is warranted, say so briefly, do the proportional pre-plan exploration
 the user to choose before scaffolding. If the user explicitly says not to plan, continue directly unless the work
 would be unsafe or ambiguous without locked decisions; in that case explain the blocker plainly.
 
-## 16. How To Create A Plan From Natural Language
+## 16. Migration / Replacement / Cutover Plans
+
+Use this section when the work replaces an old owner, path, transport, protocol, storage format, runtime route,
+or behavior with a new one. These plans are prone to false completion because a carrier, shim, adapter, or green
+build can exist while the old route still owns real behavior.
+
+Before presenting the plan:
+
+- Name the old owner/path/transport that must disappear or stop being authoritative.
+- Name the new owner/path/transport that must become mandatory, not merely available.
+- Decide whether the old API shape, function signature, protocol shape, compatibility shim, or adapter seam is still
+  allowed. Preserving the old seam under a new transport can be false completion when the user's goal is a new design.
+- Lock the approach in `decisions.md`: direct replacement, parallel shadow build, staged cutover, or a separate
+  follow-up plan.
+- Lock the fallback/rollback policy. If fallback is prohibited after cutover, say so explicitly.
+- List the parity dimensions that must not regress: behavior, data ownership, serialization, replay, correction,
+  runtime routing, performance, compatibility, or any project-specific equivalent.
+- If a related alternative or larger migration appears, either reject it in `Prohibited Actions` / `Deferred`, or
+  split it into a separate plan or ADR. Do not blur two migrations into one contract.
+
+For phase design:
+
+- A carrier/shim/adaptor phase may be useful, but it must not be mistaken for final completion.
+- The cutover phase owns the proof that the new route is active and the old route cannot still win.
+- If the old API shape is prohibited, at least one phase must prove no active runtime path depends on it.
+- Cleanup/removal phases must include negative source proof for old declarations, calls, config fallbacks, and
+  ownership paths that are supposed to disappear.
+- Runtime or integration evidence is required when source grep cannot prove behavior parity.
+
+Acceptance gates for these plans should include both:
+
+- Positive proof the new path is active in the relevant runtime or integration surface.
+- Negative proof the old path/fallback is gone or no longer authoritative.
+
+## 17. How To Create A Plan From Natural Language
 
 When the user asks (in natural language) to create / draft a plan, with no special command:
 
@@ -290,7 +392,7 @@ When the user asks (in natural language) to create / draft a plan, with no speci
    the templates above, then tell the user the plan name.
 4. When updating or advancing a plan, edit those files in place, keeping this structure.
 
-## 17. Migrating A Legacy `_summary.md` Plan
+## 18. Migrating A Legacy `_summary.md` Plan
 
 Older plans may use `_summary.md` + `phase-XX.md`. When you touch one: create `contract.md` (current effective
 decisions + invariants) and `current-phase.md` (the next executable slice); move superseded design / old

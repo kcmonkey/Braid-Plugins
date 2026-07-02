@@ -1,0 +1,15 @@
+{
+  "id": "memory",
+  "name": "Memory",
+  "version": "1.0.0",
+  "description": "Project-local persistent memory tools stored under .braid/memory/.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "agentTools": ["memory_record", "memory_recall"],
+    "hostServices": ["memory.hostService"],
+    "turnContext": ["memory.turnContext"]
+  }
+}
