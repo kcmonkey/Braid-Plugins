@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { README_PATH, SKILLS_PROTOCOL, cachedSkillEntries, skillSlashCommands, skillsContextText, skillsSeedArtifacts } from './methodology';
+import { README_PATH, SKILLS_PROTOCOL, cachedSkillEntries, skillSlashCommands, skillsContextText, skillsSeedBraidFiles } from './methodology';
 
 describe('skills context injection', () => {
   it('returns null for an empty vault (no injection)', () => {
@@ -15,6 +15,18 @@ describe('skills context injection', () => {
     expect(text).toContain('Stage and commit.');
     expect(text).toContain('.braid/skills/commit-helper/SKILL.md');
     expect(text).toContain(SKILLS_PROTOCOL);
+  });
+
+  it('instructs lazy skill selection instead of plan-run pre-reading', () => {
+    const text = skillsContextText([
+      { name: 'test-engineering', description: 'Use when writing tests.', path: '.braid/skills/test-engineering/SKILL.md' },
+      { name: 'ui-design', description: 'Use when polishing UI.', path: '.braid/skills/ui-design/SKILL.md' },
+    ]) ?? '';
+    expect(text).toContain('choose the smallest matching set');
+    expect(text).toContain('do not pre-read all skills');
+    expect(text).toContain('including during plan runs');
+    expect(text).toContain('one primary skill');
+    expect(text).toContain('reuse it instead of re-reading');
   });
 
   it('dedupes by name and sorts', () => {
@@ -44,7 +56,7 @@ describe('skills context injection', () => {
   });
 
   it('seeds the README spec', () => {
-    expect(skillsSeedArtifacts('DOC').some((a) => a.path === README_PATH)).toBe(true);
+    expect(skillsSeedBraidFiles('DOC').some((a) => a.path === README_PATH)).toBe(true);
   });
 
   it('maps skill entries to slash-command specs (deduped + sorted)', () => {

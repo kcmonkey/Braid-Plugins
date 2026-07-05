@@ -1,0 +1,14 @@
+{
+  "id": "artifacts",
+  "name": "Artifacts",
+  "version": "1.0.0",
+  "description": "Provider-neutral tools for declaring reusable Braid artifacts.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "agentTools": ["artifact_declare"],
+    "hostServices": ["artifacts.hostService"]
+  }
+}

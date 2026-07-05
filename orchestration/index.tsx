@@ -327,28 +327,38 @@ function archetypeForCard(card: Pick<RunCardNode, 'role' | 'stage' | 'packageTit
   return archetypeForRole(card.role);
 }
 
+// A selection is valid only while it still points at a live card. A deliberate close
+// (selectedId === undefined) is NOT selectable, so the reset effect must not treat it as
+// "stale" and re-open the dossier. (review fix — the old effect re-asserted the focused card.)
+export function isSelectableCard(selectedId: string | undefined, cards: RunCardNode[]): boolean {
+  return !!selectedId && cards.some((card) => card.boardId === selectedId);
+}
+
 export function CardTableau({
   model,
   controls,
   onPlayArchetype,
+  initialSelectedId,
 }: {
   model: RunViewModel;
   controls?: React.ReactNode | ((actions: CardTableauControls) => React.ReactNode);
   onPlayArchetype?: (id: OrchestrationArchetypeId) => void | Promise<void>;
+  initialSelectedId?: string;
 }) {
-  const initialSelected = model.focusedBoardId && model.cards.some((card) => card.boardId === model.focusedBoardId)
-    ? model.focusedBoardId
-    : undefined;
-  const [selectedId, setSelectedId] = React.useState<string | undefined>(initialSelected);
+  // The dossier is a modal: CLOSED by default, opened by clicking a card (mockup parity —
+  // the mockup's default view is the command tree, the exec档 is a centered modal you open).
+  // `initialSelectedId` lets SSR tests render it open; the runtime never passes it.
+  const [selectedId, setSelectedId] = React.useState<string | undefined>(
+    initialSelectedId && model.cards.some((card) => card.boardId === initialSelectedId) ? initialSelectedId : undefined,
+  );
   const [mode, setMode] = React.useState<'table' | 'deck' | 'debug'>('table');
   const openCard = React.useCallback((id: string) => setSelectedId(id), []);
   React.useEffect(() => {
-    if (selectedId && model.cards.some((card) => card.boardId === selectedId)) return;
-    setSelectedId(initialSelected);
-  }, [initialSelected, model.cards, selectedId]);
-  const depths = cardDepths(model.cards);
-  const columnCount = Math.max(1, ...[...depths.values()].map((depth) => depth + 1));
-  const treeMinWidth = Math.max(142, columnCount * 152);
+    // Only clear a selection whose board vanished mid-run. A deliberate close leaves
+    // selectedId === undefined and must STAY closed — re-asserting initialSelected here
+    // re-opened the dossier the user just dismissed. (review fix; e2e regression guards it)
+    if (selectedId && !isSelectableCard(selectedId, model.cards)) setSelectedId(undefined);
+  }, [model.cards, selectedId]);
   const cardIds = new Set(model.cards.map((card) => card.boardId));
   const selectedCard = selectedId ? model.cards.find((card) => card.boardId === selectedId) : undefined;
   const controlContent = typeof controls === 'function' ? controls({ selectedId, openCard }) : controls;
@@ -422,33 +432,19 @@ export function CardTableau({
           }}
         >
           <ScopedIntelWires entries={model.scopedIntel} readerBoardId={selectedId ?? model.focusedBoardId ?? model.cards[0]?.boardId} />
-          <div className="orchestration-tree-scroll orchestration-tree tree" style={{ position: 'relative', zIndex: 1, minWidth: 0, overflowX: 'auto', overflowY: 'auto', paddingBottom: 2 }}>
-          <div
-            style={{
-              display: 'grid',
-              gridTemplateColumns: `repeat(${columnCount}, minmax(142px, 1fr))`,
-              gap: 10,
-              alignItems: 'stretch',
-              minWidth: treeMinWidth,
-              width: '100%',
-            }}
-          >
-            {model.cards.map((card) => {
-              const cardBubbles = bubblesBySource.get(card.boardId) ?? [];
-              const speaking = cardBubbles.length > 0 && latestBubbleForCard(cardBubbles)?.id === latestSourcedBubble?.id;
-              return (
-              <div key={card.boardId} className="orchestration-card-speech-anchor" style={{ gridColumn: (depths.get(card.boardId) ?? 0) + 1, display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0, position: 'relative' }}>
-                <RoleCard card={card} selected={card.boardId === selectedId} speaking={speaking} onOpen={() => openCard(card.boardId)} />
-                <SpeechEvents bubbles={cardBubbles} />
+          <div className="orchestration-tree-scroll orchestration-tree tree" style={{ position: 'relative', zIndex: 1, minWidth: 0, overflow: 'auto', padding: '10px 6px 12px' }}>
+            <OrgTree
+              cards={model.cards}
+              bubblesBySource={bubblesBySource}
+              latestSourcedBubbleId={latestSourcedBubble?.id}
+              selectedId={selectedId}
+              openCard={openCard}
+            />
+            {looseBubbles.length ? (
+              <div className="orchestration-speech-loose" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+                {looseBubbles.map((bubble) => <SpeechBalloon key={bubble.id} bubble={bubble} loose />)}
               </div>
-              );
-            })}
-          </div>
-          {looseBubbles.length ? (
-            <div className="orchestration-speech-loose" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
-              {looseBubbles.map((bubble) => <SpeechBalloon key={bubble.id} bubble={bubble} loose />)}
-            </div>
-          ) : null}
+            ) : null}
           </div>
           <div className="orchestration-intel-slot intel" style={{ position: 'relative', zIndex: 1, minWidth: 0, minHeight: 0 }}>
             <ScopedIntelRail entries={model.scopedIntel} />
@@ -524,6 +520,48 @@ export function SteeringControls({ boardId, board, api, state, model, onOpenCard
       ) : null}
     </div>
   );
+}
+
+// Org-chart command tree (mockup `.tree`): nested ul/li built from real parent/child lineage, so the
+// gold connector lines (CSS `.tree li::before/::after`) draw the actual command hierarchy.
+function OrgTree({ cards, bubblesBySource, latestSourcedBubbleId, selectedId, openCard }: {
+  cards: RunCardNode[];
+  bubblesBySource: Map<string, BubbleEvent[]>;
+  latestSourcedBubbleId?: string;
+  selectedId?: string;
+  openCard(id: string): void;
+}) {
+  const byId = new Map(cards.map((c) => [c.boardId, c]));
+  const childrenOf = new Map<string, RunCardNode[]>();
+  const roots: RunCardNode[] = [];
+  for (const c of cards) {
+    const parent = c.parentBoardId && c.parentBoardId !== c.boardId && byId.has(c.parentBoardId) ? c.parentBoardId : undefined;
+    if (parent) {
+      const list = childrenOf.get(parent) ?? [];
+      list.push(c);
+      childrenOf.set(parent, list);
+    } else {
+      roots.push(c);
+    }
+  }
+  const seen = new Set<string>();
+  const renderNode = (card: RunCardNode): React.ReactNode => {
+    if (seen.has(card.boardId)) return null;
+    seen.add(card.boardId);
+    const kids = (childrenOf.get(card.boardId) ?? []).filter((k) => !seen.has(k.boardId));
+    const cardBubbles = bubblesBySource.get(card.boardId) ?? [];
+    const speaking = cardBubbles.length > 0 && latestBubbleForCard(cardBubbles)?.id === latestSourcedBubbleId;
+    return (
+      <li key={card.boardId}>
+        <div className="orchestration-card-speech-anchor" style={{ position: 'relative', display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+          <RoleCard card={card} selected={card.boardId === selectedId} speaking={speaking} onOpen={() => openCard(card.boardId)} />
+          <SpeechEvents bubbles={cardBubbles} />
+        </div>
+        {kids.length ? <ul>{kids.map(renderNode)}</ul> : null}
+      </li>
+    );
+  };
+  return <ul>{roots.map(renderNode)}</ul>;
 }
 
 function RoleCard({ card, selected, speaking, onOpen }: { card: RunCardNode; selected: boolean; speaking?: boolean; onOpen(): void }) {
@@ -662,7 +700,7 @@ function MissionStrip({ mission }: { mission: { title: string; stage: string; pr
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
         <span className="sw" style={{ color: '#b9ab90', border: '1px solid #3b3020', background: '#15120e', borderRadius: 12, padding: '2px 7px', fontSize: 11, whiteSpace: 'nowrap' }}>自动放行 · 每个命令你仍可拦</span>
-        <button type="button" className="btn btn--go" style={{ border: '1px solid #7c5b23', background: '#2d2112', color: '#ffd98a', borderRadius: 5, padding: '4px 8px', fontSize: 11, fontWeight: 900, cursor: 'pointer' }}>↻ 重来</button>
+        <button type="button" className="btn btn--go" disabled title="Restart is controlled from the source board, not this panel yet" style={{ border: '1px solid #5b451f', background: '#241b0f', color: '#b9a678', borderRadius: 5, padding: '4px 8px', fontSize: 11, fontWeight: 900, cursor: 'default', opacity: .55 }}>↻ 重来</button>
       </div>
     </div>
   );
@@ -897,19 +935,28 @@ function ScopedIntelCard({ entry }: { entry: ScopedIntelEntry }) {
 }
 
 function ExecutionDossier({ card, onClose }: { card: RunCardNode | undefined; onClose(): void }) {
-  if (!card) {
-    return (
-      <div className="orchestration-modal orchestration-modal--empty" style={{ marginTop: 10, border: '1px solid #3d3323', background: '#0f0d0a', borderRadius: 7, padding: 10, color: '#8c857b' }}>
-        <div className="orchestration-sheet orchestration-sheet--empty" style={{ color: '#8c857b' }}>Select a card to inspect execution.</div>
-      </div>
-    );
-  }
+  // Esc dismisses the modal — only while it is open (card present), so a closed dossier
+  // never installs a global key listener that could steal Esc from other UI.
+  React.useEffect(() => {
+    if (!card) return undefined;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [card, onClose]);
+  if (!card) return null; // closed: nothing renders (the tree/canvas is the resting view)
   const report = card.report;
   const tone = statusTone(report.status);
   const archetype = archetypeForCard(card);
   const timelineItems = [...report.timeline].slice(0, 6);
   return (
-    <div className="modal on orchestration-modal orchestration-modal--inline" role="dialog" aria-label={`${card.roleLabel} execution dossier`} style={{ marginTop: 10, border: '1px solid #5d4724', background: 'rgba(9,8,6,.72)', borderRadius: 9, padding: 10 }}>
+    <div
+      className="modal on orchestration-modal orchestration-modal--inline"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`${card.roleLabel} execution dossier`}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ marginTop: 10, border: '1px solid #5d4724', background: 'rgba(9,8,6,.72)', borderRadius: 9, padding: 10 }}
+    >
       <div className="sheet orchestration-sheet" style={{ position: 'relative', display: 'grid', gridTemplateColumns: '96px minmax(0, 1fr)', gap: 14, alignItems: 'start', border: '1px solid #8c642b', borderTop: '2px solid #c9962f', background: 'linear-gradient(180deg, #17100a, #110b06)', borderRadius: 8, padding: 14, boxShadow: '0 18px 44px rgba(0,0,0,.45)' }}>
         <button
           type="button"

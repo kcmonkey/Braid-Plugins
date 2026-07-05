@@ -4,12 +4,12 @@ import type {
   BoardPluginApi,
   ContextProviderPlugin,
   PluginManifest,
-  SeedArtifact,
+  SeedBraidFile,
 } from '../../../src/plugin-api/types';
 import { type BoardLike as BoardData } from '../shared/board';
-import { VAULT_DIR, cachedSkillEntries, skillSlashCommands, skillsContextText, skillsSeedArtifacts } from './methodology';
+import { VAULT_DIR, cachedSkillEntries, skillSlashCommands, skillsContextText, skillsSeedBraidFiles } from './methodology';
 import { skillBody, skillEntryFromFile, sortSkillEntries, type SkillEntry } from './parse';
-// The usage doc ships IN this plugin (esbuild `.md` text loader inlines it). seedArtifacts drops a copy at
+// The usage doc ships IN this plugin (esbuild `.md` text loader inlines it). seedBraidFiles drops a copy at
 // `.braid/skills/_README.md` so the agent reads the skill format on demand.
 import USAGE_DOC from './skills-usage.md';
 import manifestJson from './plugin.json';
@@ -28,12 +28,12 @@ function vaultVersion(board: BoardData): string {
 // Discover skills by scanning `.braid/skills/<name>/SKILL.md` and reading each one's frontmatter. Confined to the
 // focused board (mirrors knowledge ADR-6) so a big canvas does not read the vault from every card.
 async function loadSkills(api: BoardPluginApi): Promise<SkillEntry[]> {
-  const dir = await api.listArtifacts(VAULT_DIR);
+  const dir = await api.listBraidDir(VAULT_DIR);
   const out: SkillEntry[] = [];
   for (const e of dir.entries ?? []) {
     if (!e.isDir || e.name.startsWith('_') || e.name.startsWith('.')) continue;
     const mdPath = `${VAULT_DIR}/${e.name}/SKILL.md`;
-    const file = await api.readArtifact(mdPath);
+    const file = await api.readBraidFile(mdPath);
     if (!file.text) continue;
     const entry = skillEntryFromFile(e.name, file.text, mdPath);
     if (entry) out.push(entry);
@@ -90,7 +90,7 @@ export const skillsElementPlugin: BoardElementPlugin<SkillsConfig> = {
   async resolveSlashInsert(name, state, api) {
     const entry = cachedSkillEntries(state).find((e) => e.name === name);
     if (!entry) return null;
-    const file = await api.readArtifact(entry.path);
+    const file = await api.readBraidFile(entry.path);
     return `${skillBody(file.text ?? '')}\n\n`;
   },
 };
@@ -107,7 +107,7 @@ export const skillsContextProvider: ContextProviderPlugin<SkillsConfig> = {
     const text = skillsContextText(cachedSkillEntries(board.elements?.skills));
     return text ? { text } : null;
   },
-  seedArtifacts(): SeedArtifact[] {
-    return skillsSeedArtifacts(USAGE_DOC);
+  seedBraidFiles(): SeedBraidFile[] {
+    return skillsSeedBraidFiles(USAGE_DOC);
   },
 };

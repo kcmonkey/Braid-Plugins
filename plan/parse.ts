@@ -1,6 +1,6 @@
 // Pure parsers that turn a plan's markdown files into a glanceable snapshot (phase / gate progress / decisions /
 // gaps) for the board chip + the ChatView plan panel. Kept pure + total so they are unit-testable independent of
-// React/DOM/host I/O — the hooks in index.tsx do the async readArtifact and feed the text in here.
+// React/DOM/host I/O — the hooks in index.tsx do the async readBraidFile and feed the text in here.
 // (plans/Plan-Plugin — ChatView/board plan visualization)
 
 export interface PlanGate { text: string; done: boolean }

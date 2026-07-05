@@ -358,8 +358,13 @@ Before presenting the plan:
 
 - Name the old owner/path/transport that must disappear or stop being authoritative.
 - Name the new owner/path/transport that must become mandatory, not merely available.
-- Decide whether the old API shape, function signature, protocol shape, compatibility shim, or adapter seam is still
-  allowed. Preserving the old seam under a new transport can be false completion when the user's goal is a new design.
+- Resolve the terminal state of the old owner to ONE outcome with the user — do NOT leave an unresolved "delete
+  OR keep a facade/shim" alternative in the Final Target. Either the old owner is fully removed, or a specific
+  named residual is kept and recorded in `decisions.md` as user-accepted-permanent. An unresolved delete/facade
+  OR defaults to FULL removal; never silently take the cheaper facade branch because it also "passes".
+- Every compatibility facade, shim, adapter, or forwarding seam introduced by the migration is a PROCESS scaffold
+  that a later NAMED phase must remove, unless the user explicitly accepted it as permanent. Preserving the old
+  seam by default — or letting a "facade-only" end state stand in for the real goal — is false completion.
 - Lock the approach in `decisions.md`: direct replacement, parallel shadow build, staged cutover, or a separate
   follow-up plan.
 - Lock the fallback/rollback policy. If fallback is prohibited after cutover, say so explicitly.
@@ -374,7 +379,12 @@ For phase design:
 - The cutover phase owns the proof that the new route is active and the old route cannot still win.
 - If the old API shape is prohibited, at least one phase must prove no active runtime path depends on it.
 - Cleanup/removal phases must include negative source proof for old declarations, calls, config fallbacks, and
-  ownership paths that are supposed to disappear.
+  ownership paths that are supposed to disappear. That negative grep MUST be project-wide (unscoped) and
+  reconciled against the full consumer census — not scoped to the files the phase happened to edit, which
+  returns zero for untouched consumers and proves nothing.
+- Reconcile every removal phase against the original consumer count: each consumer must be migrated, explicitly
+  re-homed to a NAMED owning phase, or justified individually against the resolved Final Target. A "final
+  removal" phase may not be marked done on a narrowed scope while any excluded consumer still has no owning phase.
 - Runtime or integration evidence is required when source grep cannot prove behavior parity.
 
 Acceptance gates for these plans should include both:

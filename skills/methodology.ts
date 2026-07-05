@@ -2,7 +2,7 @@
 // has skills, so the agent can discover and follow reusable, project-local SKILLS under `.braid/skills/` on ANY
 // engine. Everything here is PURE (no React, no `.md` import) so it is unit-testable.
 
-import type { SeedArtifact } from '../../../src/plugin-api/types';
+import type { SeedBraidFile } from '../../../src/plugin-api/types';
 import type { SkillEntry } from './parse';
 import { sortSkillEntries } from './parse';
 
@@ -14,8 +14,11 @@ export const SKILLS_PROTOCOL =
   'This project has reusable agent SKILLS under `.braid/skills/`. Each skill is a folder ' +
   '`.braid/skills/<name>/SKILL.md`: its frontmatter has a name + description, its body holds the instructions, ' +
   'and it may ship helper scripts/resources alongside it. Only skill names + descriptions are listed here — ' +
-  'NOT the bodies. When a task matches a skill, READ that skill\'s SKILL.md on demand BEFORE acting, then ' +
-  'follow it and run any bundled scripts with your own tools. Ignore skills that do not apply.';
+  'NOT the bodies. When a task matches a skill, choose the smallest matching set from names/descriptions; do not ' +
+  'pre-read all skills, including during plan runs. Read one primary skill\'s SKILL.md on demand BEFORE acting, ' +
+  'then read additional skill bodies only if the task actually touches that surface or the opened skill requires ' +
+  'it. If a skill body was already read in this same provider thread and you have not changed it, reuse it instead ' +
+  'of re-reading. Ignore skills that do not apply.';
 
 function asEntry(value: unknown): SkillEntry | undefined {
   if (!value || typeof value !== 'object') return undefined;
@@ -74,6 +77,6 @@ export function skillSlashCommands(entries?: readonly unknown[]): SkillSlashComm
   return normalizeEntries(entries).map((e) => ({ name: e.name, description: e.description || undefined }));
 }
 
-export function skillsSeedArtifacts(usageDoc: string): SeedArtifact[] {
+export function skillsSeedBraidFiles(usageDoc: string): SeedBraidFile[] {
   return [{ path: README_PATH, text: `${README_HEADER}\n\n${usageDoc}` }];
 }

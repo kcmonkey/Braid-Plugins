@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginManifest, RunPolicyPlugin, SeedArtifact } from '../../../src/plugin-api/types';
+import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginManifest, RunPolicyPlugin, SeedBraidFile } from '../../../src/plugin-api/types';
 import { boardTurns, hasPendingAsk, latestAnswer, latestPrompt, type BoardLike as BoardData } from '../shared/board';
 import { runStep, runArm, runDoneVisible, runCompletionSummaryVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, type RunState } from './runStep';
 import { detectCreatedPlan, latestCreatedPlan, planWriteSignal } from './detect';
 import { planContextText } from './methodology';
 import { firstHeading, parseGates, parsePlanSnapshot, type PlanSnapshot } from './parse';
 // The FULL authoring methodology, shipped IN this plugin (esbuild `.md` text loader inlines it). This is the
-// SSOT; `seedArtifacts` drops a copy at `.braid/plans/_authoring.md` so the agent can Read it on demand. (方向O)
+// SSOT; `seedBraidFiles` drops a copy at `.braid/plans/_authoring.md` so the agent can Read it on demand. (方向O)
 import PLAN_AUTHORING from './plan-authoring.md';
 import manifestJson from './plugin.json';
 
@@ -19,15 +19,16 @@ const AUTHORING_DOC = `<!-- Managed by the Braid Plan plugin — edits are overw
 // PER-BOARD state (`board.elements.plan`), persisted via serialize (`...data`, D7) with NO GRAPH_VERSION bump.
 //
 // NO buttons (the user's ask): you drive the plan by TALKING to the agent, not by clicking. A context provider
-// (P1 seam) tells the agent — on every turn of a bound board — to read the authoritative plan files, and to emit
-// a BRAID_RUN_BEGIN marker when you ask it to EXECUTE the plan (vs just discuss). That marker arms the always-on
+// (P1 seam) routes plan-related turns to the authoritative plan files, and tells runtime continuations to reuse
+// unchanged plan context instead of rereading stable files every tick. The agent emits a BRAID_RUN_BEGIN marker
+// when you ask it to EXECUTE the plan (vs just discuss). That marker arms the always-on
 // run loop (Gap E, `planRunPolicy`); the agent emits BRAID_RUN_DONE only when the USER'S requested scope is done
 // (current phase if they asked for that, or every roadmap phase if they asked for the full plan). So "run the plan"
 // / "一口气跑完" starts an autonomous run with no UI control. The plugin's job is READ + VISUALIZE:
 //   - the board card chip shows `◆ planId · phase · done/total` (quick progress at a glance);
 //   - the ChatView panel shows phase + a progress bar + locked decisions + remaining gates + gaps.
 // Decisions are recorded by the AGENT editing decisions.md directly (told via the context provider), then shown
-// here — no lock button. The generic core seams (oneShot/writeArtifact) remain for other plugins; this plugin
+// here — no lock button. The generic core seam (oneShot) remains for other plugins; this plugin
 // no longer needs them.
 
 // `open` = the user explicitly asked (via the right-click menu) to bind/change a plan on this board → the
@@ -75,7 +76,11 @@ function withoutRun(planId: string, state: PlanState | undefined): PlanState {
 // level so a run advances regardless of whether the card is rendered).
 const CONTINUE_PROMPT =
   "Continue the Braid plan execution scope the user requested — do NOT stop to ask for confirmation, and do NOT " +
-  "just summarize and wait. Always read current-phase.md and contract.md first. If the user asked to complete " +
+  "just summarize and wait. Reuse plan files and skill bodies already read in this same provider thread unless " +
+  "you changed them in the current run; do not re-read stable plan or skill files merely because this is an " +
+  "auto-continuation. Re-read only the specific plan file after you changed it, when a phase was promoted, " +
+  "before final completion verification, or when the user questions plan state. Do not read " +
+  "`.braid/plans/_authoring.md` during execution unless you are creating or changing a plan. If the user asked to complete " +
   "only the current phase, finish every acceptance gate in current-phase.md, run the phase/global verification " +
   "the plan requires, then reply with the exact completion-report shape below. The run policy will NOT treat a " +
   `bare ${RUN_DONE_SENTINEL} marker as complete without this heading:\n\n` +
@@ -126,7 +131,7 @@ function usePhaseDoc(planId: string, api: BoardPluginApi, version: string) {
     if (!planId) { setMd(null); return; }
     (async () => {
       for (const f of ['current-phase.md', '_summary.md', 'contract.md']) {
-        const r = await api.readArtifact(`.braid/plans/${planId}/${f}`);
+        const r = await api.readBraidFile(`.braid/plans/${planId}/${f}`);
         if (!alive) return;
         if (r.text) { setMd(r.text); return; }
       }
@@ -147,7 +152,7 @@ function usePlanSnapshot(planId: string, api: BoardPluginApi, version: string) {
     setErr(null);
     if (!planId) { setSnap(null); return; }
     (async () => {
-      const read = async (f: string) => (await api.readArtifact(`.braid/plans/${planId}/${f}`)).text ?? '';
+      const read = async (f: string) => (await api.readBraidFile(`.braid/plans/${planId}/${f}`)).text ?? '';
       let phaseMd = await read('current-phase.md');
       if (!phaseMd) phaseMd = await read('_summary.md');
       const [decisionsMd, contractMd] = await Promise.all([read('decisions.md'), read('contract.md')]);
@@ -335,7 +340,7 @@ function PlanBind({ boardId, board, planId, api }: { boardId: string; board: Boa
   const [plans, setPlans] = useState<string[] | null>(null);
   useEffect(() => {
     let alive = true;
-    api.listArtifacts('.braid/plans').then((r) => {
+    api.listBraidDir('.braid/plans').then((r) => {
       if (!alive) return;
       setPlans((r.entries ?? [])
         .filter((e) => e.isDir && !e.name.startsWith('_') && !e.name.startsWith('.'))
@@ -437,7 +442,7 @@ export const planContextProvider: ContextProviderPlugin<PlanConfig> = {
   },
   // 方向O: ship the FULL authoring methodology WITH the plugin and seed it to `.braid/plans/_authoring.md`, so the
   // plugin is self-contained on ANY project and the agent reads the depth ON DEMAND (not injected every turn).
-  seedArtifacts(): SeedArtifact[] {
+  seedBraidFiles(): SeedBraidFile[] {
     return [{ path: AUTHORING_DOC_PATH, text: AUTHORING_DOC }];
   },
 };

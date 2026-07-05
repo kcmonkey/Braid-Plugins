@@ -4,9 +4,9 @@
 //   1. DEFAULT_METHODOLOGY (below) — a COMPACT, fixed format + a POINTER, injected (DORMANT) on EVERY board so
 //      "create a plan" works from natural language anywhere. Small enough to ride every turn.
 //   2. The FULL authoring doc (`plan-authoring.md`, shipped in this plugin) — seeded once to the project's
-//      `.braid/plans/_authoring.md` (see index.tsx `seedArtifacts`); the compact block points the agent to it,
+//      `.braid/plans/_authoring.md` (see index.tsx `seedBraidFiles`); the compact block points the agent to it,
 //      and the agent Reads it ON DEMAND (lazy — not injected every turn). (方向O — portable, lazy depth)
-// The agent scaffolds a SINGLE `.braid/plans/<name>/`; the run policy AUTO-BINDS the board to it
+// The agent scaffolds a SINGLE `.braid/plans/<name>`; the run policy AUTO-BINDS the board to it
 // (detectCreatedPlan). This replaces the `/new-plan` command for the common case.
 
 import { RUN_BEGIN_SENTINEL, RUN_DONE_SENTINEL } from './runStep';
@@ -41,12 +41,21 @@ export const DEFAULT_METHODOLOGY =
   'For systematic plans, lock the final target before phase gates: every acceptance criterion must trace to ' +
   '`Final Target:` / `Done means:` / `Not done until:` and add negative grep/runtime proof when old ownership, ' +
   'paths, or behavior must disappear.\n' +
-  'For migration/replacement/cutover plans, contract.md must name the old owner/path/transport that will ' +
-  'disappear, the new owner/path/transport that becomes mandatory, the fallback/rollback policy, and the ' +
-  'parity dimensions to preserve; also decide whether the old API shape or any compatibility shim is allowed, ' +
-  'because preserving the old seam under a new transport can be false completion. If an alternative approach or follow-up migration appears, split it into a ' +
-  'separate plan or ADR instead of blurring scope. Acceptance gates need positive proof the new path is active ' +
-  'and negative proof the old path/fallback is gone before completion.\n' +
+  'For migration/replacement/cutover plans (goal = an old owner/path/transport/type/call-site must DISAPPEAR), ' +
+  'contract.md must name the old owner/path/transport that will disappear, the new owner/path/transport that ' +
+  'becomes mandatory, the fallback/rollback policy, and the parity dimensions to preserve. The Final Target must ' +
+  'resolve to ONE terminal state — do NOT leave an unresolved "delete OR keep a facade/shim" alternative; resolve ' +
+  'it with the user (old owner fully removed, or a named residual recorded as user-accepted-permanent in ' +
+  'decisions.md). An unresolved delete/facade OR defaults to FULL removal; never silently take the cheaper facade ' +
+  'branch. Treat every compatibility facade/shim/forwarding seam as a PROCESS scaffold that a later NAMED phase ' +
+  'removes unless the user accepted it as permanent; a facade left to persist by default is false completion, not ' +
+  'done. If an alternative approach or follow-up migration appears, split it into a separate plan or ADR instead ' +
+  'of blurring scope. Acceptance needs positive proof the new path is active AND a PROJECT-WIDE (unscoped) ' +
+  'negative grep reconciled against the full consumer census that the old owner is gone — not a grep scoped to ' +
+  'the files the phase edited (that is blind to untouched consumers and proves nothing). Each original consumer ' +
+  'must be migrated, re-homed to a NAMED owning phase, or justified individually against the resolved Final ' +
+  'Target; a "final removal" phase may not be marked done on a narrowed scope while any excluded consumer has ' +
+  'no owning phase.\n' +
   'Before presenting or scaffolding any systematic plan, do an adversarial plan review: try to invalidate the ' +
   'proposed contract against the actual code owner, data granularity, lifecycle owner, integration/load path, ' +
   'fallback/rollback behavior, and whether each gate would catch a wrong plan. If the review finds a serious ' +
@@ -76,7 +85,10 @@ function boundBlock(planId: string): string {
     `This board is bound to the Braid plan "${planId}". Treat this binding as a routing hint, not as an ` +
     `execution order. If the user asks to run, continue, update, review, discuss, or modify this plan, first ` +
     `read .braid/plans/${planId}/current-phase.md, contract.md, and decisions.md; respect locked decisions and ` +
-    `do not advance past the current phase before its \`- [ ]\` acceptance gates pass. If the user asks for an ` +
+    `do not advance past the current phase before its \`- [ ]\` acceptance gates pass. For runtime/auto-continuation ` +
+    `turns in the same provider thread, do not re-read unchanged plan files just because the board is bound; reuse ` +
+    `previously read plan context, and re-read only the specific plan file after you changed it, when a phase was ` +
+    `promoted, before final completion verification, or when the user questions plan state. If the user asks for an ` +
     `unrelated tactical change, local question, simple review, or single-file edit, do not read plan files just ` +
     `because this board is bound, and do not turn that task into plan execution.\n` +
     `If the user says the goal is wrong, not done, 不达标, or that phase gates passed while missing the real ` +

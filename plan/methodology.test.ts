@@ -24,18 +24,25 @@ describe('plan methodology run scope', () => {
     expect(text).toContain('negative grep/runtime proof');
   });
 
-  it('tells the agent how to structure migration/replacement/cutover plans', () => {
+  it('tells the agent how to structure migration/replacement/cutover plans without false-completion via a facade', () => {
     const text = planContextText('');
     expect(text).toContain('migration/replacement/cutover');
     expect(text).toContain('old owner/path/transport');
     expect(text).toContain('new owner/path/transport');
     expect(text).toContain('fallback/rollback policy');
     expect(text).toContain('split it into a separate plan or ADR');
-    expect(text).toContain('old API shape');
-    expect(text).toContain('compatibility shim');
     expect(text).toContain('false completion');
+    // The Final Target's delete/facade OR must resolve to one terminal state; the cheap facade branch must not win by default.
+    expect(text).toContain('resolve to ONE terminal state');
+    expect(text).toContain('unresolved "delete OR keep a facade/shim"');
+    expect(text).toContain('defaults to FULL removal');
+    expect(text).toContain('PROCESS scaffold');
+    // Removal must be proved project-wide and reconciled against the full consumer census, not scoped to edited files.
     expect(text).toContain('positive proof the new path is active');
-    expect(text).toContain('negative proof the old path/fallback is gone');
+    expect(text).toContain('PROJECT-WIDE (unscoped) negative grep');
+    expect(text).toContain('reconciled against the full consumer census');
+    expect(text).toContain('re-homed to a NAMED owning phase');
+    expect(text).toContain('may not be marked done on a narrowed scope');
   });
 
   it('requires adversarial plan review before presenting or scaffolding a plan', () => {
@@ -93,6 +100,15 @@ describe('plan methodology run scope', () => {
     expect(text).toContain('do not turn that task into plan execution');
     expect(text).toContain('Do NOT emit either marker for ordinary questions or "continue testing" / "继续测试"');
     expect(text).not.toContain('current-phase.md, contract.md, and decisions.md before acting');
+  });
+
+  it('tells runtime plan continuations to reuse unchanged plan context', () => {
+    const text = planContextText('p1');
+    expect(text).toContain('runtime/auto-continuation');
+    expect(text).toContain('do not re-read unchanged plan files');
+    expect(text).toContain('reuse previously read plan context');
+    expect(text).toContain('after you changed it');
+    expect(text).toContain('before final completion verification');
   });
 
   it('requires plan-system changes to be recorded in a Braid plan first', () => {

@@ -6,6 +6,7 @@ import {
   applyRecordedOrchestrationDecision,
   buildOrchestrationRunViewModelFromSnapshot,
   CardTableau,
+  isSelectableCard,
   materializeManualOrchestrationArchetype,
   materializeOrchestrationRoleBoard,
   readOrchestrationRunSnapshot,
@@ -354,6 +355,7 @@ describe('orchestration cutover', () => {
   it('renders view-model bubbles, speech tails, peer links, and scoped-intel wires from live model data', () => {
     const html = renderToStaticMarkup(
       <CardTableau
+        initialSelectedId="lead-1"
         model={{
           runId: 'run-1',
           focusedBoardId: 'lead-1',
@@ -406,7 +408,9 @@ describe('orchestration cutover', () => {
     expect(html).toContain('peerlink');
     expect(html).toContain('peerlink__b');
     expect(html).toContain('orchestration-speech-loose');
-    expect(html).toContain('overflow-x:auto');
+    // The org-chart command tree lives in a dedicated scroll container so a wide hierarchy
+    // scrolls instead of clipping/exploding the panel (Phase 21: overflowX/Y → overflow:auto).
+    expect(html).toContain('orchestration-tree-scroll');
     expect(html).toContain('Outside source');
     expect(html).toContain('orchestration-wires');
     expect(html).toContain('class="wire in orchestration-wire');
@@ -448,6 +452,7 @@ describe('orchestration cutover', () => {
 
     const emptyHtml = renderToStaticMarkup(
       <CardTableau
+        initialSelectedId="empty-1"
         model={{
           runId: 'run-empty',
           focusedBoardId: 'empty-1',
@@ -715,5 +720,18 @@ describe('orchestration cutover', () => {
     expect(html).toContain('worker-1');
     expect(html).toContain('Use the board');
     expect(html).toContain('Stop');
+  });
+
+  it('keeps a live card selectable but treats a deliberate close and a stale board as not selectable', () => {
+    const cards = [
+      { boardId: 'lead-1' },
+      { boardId: 'worker-1' },
+    ] as any;
+    // A live selection stays open.
+    expect(isSelectableCard('lead-1', cards)).toBe(true);
+    // A deliberate close (undefined) must NOT be re-opened by the reset effect.
+    expect(isSelectableCard(undefined, cards)).toBe(false);
+    // A selection whose board vanished mid-run is cleared, not resurrected.
+    expect(isSelectableCard('gone', cards)).toBe(false);
   });
 });

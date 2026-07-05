@@ -125,6 +125,29 @@ describe('planRunPolicy live completion cleanup', () => {
     });
   });
 
+  it('keeps auto-continue from rereading unchanged plan and skill files every tick', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          answer: 'phase work progressed',
+          turns: [{ answer: 'phase work progressed' }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 0 } },
+        interrupted: false,
+      });
+
+      expect((r as any).drive).toContain('Reuse plan files and skill bodies already read');
+      expect((r as any).drive).toContain('do not re-read stable plan or skill files');
+      expect((r as any).drive).toContain('before final completion verification');
+      expect((r as any).drive).toContain('Do not read `.braid/plans/_authoring.md` during execution');
+      expect((r as any).drive).not.toContain('Always read current-phase.md and contract.md first');
+    });
+  });
+
   it('stops a bound streaming board when summarized completion is visible even if run state is missing', () => {
     return import('./index').then(({ planRunPolicy }) => {
     const r = planRunPolicy.step({

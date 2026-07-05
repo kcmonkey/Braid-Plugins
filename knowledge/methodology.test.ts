@@ -7,7 +7,7 @@ import {
   cachedIndexTitles,
   cachedRoutingEntries,
   knowledgeContextText,
-  knowledgeSeedArtifacts,
+  knowledgeSeedBraidFiles,
 } from './methodology';
 import manifest from './plugin.json';
 
@@ -107,7 +107,7 @@ describe('knowledge methodology', () => {
 
 describe('knowledge seed + manifest', () => {
   it('seed builder returns exactly one artifact under .braid/knowledge/', () => {
-    const arts = knowledgeSeedArtifacts('# usage doc body');
+    const arts = knowledgeSeedBraidFiles('# usage doc body');
     expect(arts).toHaveLength(1);
     expect(arts[0].path.startsWith(`${VAULT_DIR}/`)).toBe(true);
     expect(arts[0].text).toContain('# usage doc body');

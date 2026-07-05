@@ -4,7 +4,7 @@ import type {
   BoardPluginApi,
   ContextProviderPlugin,
   PluginManifest,
-  SeedArtifact,
+  SeedBraidFile,
 } from '../../../src/plugin-api/types';
 import { boardTurns, type BoardLike as BoardData } from '../shared/board';
 import {
@@ -12,12 +12,12 @@ import {
   VAULT_INDEX,
   cachedRoutingEntries,
   knowledgeContextText,
-  knowledgeSeedArtifacts,
+  knowledgeSeedBraidFiles,
 } from './methodology';
 import { notesFromEntries, parseKnowledgeIndex, routableKnowledgeEntries, type KnowledgeNote } from './parse';
 import { lessonRecordingGap, noteQualityGap } from './detect';
 // The full usage doc, shipped IN this plugin (esbuild `.md` text loader inlines it). This is the SSOT;
-// seedArtifacts drops a copy at `.braid/knowledge/_README.md` so the agent reads the convention on demand.
+// seedBraidFiles drops a copy at `.braid/knowledge/_README.md` so the agent reads the convention on demand.
 import USAGE_DOC from './knowledge-usage.md';
 import manifestJson from './plugin.json';
 
@@ -33,10 +33,10 @@ function vaultVersion(board: BoardData): string {
 
 // Read the vault notes: prefer the agent-maintained `_index.md`, else list the `.md` files in the vault dir.
 async function loadNotes(api: BoardPluginApi): Promise<KnowledgeNote[]> {
-  const idx = await api.readArtifact(VAULT_INDEX);
+  const idx = await api.readBraidFile(VAULT_INDEX);
   const fromIndex = idx.text ? parseKnowledgeIndex(idx.text) : [];
   if (fromIndex.length) return fromIndex;
-  const dir = await api.listArtifacts(VAULT_DIR);
+  const dir = await api.listBraidDir(VAULT_DIR);
   return notesFromEntries(dir.entries ?? []);
 }
 
@@ -150,7 +150,7 @@ export const knowledgeContextProvider: ContextProviderPlugin<KnowledgeConfig> = 
       }),
     };
   },
-  seedArtifacts(): SeedArtifact[] {
-    return knowledgeSeedArtifacts(USAGE_DOC);
+  seedBraidFiles(): SeedBraidFile[] {
+    return knowledgeSeedBraidFiles(USAGE_DOC);
   },
 };

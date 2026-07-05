@@ -287,7 +287,7 @@ function CoordinatorResourcesConfigPanel({ api }: { api: BoardPluginApi }) {
     setLoading(true);
     setError(null);
     setSaved(null);
-    const result = await api.readArtifact(RESOURCE_FILE);
+    const result = await api.readBraidFile(RESOURCE_FILE);
     if (result.error) {
       setResources([]);
       setError(result.error);
@@ -327,7 +327,7 @@ function CoordinatorResourcesConfigPanel({ api }: { api: BoardPluginApi }) {
     setSaving(true);
     setError(null);
     setSaved(null);
-    const result = await api.writeArtifact(RESOURCE_FILE, resourceDocumentText(resources));
+    const result = await api.writeBraidFile(RESOURCE_FILE, resourceDocumentText(resources));
     setSaving(false);
     if (result.error) {
       setError(result.error);

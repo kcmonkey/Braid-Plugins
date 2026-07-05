@@ -2,7 +2,7 @@
 // every board so the agent records and recalls durable, project-specific knowledge under `.braid/knowledge/`
 // with NO manual UI. Everything here is PURE (no React, no `.md` import) so it is unit-testable.
 
-import type { SeedArtifact } from '../../../src/plugin-api/types';
+import type { SeedBraidFile } from '../../../src/plugin-api/types';
 import type { KnowledgeNote } from './parse';
 import { routableKnowledgeEntries } from './parse';
 
@@ -119,6 +119,6 @@ export function cachedIndexTitles(elementState: unknown): string[] {
   return cachedRoutingEntries(elementState).map((e) => e.title);
 }
 
-export function knowledgeSeedArtifacts(usageDoc: string): SeedArtifact[] {
+export function knowledgeSeedBraidFiles(usageDoc: string): SeedBraidFile[] {
   return [{ path: README_PATH, text: `${README_HEADER}\n\n${usageDoc}` }];
 }
