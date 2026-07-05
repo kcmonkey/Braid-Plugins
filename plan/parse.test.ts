@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { firstHeading, parseGates, parseDecisions, parseDeferred, parseSection, parsePlanSnapshot, parsePhases, matchPhaseIndex, parseFinalTarget } from './parse';
+import { firstHeading, parseGates, parseDecisions, parseDeferred, parseSection, parsePlanSnapshot, parsePhases, matchPhaseIndex, parseFinalTarget, parseSettlePredicates } from './parse';
 
 describe('plan parse', () => {
   it('firstHeading strips the "Current Phase:" prefix', () => {
@@ -57,6 +57,29 @@ describe('plan parse', () => {
     const md = '# Title\n## Goal\nDo the thing.\nMore detail.\n## Next\n- x\n';
     expect(parseSection(md, /^#{1,6}\s+goal\b/i)).toBe('Do the thing.\nMore detail.');
     expect(parseSection(md, /^#{1,6}\s+missing\b/i)).toBe('');
+  });
+
+  it('parseSettlePredicates extracts deterministic Settle Gate lines', () => {
+    const md = [
+      '# Current Phase: Verify',
+      '## Settle Gate',
+      '- run: npm test',
+      '- grep0: oldArtifactName',
+      '- grep1: SettlePredicate',
+      '- note: ignored',
+      '',
+      '## Acceptance Criteria',
+      '- [ ] done',
+    ].join('\n');
+    expect(parseSettlePredicates(md)).toEqual([
+      { kind: 'run', command: 'npm test' },
+      { kind: 'grep0', pattern: 'oldArtifactName' },
+      { kind: 'grep1', pattern: 'SettlePredicate' },
+    ]);
+  });
+
+  it('parseSettlePredicates returns empty when the Settle Gate block is absent', () => {
+    expect(parseSettlePredicates('## Goal\nNo machine gate yet.\n- run: not under the gate\n')).toEqual([]);
   });
 
   it('parseFinalTarget extracts structured goal-fidelity checks from the contract goal body', () => {

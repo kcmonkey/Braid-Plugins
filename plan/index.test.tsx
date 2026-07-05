@@ -77,6 +77,88 @@ describe('planRunPolicy live completion cleanup', () => {
     });
   });
 
+  it('returns a source-neutral verify step when a summarized completion has Settle Gate predicates', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const predicates = [{ kind: 'run' as const, command: 'npm test' }];
+      const answer = '## Execution Summary\n- Completed: done\n- Verification: local checks\n- Remaining: none\nBRAID_RUN_DONE';
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          prompt: 'Run the current phase',
+          answer,
+          turns: [{ prompt: 'Run the current phase', answer }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 1, userPrompt: 'Run the current phase' }, settlePredicates: predicates },
+        interrupted: false,
+      });
+
+      expect(r).toMatchObject({
+        verify: predicates,
+        state: { planId: 'p1', run: { status: 'running', note: 'verifying Settle Gate' }, settlePredicates: predicates },
+        event: { kind: 'verify', title: 'Plan verifying Settle Gate' },
+      });
+    });
+  });
+
+  it('completes as host-verified when the Settle Gate verdict passes', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const predicates = [{ kind: 'grep1' as const, pattern: 'SettlePredicate' }];
+      const answer = '## Execution Summary\n- Completed: done\n- Verification: local checks\n- Remaining: none\nBRAID_RUN_DONE';
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          prompt: 'Run the current phase',
+          answer,
+          turns: [{ prompt: 'Run the current phase', answer }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 1, userPrompt: 'Run the current phase' }, settlePredicates: predicates },
+        interrupted: false,
+        settleVerdict: { pass: true, results: [{ predicate: predicates[0], pass: true, detail: 'matched' }] },
+      });
+
+      expect(r).toMatchObject({
+        state: { planId: 'p1', run: { status: 'paused', note: 'completed ✓ host-verified' }, settlePredicates: predicates },
+        event: { kind: 'verified', title: 'Plan completed with host-verified Settle Gate' },
+      });
+    });
+  });
+
+  it('re-drives with concrete Settle Gate failure detail when the verdict fails', () => {
+    return import('./index').then(({ planRunPolicy }) => {
+      const predicates = [{ kind: 'grep0' as const, pattern: 'legacyName' }];
+      const answer = '## Execution Summary\n- Completed: done\n- Verification: local checks\n- Remaining: none\nBRAID_RUN_DONE';
+      const r = planRunPolicy.step({
+        boardId: 'b1',
+        board: {
+          status: 'done',
+          prompt: 'Run the current phase',
+          answer,
+          turns: [{ prompt: 'Run the current phase', answer }],
+          elements: { plan: { planId: 'p1' } },
+        } as any,
+        config: {},
+        state: { planId: 'p1', run: { status: 'running', continues: 1, userPrompt: 'Run the current phase' }, settlePredicates: predicates },
+        interrupted: false,
+        settleVerdict: { pass: false, results: [{ predicate: predicates[0], pass: false, detail: 'legacyName matched src/a.ts:1' }] },
+      });
+
+      expect(r).toMatchObject({
+        permissionMode: 'bypassPermissions',
+        state: { planId: 'p1', run: { status: 'running', continues: 2, note: 'repairing Settle Gate' }, settlePredicates: predicates },
+        event: { kind: 'repair', title: 'Plan requested Settle Gate repair' },
+      });
+      expect((r as any).drive).toContain('The host-ran Settle Gate failed');
+      expect((r as any).drive).toContain('grep0: legacyName');
+      expect((r as any).drive).toContain('legacyName matched src/a.ts:1');
+    });
+  });
+
   it('keeps the original user prompt as displayPrompt when driving a completion-summary repair', () => {
     return import('./index').then(({ planRunPolicy }) => {
       const r = planRunPolicy.step({

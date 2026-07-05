@@ -8,7 +8,7 @@
   "scope": "builtin",
   "runtime": "builtin",
   "contributes": {
-    "agentTools": ["artifact_declare"],
+    "agentTools": ["artifact_declare", "artifact_types"],
     "hostServices": ["artifacts.hostService"]
   }
 }

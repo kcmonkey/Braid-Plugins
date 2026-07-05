@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { runStep, runArm, runDoneVisible, runCompletionSummaryVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, RUN_BEGIN_SENTINEL, type RunState } from './runStep';
 
 const running = (over: Partial<RunState> = {}): RunState => ({ status: 'running', continues: 0, ...over });
+const doneWithSummary = `## Execution Summary\n- Completed: all gates pass.\n- Verification: command passed\n- Remaining: none\n${RUN_DONE_SENTINEL}`;
 
 describe('runStep — Plan run controller safety state machine (P3c / Gap E)', () => {
   it('does nothing when there is no run, or the run is paused', () => {
@@ -57,9 +58,43 @@ describe('runStep — Plan run controller safety state machine (P3c / Gap E)', (
   });
 
   it('PAUSES when the agent signals completion with the required execution summary', () => {
-    const d = runStep(running({ continues: 1 }), 'done', `## Execution Summary\n- Completed: all gates pass.\n- Verification: command passed\n- Remaining: none\n${RUN_DONE_SENTINEL}`, false);
+    const d = runStep(running({ continues: 1 }), 'done', doneWithSummary, false);
     expect(d.action).toBe('pause');
     expect(d.action === 'pause' && d.next.note).toContain('completed');
+  });
+
+  it('VERIFIES instead of completing when Settle Gate predicates are present', () => {
+    const predicates = [{ kind: 'run' as const, command: 'npm test' }];
+    const d = runStep(running({ continues: 1 }), 'done', doneWithSummary, false, { settlePredicates: predicates });
+    expect(d.action).toBe('verify');
+    if (d.action === 'verify') {
+      expect(d.predicates).toEqual(predicates);
+      expect(d.next.note).toContain('verifying Settle Gate');
+    }
+  });
+
+  it('PAUSES as host-verified when Settle Gate predicates pass', () => {
+    const predicates = [{ kind: 'run' as const, command: 'npm test' }];
+    const d = runStep(running({ continues: 1 }), 'done', doneWithSummary, false, {
+      settlePredicates: predicates,
+      settleVerdict: { pass: true, results: [{ predicate: predicates[0], pass: true, detail: 'exit 0' }] },
+    });
+    expect(d.action).toBe('pause');
+    expect(d.action === 'pause' && d.verified).toBe(true);
+    expect(d.action === 'pause' && d.next.note).toContain('host-verified');
+  });
+
+  it('CONTINUES with failure detail when Settle Gate predicates fail', () => {
+    const predicates = [{ kind: 'grep0' as const, pattern: 'legacyName' }];
+    const verdict = { pass: false, results: [{ predicate: predicates[0], pass: false, detail: 'legacyName matched src/a.ts:1' }] };
+    const d = runStep(running({ continues: 1 }), 'done', doneWithSummary, false, { settlePredicates: predicates, settleVerdict: verdict });
+    expect(d.action).toBe('continue');
+    if (d.action === 'continue') {
+      expect(d.reason).toBe('settleVerificationFailed');
+      expect(d.verdict).toBe(verdict);
+      expect(d.next.continues).toBe(2);
+      expect(d.next.note).toContain('repairing Settle Gate');
+    }
   });
 
   it('does not complete on a bare sentinel; it requests one repair turn for the missing execution summary', () => {

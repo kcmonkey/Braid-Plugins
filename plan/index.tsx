@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginManifest, RunPolicyPlugin, SeedBraidFile } from '../../../src/plugin-api/types';
+import type { SettlePredicate, SettleVerdict } from '../../../src/protocol';
 import { boardTurns, hasPendingAsk, latestAnswer, latestPrompt, type BoardLike as BoardData } from '../shared/board';
 import { runStep, runArm, runDoneVisible, runCompletionSummaryVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, type RunState } from './runStep';
 import { detectCreatedPlan, latestCreatedPlan, planWriteSignal } from './detect';
 import { planContextText } from './methodology';
-import { firstHeading, parseGates, parsePlanSnapshot, type PlanSnapshot } from './parse';
+import { firstHeading, parseGates, parsePlanSnapshot, parseSettlePredicates, type PlanSnapshot } from './parse';
 // The FULL authoring methodology, shipped IN this plugin (esbuild `.md` text loader inlines it). This is the
 // SSOT; `seedBraidFiles` drops a copy at `.braid/plans/_authoring.md` so the agent can Read it on demand. (方向O)
 import PLAN_AUTHORING from './plan-authoring.md';
@@ -33,7 +34,7 @@ const AUTHORING_DOC = `<!-- Managed by the Braid Plan plugin — edits are overw
 
 // `open` = the user explicitly asked (via the right-click menu) to bind/change a plan on this board → the
 // detail card reveals the picker. NOT shown by default. Cleared on commit/cancel.
-interface PlanState { planId: string; run?: RunState; open?: boolean }
+interface PlanState { planId: string; run?: RunState; open?: boolean; settlePredicates?: SettlePredicate[] }
 // The plan FORMAT (how to author/structure a Braid plan) is a FIXED constant in methodology.ts — identical to
 // the Contractors_Showdown contract format, injected on every board. There is no per-plugin config. (D11)
 type PlanConfig = Record<string, never>;
@@ -68,8 +69,15 @@ function userRequestedPlanExecution(prompt: string): boolean {
   if (/(继续|接着).*(执行|跑|完成)/.test(text)) return true;
   return false;
 }
+function settlePredicatesEqual(a: SettlePredicate[] | undefined, b: SettlePredicate[] | undefined): boolean {
+  return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
+}
+function withSettlePredicates(state: PlanState, predicates: SettlePredicate[]): PlanState {
+  const { settlePredicates: _drop, ...rest } = state;
+  return predicates.length ? { ...rest, settlePredicates: predicates } : rest;
+}
 function withoutRun(planId: string, state: PlanState | undefined): PlanState {
-  return { planId, ...(state?.open ? { open: true } : {}) };
+  return { planId, ...(state?.open ? { open: true } : {}), ...(state?.settlePredicates?.length ? { settlePredicates: state.settlePredicates } : {}) };
 }
 
 // The auto-continue prompt the run loop re-drives with (the loop lives in `planRunPolicy`, driven at the canvas
@@ -105,6 +113,24 @@ const COMPLETION_REPORT_PROMPT =
   "- Verification: <acceptance gates / commands / checks that passed>\n" +
   "- Remaining: <gaps, risks, or none>\n\n" +
   `${RUN_DONE_SENTINEL}`;
+
+function describePredicate(p: SettlePredicate): string {
+  return p.kind === 'run' ? `run: ${p.command}` : `${p.kind}: ${p.pattern}`;
+}
+
+function settleFailureSummary(verdict: SettleVerdict): string {
+  const failed = verdict.results.filter((r) => !r.pass);
+  return failed.map((r, i) => `${i + 1}. ${describePredicate(r.predicate)}\n${r.detail.trim() || 'No detail returned.'}`).join('\n\n');
+}
+
+function settleGateRepairPrompt(verdict: SettleVerdict): string {
+  return [
+    'The host-ran Settle Gate failed. Do not claim completion yet.',
+    'Fix the failing predicates below, rerun the relevant verification, update plan evidence/current-phase as needed, then emit the normal completion report only after the gate can pass.',
+    '',
+    settleFailureSummary(verdict),
+  ].join('\n');
+}
 
 // Refetch plan files when the board settles, and while live only when this board writes the bound plan files. That
 // keeps normal token streaming from causing read storms while still reflecting an agent that advances current-phase
@@ -142,33 +168,49 @@ function usePhaseDoc(planId: string, api: BoardPluginApi, version: string) {
   return { md, err };
 }
 
+function useSyncSettlePredicates(boardId: string, board: BoardData, planId: string, phaseMd: string | null | undefined, api: BoardPluginApi) {
+  useEffect(() => {
+    if (!planId || phaseMd == null) return;
+    const prev = asPlanState(board.elements?.plan);
+    if (!prev || safePlanId(prev.planId) !== planId) return;
+    const nextPredicates = parseSettlePredicates(phaseMd);
+    if (settlePredicatesEqual(prev.settlePredicates, nextPredicates)) return;
+    api.patchBoard(boardId, {
+      elements: { ...(board.elements ?? {}), plan: withSettlePredicates(prev, nextPredicates) },
+    });
+  }, [boardId, board, planId, phaseMd, api]);
+}
+
 // Reads the three plan files and parses the full snapshot. Used by the richer ChatView panel (one panel at a
 // time, so 3 reads per settle is cheap).
 function usePlanSnapshot(planId: string, api: BoardPluginApi, version: string) {
   const [snap, setSnap] = useState<PlanSnapshot | null>(null);
+  const [phaseMdState, setPhaseMdState] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
     setErr(null);
-    if (!planId) { setSnap(null); return; }
+    if (!planId) { setSnap(null); setPhaseMdState(null); return; }
     (async () => {
       const read = async (f: string) => (await api.readBraidFile(`.braid/plans/${planId}/${f}`)).text ?? '';
       let phaseMd = await read('current-phase.md');
       if (!phaseMd) phaseMd = await read('_summary.md');
       const [decisionsMd, contractMd] = await Promise.all([read('decisions.md'), read('contract.md')]);
       if (!alive) return;
-      if (!phaseMd && !decisionsMd && !contractMd) { setSnap(null); setErr('plan files not found'); return; }
+      if (!phaseMd && !decisionsMd && !contractMd) { setSnap(null); setPhaseMdState(null); setErr('plan files not found'); return; }
       if (!phaseMd) phaseMd = contractMd; // last resort so at least the phase heading shows
+      setPhaseMdState(phaseMd);
       setSnap(parsePlanSnapshot({ phaseMd, decisionsMd, contractMd }));
     })();
     return () => { alive = false; };
   }, [planId, api, version]);
-  return { snap, err };
+  return { snap, phaseMd: phaseMdState, err };
 }
 
 // Compact card chip: `◆ planId  [▶ n/6 | ⏸]  done/total  · phase`. Read-only; one file read per settled turn.
-function PlanChip({ planId, api, board, run, inline = false }: { planId: string; api: BoardPluginApi; board: BoardData; run?: RunState; inline?: boolean }) {
+function PlanChip({ boardId, planId, api, board, run, inline = false }: { boardId: string; planId: string; api: BoardPluginApi; board: BoardData; run?: RunState; inline?: boolean }) {
   const { md, err } = usePhaseDoc(planId, api, planVersion(board, planId));
+  useSyncSettlePredicates(boardId, board, planId, md, api);
   const phase = md ? firstHeading(md) : undefined;
   const gates = md ? parseGates(md) : [];
   const done = gates.filter((g) => g.done).length;
@@ -195,8 +237,9 @@ function PlanChip({ planId, api, board, run, inline = false }: { planId: string;
 
 // ChatView panel: an at-a-glance plan status above the conversation — phase, progress bar, locked decisions,
 // remaining gates, and declared gaps. Always shows the compact header; a ▾ toggle reveals the detail.
-function PlanPanel({ planId, api, board }: { planId: string; api: BoardPluginApi; board: BoardData }) {
-  const { snap, err } = usePlanSnapshot(planId, api, planVersion(board, planId));
+function PlanPanel({ boardId, planId, api, board }: { boardId: string; planId: string; api: BoardPluginApi; board: BoardData }) {
+  const { snap, phaseMd, err } = usePlanSnapshot(planId, api, planVersion(board, planId));
+  useSyncSettlePredicates(boardId, board, planId, phaseMd, api);
   // Default COLLAPSED so the panel doesn't eat the conversation area; the always-visible header carries the
   // concise status (plan · phase · progress · run) and the user expands on demand for the full details.
   const [open, setOpen] = useState(false);
@@ -385,15 +428,15 @@ export const planElementPlugin: BoardElementPlugin<PlanConfig> = {
     const planId = planIdOf(board);
     const open = !!asPlanState(board.elements?.plan)?.open;
     // ChatView: a glanceable plan panel above the conversation (phase / progress / decisions / gaps).
-    if (slot === 'chatview-aside') return planId ? <PlanPanel planId={planId} api={api} board={board} /> : null;
+    if (slot === 'chatview-aside') return planId ? <PlanPanel boardId={boardId} planId={planId} api={api} board={board} /> : null;
     if (slot === 'card-detail') {
       // The detail card ONLY hosts the (rarely used) plan picker, revealed from the right-click menu. The chip is
       // rendered by 'card-top' (visible at detail AND far), so it is NOT repeated here. No run/decision buttons —
       // the plan is driven by talking to the agent.
       return open ? <PlanBind boardId={boardId} board={board} planId={planId} api={api} /> : null;
     }
-    if (slot === 'card-head-inline') return planId ? <PlanChip planId={planId} api={api} board={board} run={runOf(asPlanState(board.elements?.plan))} inline /> : null;
-    return planId ? <PlanChip planId={planId} api={api} board={board} run={runOf(asPlanState(board.elements?.plan))} /> : null; // compact (card-top)
+    if (slot === 'card-head-inline') return planId ? <PlanChip boardId={boardId} planId={planId} api={api} board={board} run={runOf(asPlanState(board.elements?.plan))} inline /> : null;
+    return planId ? <PlanChip boardId={boardId} planId={planId} api={api} board={board} run={runOf(asPlanState(board.elements?.plan))} /> : null; // compact (card-top)
   },
   // Manual bind lives in the right-click menu, so it's a deliberate action instead of a control on every card.
   boardMenu({ boardId, board, api }) {
@@ -466,7 +509,7 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
     const planId = safePlanId(ps?.planId ?? '');
     return planId && runOf(ps)?.status === 'running' ? planId : undefined;
   },
-  step({ board, state, interrupted }) {
+  step({ board, state, interrupted, settleVerdict }) {
     const planState = asPlanState(state);
     const planId = safePlanId(planState?.planId ?? '');
     if (!planId) {
@@ -491,6 +534,7 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
     const turnCount = boardTurns(board).length;
     const la = latestAnswer(board);
     const displayPrompt = runDisplayPrompt(board, run);
+    const settlePredicates = planState?.settlePredicates ?? [];
     // A board with FEWER turns than when the run last acted was truncated in place by a ChatView fork/split
     // (splitBoardAtTurn / splitBoardIntoTurnBoards rewrite a board's turns[]). Its answer no longer matches the
     // run's lastSig, so the auto-continue loop would re-drive it as a phantom "Generating…" turn. A manual
@@ -516,6 +560,26 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
                 ...(run?.summaryRepairSent ? { summaryRepairSent: true } : {}),
                 note: 'completion marker missing Execution Summary',
               },
+            },
+            stop: true,
+          };
+        }
+        return null;
+      }
+      if (settlePredicates.length) {
+        if (!(run?.status === 'running' && run.lastSig === answerSig && run.note === 'verifying Settle Gate')) {
+          return {
+            state: {
+              planId,
+              run: {
+                status: 'running',
+                continues: run?.continues ?? 0,
+                lastSig: answerSig,
+                seenTurns: turnCount,
+                userPrompt: displayPrompt,
+                note: 'verifying Settle Gate',
+              },
+              settlePredicates,
             },
             stop: true,
           };
@@ -559,21 +623,35 @@ export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
     if (run?.status === 'paused' && turnCount > (run.seenTurns ?? 0)) return { state: withoutRun(planId, planState) };
     // CONTINUE / PAUSE / WAIT. A pending AskUserQuestion is a real human decision → pause. A permission prompt is
     // NOT a pause (continues bypass approvals; turn 1 just waits for your approval, then the run resumes).
-    const d = runStep(run, board.status, la, hasPendingAsk(board));
+    const d = runStep(run, board.status, la, hasPendingAsk(board), { settlePredicates, ...(settleVerdict ? { settleVerdict } : {}) });
     if (d.action === 'wait') return null;
     const next: RunState = { ...d.next, seenTurns: turnCount, userPrompt: d.next.userPrompt ?? displayPrompt };
+    if (d.action === 'verify') {
+      return {
+        verify: d.predicates,
+        state: { planId, run: next, ...(settlePredicates.length ? { settlePredicates } : {}) },
+        event: { kind: 'verify', title: 'Plan verifying Settle Gate', detail: `${d.predicates.length} host predicate(s) queued.`, status: 'busy' },
+      };
+    }
     if (d.action === 'continue') {
       const completionRepair = d.reason === 'completionSummaryMissing';
+      const settleRepairVerdict = d.reason === 'settleVerificationFailed' ? d.verdict : undefined;
       return {
-        drive: completionRepair ? COMPLETION_REPORT_PROMPT : CONTINUE_PROMPT,
+        drive: completionRepair ? COMPLETION_REPORT_PROMPT : settleRepairVerdict ? settleGateRepairPrompt(settleRepairVerdict) : CONTINUE_PROMPT,
         displayPrompt: next.userPrompt,
-        state: { planId, run: next },
+        state: { planId, run: next, ...(settlePredicates.length ? { settlePredicates } : {}) },
         permissionMode: 'bypassPermissions',
         event: completionRepair
           ? { kind: 'repair', title: 'Plan requested execution summary', detail: 'The completion marker was missing the required report block.', status: 'done' }
+          : settleRepairVerdict
+          ? { kind: 'repair', title: 'Plan requested Settle Gate repair', detail: settleFailureSummary(settleRepairVerdict), status: 'error' }
           : { kind: 'continue', title: 'Plan auto-continued', detail: 'Continuing the current phase without adding a user-authored prompt.', status: 'done' },
       };
     }
-    return { state: { planId, run: next }, ...(d.stop ? { stop: true } : {}) };
+    return {
+      state: { planId, run: next, ...(settlePredicates.length ? { settlePredicates } : {}) },
+      ...(d.stop ? { stop: true } : {}),
+      ...(d.verified ? { event: { kind: 'verified', title: 'Plan completed with host-verified Settle Gate', status: 'done' } } : {}),
+    };
   },
 };

@@ -2,6 +2,7 @@
 // Extracted from the React effect so the RUNAWAY-PRONE state machine is deterministically unit-testable,
 // independent of React/DOM. The hard cap (MAX_CONTINUES) is the structural backstop: even if every other
 // branch were wrong, the loop can re-drive a board at most MAX_CONTINUES times before it pauses.
+import type { SettlePredicate, SettleVerdict } from '../../../src/protocol';
 
 export const MAX_CONTINUES = 6;
 export const RUN_DONE_SENTINEL = 'BRAID_RUN_DONE';
@@ -48,8 +49,9 @@ export function runCompletionSummaryVisible(text: string): boolean {
 }
 
 export type RunDecision =
-  | { action: 'continue'; next: RunState; reason?: 'completionSummaryMissing' } // persist `next`, then re-drive the board
-  | { action: 'pause'; next: RunState; stop?: boolean } // persist `next`; optionally stop the live turn
+  | { action: 'continue'; next: RunState; reason?: 'completionSummaryMissing' | 'settleVerificationFailed'; verdict?: SettleVerdict } // persist `next`, then re-drive the board
+  | { action: 'verify'; next: RunState; predicates: SettlePredicate[] } // persist `next`, then ask the source-neutral driver to run host predicates
+  | { action: 'pause'; next: RunState; stop?: boolean; verified?: boolean } // persist `next`; optionally stop the live turn
   | { action: 'wait' };                    // do nothing this render
 
 // FNV-1a hash of a settled turn's answer. `lastSig` makes each settled turn drive AT MOST ONCE — the guard
@@ -85,12 +87,44 @@ export function runArm(run: RunState | undefined, answer: string, turnCount: num
  *   reads as `streaming` — status alone cannot see it. (A pending PERMISSION prompt is intentionally NOT a pause:
  *   the run bypasses approvals on continues, and turn 1 just waits for the user's approval.)
  */
-export function runStep(run: RunState | undefined, status: string, answer: string, needsUser: boolean): RunDecision {
+export interface RunStepOptions {
+  settlePredicates?: SettlePredicate[];
+  settleVerdict?: SettleVerdict;
+}
+
+export function runStep(run: RunState | undefined, status: string, answer: string, needsUser: boolean, options: RunStepOptions = {}): RunDecision {
   if (!run || run.status !== 'running') return { action: 'wait' };
   if (needsUser) return { action: 'pause', next: { ...run, status: 'paused', note: 'paused — needs your answer' } };
   const s = sig(answer);
+  const settlePredicates = options.settlePredicates ?? [];
   if (runDoneVisible(answer)) {
     if (runCompletionSummaryVisible(answer)) {
+      if (settlePredicates.length) {
+        const verdict = options.settleVerdict;
+        if (!verdict) {
+          return {
+            action: 'verify',
+            predicates: settlePredicates,
+            next: { ...run, lastSig: s, note: 'verifying Settle Gate' },
+          };
+        }
+        if (verdict.pass) {
+          const next = { ...run, status: 'paused' as const, lastSig: s, note: 'completed ✓ host-verified' };
+          return { action: 'pause', next, verified: true, ...(status === 'streaming' || status === 'waiting' ? { stop: true } : {}) };
+        }
+        if (run.continues >= MAX_CONTINUES) {
+          return {
+            action: 'pause',
+            next: { ...run, status: 'paused', lastSig: s, note: `paused — Settle Gate failed and hit the ${MAX_CONTINUES}-continue cap` },
+          };
+        }
+        return {
+          action: 'continue',
+          reason: 'settleVerificationFailed',
+          verdict,
+          next: { ...run, continues: run.continues + 1, lastSig: s, note: 'repairing Settle Gate' },
+        };
+      }
       const next = { ...run, status: 'paused' as const, lastSig: s, note: 'completed ✓' };
       return { action: 'pause', next, ...(status === 'streaming' || status === 'waiting' ? { stop: true } : {}) };
     }

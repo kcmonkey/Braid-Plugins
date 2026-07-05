@@ -2,6 +2,7 @@
 // gaps) for the board chip + the ChatView plan panel. Kept pure + total so they are unit-testable independent of
 // React/DOM/host I/O — the hooks in index.tsx do the async readBraidFile and feed the text in here.
 // (plans/Plan-Plugin — ChatView/board plan visualization)
+import type { SettlePredicate } from '../../../src/protocol';
 
 export interface PlanGate { text: string; done: boolean }
 export interface PlanDecision { id: string; title: string }
@@ -76,6 +77,23 @@ export function parseSection(md: string, headingRe: RegExp): string {
     if (inSection) out.push(line);
   }
   return out.join('\n').trim();
+}
+
+const SETTLE_GATE_HEADING = /^#{1,6}\s+settle\s+gate\b/i;
+
+export function parseSettlePredicates(md: string): SettlePredicate[] {
+  const body = parseSection(md, SETTLE_GATE_HEADING);
+  if (!body) return [];
+  const out: SettlePredicate[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    const m = line.match(/^[ \t]*[-*][ \t]+(run|grep0|grep1)\s*:\s*(.*\S)[ \t]*$/i);
+    if (!m) continue;
+    const kind = m[1].toLowerCase();
+    const value = m[2].trim();
+    if (kind === 'run') out.push({ kind: 'run', command: value });
+    else if (kind === 'grep0' || kind === 'grep1') out.push({ kind, pattern: value });
+  }
+  return out;
 }
 
 const GOAL_HEADING = /^#{1,6}\s+goal\b/i;
