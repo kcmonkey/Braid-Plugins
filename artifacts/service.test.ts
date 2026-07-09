@@ -5,15 +5,22 @@ import * as path from 'path';
 import { artifactsHostServicePlugin } from './service';
 import type { AgentToolPlugin, HostServiceContext, LiveMessageContext } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
-import { registerArtifactType } from '../../../src/plugin-runtime/registry';
+import { registerArtifactType, resolveArtifactTypePlugin } from '../../../src/plugin-runtime/registry';
+import type { ObligationLedgerEvent } from '../../../src/obligations';
+import { VIDEO_DATA_TYPE, VIDEO_MP4_MIME, videoArtifactType } from '../video-artifacts/artifactType';
 
 function makeHarness(project: string, options: { live?: boolean } = {}) {
   const produceCalls: Array<{ canvasId: string; boardId: string; input: any }> = [];
+  const attachedObligations: any[] = [];
   const delivered: LiveMessageContext[] = [];
+  const obligationEvents: ObligationLedgerEvent[] = [];
   let deliveryAttempts = 0;
   const targetKey = 'c1::b1';
   const ctx: HostServiceContext = {
     cwd: () => project,
+    readSecret: async (pluginId, key) => ({ pluginId, key, stored: false }),
+    writeSecret: async (pluginId, key) => ({ pluginId, key, stored: true }),
+    clearSecret: async (pluginId, key) => ({ pluginId, key, cleared: true }),
     produceArtifact: async (canvasId, boardId, input) => {
       produceCalls.push({ canvasId, boardId, input });
       return {
@@ -28,6 +35,13 @@ function makeHarness(project: string, options: { live?: boolean } = {}) {
         },
         path: path.join(project, '.braid', 'artifacts', 'objects', 'declared-spec-test', 'v1.md'),
       };
+    },
+    recordObligationEvent: (event) => {
+      obligationEvents.push(event);
+    },
+    attachObligation: (obligation) => {
+      attachedObligations.push(obligation);
+      return { obligationId: obligation.id };
     },
     liveOwnerKeys: () => new Set(),
     openCanvasIds: () => ['c1'],
@@ -68,7 +82,7 @@ function makeHarness(project: string, options: { live?: boolean } = {}) {
   const settle = async (turnIndex = 2) => {
     await service.onTurnSettled?.({ canvasId: 'c1', boardId: 'b1', turnIndex, provider: 'codex', answer: 'done' });
   };
-  return { call, tools, produceCalls, service, delivered, get deliveryAttempts() { return deliveryAttempts; }, observeToolUse, settle };
+  return { call, tools, produceCalls, attachedObligations, obligationEvents, service, delivered, get deliveryAttempts() { return deliveryAttempts; }, observeToolUse, settle };
 }
 
 describe('artifacts host service', () => {
@@ -93,6 +107,14 @@ describe('artifacts host service', () => {
       expect(description).toContain('bounded');
       expect(description).toContain('presentable');
       expect(description).toContain('declare it as an artifact');
+      expect(description).toContain('standalone');
+      expect(description).toContain('runnable');
+      expect(description).toContain('demo');
+      expect(description).toContain('not excluded merely because it is code');
+      expect(description).not.toContain('HTML');
+      expect(description).not.toContain('.html');
+      expect(description).not.toContain('.docx');
+      expect(description).not.toContain('.glb');
       expect(description).toContain('Do not declare source files');
       expect(description).toContain('scratch files');
       expect(description).toContain('build outputs');
@@ -141,6 +163,52 @@ describe('artifacts host service', () => {
         hasSchema: true,
       });
       expect(brief.schema).toBeUndefined();
+    } finally {
+      unregister();
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('lists the video artifact type and validates video MIME metadata', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-video-type-'));
+    const unregister = registerArtifactType(videoArtifactType);
+    try {
+      const harness = makeHarness(project);
+
+      const result = await harness.call('artifact_types', {});
+
+      expect(result.ok).toBe(true);
+      const parsed = JSON.parse(result.result);
+      const video = parsed.types.find((type: any) => type.dataType === VIDEO_DATA_TYPE);
+      expect(video).toMatchObject({
+        dataType: VIDEO_DATA_TYPE,
+        label: 'Video',
+        hasValidator: true,
+      });
+      expect(video.description).toContain(VIDEO_MP4_MIME);
+
+      const type = resolveArtifactTypePlugin(VIDEO_DATA_TYPE);
+      await expect(Promise.resolve(type.validate?.({
+        dataType: VIDEO_DATA_TYPE,
+        artifactClass: 'born',
+        mime: VIDEO_MP4_MIME,
+        label: 'clip.mp4',
+      }))).resolves.toEqual({ ok: true });
+      await expect(Promise.resolve(type.validate?.({
+        dataType: VIDEO_DATA_TYPE,
+        artifactClass: 'external-ref',
+        mime: 'video/webm; codecs=vp9',
+        label: 'clip.webm',
+      }))).resolves.toEqual({ ok: true });
+      await expect(Promise.resolve(type.validate?.({
+        dataType: VIDEO_DATA_TYPE,
+        artifactClass: 'born',
+        mime: 'image/png',
+        label: 'clip.png',
+      }))).resolves.toMatchObject({
+        ok: false,
+        reason: expect.stringContaining('video/'),
+      });
     } finally {
       unregister();
       fs.rmSync(project, { recursive: true, force: true });
@@ -366,25 +434,307 @@ describe('artifacts host service', () => {
     }
   });
 
-  it('nudges the producer once for an unclaimed deliverable candidate after successful settle', async () => {
+  it('exposes and validates artifact expectations without declaring artifacts', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-contract-'));
+    try {
+      const harness = makeHarness(project);
+      const tool = harness.tools.find((candidate) => candidate.tool.name === 'artifact_expect');
+      expect(tool?.tool.description).toContain('not an artifact declaration');
+      expect(tool?.tool.description).toContain('artifact_declare');
+      expect(tool?.tool.description).toContain('expect nothing');
+      expect(tool?.tool.description).toContain('latest expectation');
+      expect(tool?.tool.description).toContain('agent judgment');
+      expect(tool?.tool.description).toContain('exactly one');
+      expect(tool?.tool.description).toContain('Never pass nothing:false');
+      expect(tool?.tool.description).toContain('attachToTurn:true');
+      expect(tool?.tool.inputSchema).toMatchObject({
+        oneOf: [
+          expect.objectContaining({ required: ['dataType'] }),
+          expect.objectContaining({ required: ['nothing'] }),
+        ],
+      });
+      expect(JSON.stringify(tool?.tool.inputSchema)).toContain('"const":true');
+      expect(tool?.tool.description).not.toContain('observed new output files');
+      expect(tool?.tool.description).not.toContain('self-check');
+
+      await expect(harness.call('artifact_expect', { dataType: 'report' })).resolves.toMatchObject({ ok: true });
+      await expect(harness.call('artifact_expect', { nothing: true, reason: 'analysis only' })).resolves.toMatchObject({ ok: true });
+      await expect(harness.call('artifact_expect', { dataType: 'report', nothing: true })).resolves.toMatchObject({
+        ok: false,
+        result: expect.stringContaining('either dataType or nothing'),
+      });
+      await expect(harness.call('artifact_expect', {})).resolves.toMatchObject({
+        ok: false,
+        result: expect.stringContaining('needs either dataType or nothing'),
+      });
+      await expect(harness.call('artifact_expect', { nothing: false })).resolves.toMatchObject({
+        ok: false,
+        result: expect.stringContaining('Never pass nothing:false'),
+      });
+      expect(harness.produceCalls).toHaveLength(0);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('records repeated artifact_expect decisions so the latest one can be audited', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-latest-'));
+    try {
+      const harness = makeHarness(project);
+
+      await expect(harness.call('artifact_expect', { dataType: 'report', reason: 'Initial artifact judgment.' })).resolves.toMatchObject({ ok: true });
+      await expect(harness.call('artifact_expect', { nothing: true, reason: 'Revised judgment: no user-facing artifact.' })).resolves.toMatchObject({ ok: true });
+
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.obligationEvents).toEqual([
+        {
+          type: 'artifact-expectation-decided',
+          target: { canvasId: 'c1', boardId: 'b1', turnIndex: 2 },
+          decision: { kind: 'dataType', dataType: 'report', reason: 'Initial artifact judgment.' },
+        },
+        {
+          type: 'artifact-expectation-decided',
+          target: { canvasId: 'c1', boardId: 'b1', turnIndex: 2 },
+          decision: { kind: 'nothing', reason: 'Revised judgment: no user-facing artifact.' },
+        },
+      ]);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('records expected dataTypes for host-owned artifact-output attribution', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-obligation-default-'));
+    try {
+      const harness = makeHarness(project);
+
+      const result = await harness.call('artifact_expect', { dataType: 'report', reason: 'User asked for a report file.' });
+
+      expect(result.ok).toBe(true);
+      expect(harness.attachedObligations).toHaveLength(0);
+      const parsed = JSON.parse(result.result);
+      expect(parsed).toMatchObject({ dataType: 'report' });
+      expect(parsed.obligationId).toBeUndefined();
+      expect(harness.obligationEvents).toContainEqual({
+        type: 'artifact-expectation-decided',
+        target: { canvasId: 'c1', boardId: 'b1', turnIndex: 2 },
+        decision: { kind: 'dataType', dataType: 'report', reason: 'User asked for a report file.' },
+      });
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('records expect-nothing decisions for host-owned artifact-output attribution', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-nothing-obligation-'));
+    try {
+      const harness = makeHarness(project);
+
+      const result = await harness.call('artifact_expect', { nothing: true, reason: 'Only scratch work.' });
+
+      expect(result.ok).toBe(true);
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.obligationEvents).toContainEqual({
+        type: 'artifact-expectation-decided',
+        target: { canvasId: 'c1', boardId: 'b1', turnIndex: 2 },
+        decision: { kind: 'nothing', reason: 'Only scratch work.' },
+      });
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('records repair-turn artifact_expect decisions without plugin-side obligation resolution', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-repair-target-'));
+    try {
+      const harness = makeHarness(project);
+
+      await expect(harness.call('artifact_expect', { dataType: 'report', reason: 'Repair the original turn.' })).resolves.toMatchObject({ ok: true });
+
+      expect(harness.attachedObligations).toEqual([]);
+      expect(harness.obligationEvents).toContainEqual({
+        type: 'artifact-expectation-decided',
+        target: { canvasId: 'c1', boardId: 'b1', turnIndex: 2 },
+        decision: { kind: 'dataType', dataType: 'report', reason: 'Repair the original turn.' },
+      });
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('does not self-check nudge when an expected output is declared and attached', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-covered-'));
+    try {
+      const harness = makeHarness(project, { live: true });
+
+      await harness.observeToolUse({ path: 'reports/expected.docx' });
+      await harness.call('artifact_expect', { dataType: 'report' });
+      const declared = await harness.call('artifact_declare', {
+        dataType: 'report',
+        label: 'Expected report',
+        path: 'reports/expected.docx',
+        storageMode: 'external-ref',
+        attachToTurn: true,
+      });
+      await harness.settle();
+
+      expect(declared.ok).toBe(true);
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.delivered).toHaveLength(0);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('does not live-nudge observed output after expect nothing', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-nothing-challenge-'));
+    try {
+      const harness = makeHarness(project, { live: true });
+
+      await harness.observeToolUse({ path: 'reports/ignored.docx' });
+      const result = await harness.call('artifact_expect', { nothing: true, reason: 'Only scratch work.' });
+      await harness.settle();
+
+      expect(result.ok).toBe(true);
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.delivered).toHaveLength(0);
+      expect(harness.obligationEvents).toEqual([
+        {
+          type: 'artifact-output-candidate-observed',
+          target: { canvasId: 'c1', boardId: 'b1', turnIndex: 2 },
+          path: 'reports/ignored.docx',
+          toolName: 'write_file',
+        },
+        {
+          type: 'artifact-expectation-decided',
+          target: { canvasId: 'c1', boardId: 'b1', turnIndex: 2 },
+          decision: { kind: 'nothing', reason: 'Only scratch work.' },
+        },
+      ]);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('records host-obligation candidates for undeclared new output files without a positive deliverable-type list', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-'));
     try {
       const harness = makeHarness(project, { live: true });
 
-      await harness.observeToolUse({ path: 'mockups/checkout.html' });
+      await harness.observeToolUse({ path: 'report.docx' });
+      await harness.observeToolUse({ path: 'deck.pptx' });
+      await harness.observeToolUse({ path: 'workbook.xlsx' });
+      await harness.observeToolUse({ path: 'brief.pdf' });
+      await harness.observeToolUse({ file_path: 'snake.html' });
       await harness.settle();
       await harness.settle();
 
-      expect(harness.delivered).toHaveLength(1);
-      expect(harness.delivered[0]).toMatchObject({
-        canvasId: 'c1',
-        targetKey: 'c1::b1',
-        fromBoardId: 'b1',
-        kind: 'artifact-deliverable-self-check',
-        injected: true,
-      });
-      expect(harness.delivered[0].text).toContain('mockups/checkout.html');
-      expect(harness.delivered[0].text).toContain('artifact_declare');
+      expect(harness.delivered).toHaveLength(0);
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
+        type: 'artifact-output-candidate-observed',
+        path: 'report.docx',
+      }));
+      expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
+        type: 'artifact-output-candidate-observed',
+        path: 'deck.pptx',
+      }));
+      expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
+        type: 'artifact-output-candidate-observed',
+        path: 'workbook.xlsx',
+      }));
+      expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
+        type: 'artifact-output-candidate-observed',
+        path: 'brief.pdf',
+      }));
+      expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
+        type: 'artifact-output-candidate-observed',
+        path: 'snake.html',
+      }));
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('records a host-obligation candidate for a new nested source-looking file because the agent judges deliverable intent', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-html-'));
+    try {
+      const harness = makeHarness(project, { live: true });
+
+      await harness.observeToolUse({ path: 'src/generated-report.html' }, 'Write');
+      await harness.settle();
+
+      expect(harness.delivered).toHaveLength(0);
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
+        type: 'artifact-output-candidate-observed',
+        path: 'src/generated-report.html',
+      }));
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('records artifact-output intent for artifact-producing agent tools without declaring expectations', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-producer-tool-'));
+    try {
+      const harness = makeHarness(project, { live: true });
+      const tools = [
+        'agent__braid__image_generate',
+        'agent__braid__video_generate',
+        'agent__braid__audio_generate',
+        'agent__braid__model_generate',
+        'video_generate',
+      ];
+
+      for (const [index, toolName] of tools.entries()) {
+        await harness.observeToolUse({ prompt: 'deliver a user-facing artifact' }, toolName, 20 + index);
+      }
+
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.obligationEvents.some((event) => event.type === 'artifact-expectation-decided')).toBe(false);
+      expect(harness.obligationEvents.some((event) => event.type === 'artifact-output-candidate-observed')).toBe(false);
+      expect(harness.obligationEvents).toEqual([
+        expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'image_generate', dataType: 'image' }),
+        expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'video_generate', dataType: 'video' }),
+        expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'audio_generate', dataType: 'audio' }),
+        expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'model_generate', dataType: 'model-3d' }),
+        expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'video_generate', dataType: 'video' }),
+      ]);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('does not arm artifact-output obligations for canceled artifact-producing agent tools', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-producer-tool-cancel-'));
+    try {
+      const harness = makeHarness(project, { live: true });
+
+      await harness.observeToolUse({ requestId: 'video-1', cancel: true }, 'agent__braid__video_generate');
+
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.obligationEvents).toEqual([]);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('does not nudge for ordinary source edits or infra and scratch outputs', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-excluded-'));
+    try {
+      const harness = makeHarness(project, { live: true });
+
+      await harness.observeToolUse({ file_path: 'src/App.html' }, 'Edit');
+      await harness.observeToolUse({ path: '.braid/live-refs/note.md' }, 'Write');
+      await harness.observeToolUse({ path: 'node_modules/pkg/index.js' }, 'Write');
+      await harness.observeToolUse({ path: 'tmp-report/out.md' }, 'Write');
+      await harness.observeToolUse({ path: 'probe-run/out.md' }, 'Write');
+      await harness.observeToolUse({ path: 'dist/app.js' }, 'Write');
+      await harness.settle();
+
+      expect(harness.deliveryAttempts).toBe(0);
+      expect(harness.delivered).toHaveLength(0);
     } finally {
       fs.rmSync(project, { recursive: true, force: true });
     }
@@ -395,17 +745,20 @@ describe('artifacts host service', () => {
     try {
       const harness = makeHarness(project, { live: true });
 
-      await harness.observeToolUse({ file_path: 'mockups/attached.html' });
-      const result = await harness.call('artifact_declare', {
-        dataType: 'mockup',
-        label: 'Attached mockup',
-        path: 'mockups/attached.html',
-        storageMode: 'external-ref',
-        attachToTurn: true,
-      });
+      const files = ['reports/attached.docx', 'reports/attached.pptx', 'reports/attached.xlsx', 'reports/attached.pdf'];
+      for (const file of files) {
+        await harness.observeToolUse({ file_path: file });
+        const result = await harness.call('artifact_declare', {
+          dataType: 'report',
+          label: `Attached ${path.basename(file)}`,
+          path: file,
+          storageMode: 'external-ref',
+          attachToTurn: true,
+        });
+        expect(result.ok).toBe(true);
+      }
       await harness.settle();
 
-      expect(result.ok).toBe(true);
       expect(harness.delivered).toHaveLength(0);
     } finally {
       fs.rmSync(project, { recursive: true, force: true });
@@ -418,19 +771,19 @@ describe('artifacts host service', () => {
     const unavailableProject = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-unavailable-'));
     try {
       const errored = makeHarness(erroredProject, { live: true });
-      await errored.observeToolUse({ path: 'mockups/error.html' });
+      await errored.observeToolUse({ path: 'reports/error.docx' });
       await errored.service.onRunError?.({ canvasId: 'c1', boardId: 'b1', provider: 'codex', message: 'failed' });
       await errored.settle();
       expect(errored.delivered).toHaveLength(0);
 
       const aborted = makeHarness(abortedProject, { live: true });
-      await aborted.observeToolUse({ path: 'mockups/abort.html' });
+      await aborted.observeToolUse({ path: 'reports/abort.docx' });
       await aborted.service.onBoardAbort?.({ canvasId: 'c1', boardId: 'b1', message: 'aborted' });
       await aborted.settle();
       expect(aborted.delivered).toHaveLength(0);
 
       const unavailable = makeHarness(unavailableProject, { live: false });
-      await unavailable.observeToolUse({ path: 'mockups/cold.html' });
+      await unavailable.observeToolUse({ path: 'reports/cold.docx' });
       await unavailable.settle();
       expect(unavailable.deliveryAttempts).toBe(0);
       expect(unavailable.delivered).toHaveLength(0);
@@ -446,7 +799,7 @@ describe('artifacts host service', () => {
     try {
       const harness = makeHarness(project, { live: true });
 
-      await harness.observeToolUse({ path: 'mockups/closed.html' });
+      await harness.observeToolUse({ path: 'reports/closed.docx' });
       await harness.service.onCanvasClose?.('c1');
       await harness.settle();
 
@@ -463,12 +816,16 @@ describe('artifacts host service', () => {
     try {
       const harness = makeHarness(project, { live: true });
 
-      await harness.observeToolUse({ path: 'mockups/other.html' });
+      await harness.observeToolUse({ path: 'reports/other.docx' });
       await harness.service.onCanvasClose?.('c2'); // unrelated canvas — must not sweep c1's candidate
       await harness.settle();
 
-      expect(harness.delivered).toHaveLength(1);
-      expect(harness.delivered[0].text).toContain('mockups/other.html');
+      expect(harness.delivered).toHaveLength(0);
+      expect(harness.attachedObligations).toHaveLength(0);
+      expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
+        type: 'artifact-output-candidate-observed',
+        path: 'reports/other.docx',
+      }));
     } finally {
       fs.rmSync(project, { recursive: true, force: true });
     }

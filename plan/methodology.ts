@@ -6,10 +6,10 @@
 //   2. The FULL authoring doc (`plan-authoring.md`, shipped in this plugin) — seeded once to the project's
 //      `.braid/plans/_authoring.md` (see index.tsx `seedBraidFiles`); the compact block points the agent to it,
 //      and the agent Reads it ON DEMAND (lazy — not injected every turn). (方向O — portable, lazy depth)
-// The agent scaffolds a SINGLE `.braid/plans/<name>`; the run policy AUTO-BINDS the board to it
+// The agent scaffolds a SINGLE `.braid/plans/<name>`; the host run orchestrator AUTO-BINDS the board to it
 // (detectCreatedPlan). This replaces the `/new-plan` command for the common case.
 
-import { RUN_BEGIN_SENTINEL, RUN_DONE_SENTINEL } from './runStep';
+import { RUN_BEGIN_SENTINEL, RUN_DONE_SENTINEL } from '../../../src/run/lifecycle';
 
 // Compact, project-neutral contract format — one canonical structure for every plan, small enough to ride every
 // turn. The FULL rules live in the seeded `.braid/plans/_authoring.md` (pointed to below).

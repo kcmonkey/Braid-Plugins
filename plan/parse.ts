@@ -3,6 +3,7 @@
 // React/DOM/host I/O — the hooks in index.tsx do the async readBraidFile and feed the text in here.
 // (plans/Plan-Plugin — ChatView/board plan visualization)
 import type { SettlePredicate } from '../../../src/protocol';
+import { parseMarkdownSection, parseSettlePredicates as parseSettlePredicatesShared } from '../../../src/run/settlePredicates';
 
 export interface PlanGate { text: string; done: boolean }
 export interface PlanDecision { id: string; title: string }
@@ -70,30 +71,11 @@ export function parseDeferred(md: string): string[] {
 // The prose under a heading (everything until the next heading), trimmed. Used to pull the "## Goal" body out of
 // the contract / current-phase docs so the panel can show WHY the plan exists + WHAT the current phase delivers.
 export function parseSection(md: string, headingRe: RegExp): string {
-  const out: string[] = [];
-  let inSection = false;
-  for (const line of md.split(/\r?\n/)) {
-    if (/^#{1,6}\s+/.test(line)) { inSection = headingRe.test(line); continue; }
-    if (inSection) out.push(line);
-  }
-  return out.join('\n').trim();
+  return parseMarkdownSection(md, headingRe);
 }
 
-const SETTLE_GATE_HEADING = /^#{1,6}\s+settle\s+gate\b/i;
-
 export function parseSettlePredicates(md: string): SettlePredicate[] {
-  const body = parseSection(md, SETTLE_GATE_HEADING);
-  if (!body) return [];
-  const out: SettlePredicate[] = [];
-  for (const line of body.split(/\r?\n/)) {
-    const m = line.match(/^[ \t]*[-*][ \t]+(run|grep0|grep1)\s*:\s*(.*\S)[ \t]*$/i);
-    if (!m) continue;
-    const kind = m[1].toLowerCase();
-    const value = m[2].trim();
-    if (kind === 'run') out.push({ kind: 'run', command: value });
-    else if (kind === 'grep0' || kind === 'grep1') out.push({ kind, pattern: value });
-  }
-  return out;
+  return parseSettlePredicatesShared(md);
 }
 
 const GOAL_HEADING = /^#{1,6}\s+goal\b/i;

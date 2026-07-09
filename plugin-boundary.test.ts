@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import orchestrationManifest from './orchestration/plugin.json';
 import planManifest from './plan/plugin.json';
 
 const BUILTIN_ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -55,10 +54,5 @@ describe('builtin plugin boundary', () => {
 
   it('declares the plan run policy in manifest metadata', () => {
     expect(planManifest.contributes.runPolicies).toContain('plan');
-  });
-
-  it('enables orchestration by default so its board action entry is discoverable', () => {
-    expect(orchestrationManifest.defaultEnabled).toBe(true);
-    expect(orchestrationManifest.contributes.boardActions).toContain('orchestration.actions');
   });
 });

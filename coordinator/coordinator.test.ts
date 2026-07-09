@@ -23,6 +23,9 @@ function makeHarness(project: string, opts: {
   const liveKeys = new Set(opts.liveKeys ?? []);
   const ctx: HostServiceContext = {
     cwd: () => project,
+    readSecret: async (pluginId, key) => ({ pluginId, key, stored: false }),
+    writeSecret: async (pluginId, key) => ({ pluginId, key, stored: true }),
+    clearSecret: async (pluginId, key) => ({ pluginId, key, cleared: true }),
     liveOwnerKeys: () => new Set(liveKeys),
     openCanvasIds: () => opts.openCanvasIds ?? ['c1'],
     liveBoardKeys: () => [...liveKeys],

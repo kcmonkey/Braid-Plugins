@@ -66,6 +66,8 @@ describe('plan parse', () => {
       '- run: npm test',
       '- grep0: oldArtifactName',
       '- grep1: SettlePredicate',
+      '- artifact: mockup',
+      '- artifact(turn): report',
       '- note: ignored',
       '',
       '## Acceptance Criteria',
@@ -75,6 +77,8 @@ describe('plan parse', () => {
       { kind: 'run', command: 'npm test' },
       { kind: 'grep0', pattern: 'oldArtifactName' },
       { kind: 'grep1', pattern: 'SettlePredicate' },
+      { kind: 'artifact', dataType: 'mockup' },
+      { kind: 'artifact', dataType: 'report', scope: 'turn' },
     ]);
   });
 

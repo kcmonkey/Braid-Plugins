@@ -1,0 +1,16 @@
+{
+  "id": "model-artifacts",
+  "name": "Model Artifacts",
+  "version": "1.0.0",
+  "description": "Meshy-backed 3D model artifacts and model-generation provider support.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "artifactTypes": ["model-3d"],
+    "hostServices": ["model-artifacts.hostService"],
+    "agentTools": ["model_generate"],
+    "modelGenerationProviders": ["meshy"]
+  }
+}

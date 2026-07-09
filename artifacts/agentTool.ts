@@ -16,8 +16,16 @@ export interface ArtifactTypesToolRequest {
   dataType?: string;
 }
 
+export interface ArtifactExpectToolRequest {
+  dataType?: string;
+  nothing?: boolean;
+  invalidNothingFalse?: boolean;
+  reason?: string;
+}
+
 export interface ArtifactToolHandlers {
   declare(ctx: AgentToolContext, req: ArtifactDeclareToolRequest): Promise<AgentToolResult>;
+  expect(ctx: AgentToolContext, req: ArtifactExpectToolRequest): Promise<AgentToolResult>;
   types(ctx: AgentToolContext, req: ArtifactTypesToolRequest): Promise<AgentToolResult>;
 }
 
@@ -44,6 +52,15 @@ export function normalizeArtifactTypesArgs(input: Record<string, unknown>): Arti
   };
 }
 
+export function normalizeArtifactExpectArgs(input: Record<string, unknown>): ArtifactExpectToolRequest {
+  return {
+    dataType: stringValue(input.dataType),
+    nothing: input.nothing === true,
+    invalidNothingFalse: input.nothing === false,
+    reason: stringValue(input.reason),
+  };
+}
+
 export function createArtifactAgentTools(handlers: ArtifactToolHandlers, options?: {
   typeSummary?: string;
 }): AgentToolPlugin<Record<string, unknown>>[] {
@@ -61,8 +78,8 @@ export function createArtifactAgentTools(handlers: ArtifactToolHandlers, options
           'Use text for a declared text artifact, or path with storageMode "external-ref" for a live workspace reference / "born" for an immutable snapshot.',
           'dataType is optional; omit it when no specific artifact type fits, and Braid will use the Meta root type.',
           ...(typeSummary ? [typeSummary] : []),
-          'When the user asks for a durable, bounded, presentable deliverable such as a spec, report, protocol, handoff, mockup, review, dataset, or generated media, declare it as an artifact so other boards can display and pass it by ref.',
-          'Do not declare source files, scratch files, build outputs, test logs, transient control messages, or ordinary conversation context just because they exist.',
+          'When the user asks for a durable, bounded, presentable deliverable such as a spec, report, protocol, handoff, mockup, review, dataset, generated media, or a standalone runnable demo or entrypoint, declare it as an artifact so other boards can display and pass it by ref.',
+          'Do not declare source files edited as implementation work, scratch files, build outputs, test logs, transient control messages, or ordinary conversation context just because they exist. A user-requested standalone runnable demo or entrypoint is not excluded merely because it is code.',
           'Optional: mime. Artifacts go through the Braid registry and can attach to the current turn.',
         ].join(' '),
         inputSchema: {
@@ -82,6 +99,43 @@ export function createArtifactAgentTools(handlers: ArtifactToolHandlers, options
       },
       call(ctx, input) {
         return handlers.declare(ctx, normalizeArtifactDeclareArgs(input));
+      },
+    },
+    {
+      id: 'artifacts.expect',
+      label: 'Expect Artifact',
+      manifest,
+      tool: {
+        namespace: 'braid',
+        name: 'artifact_expect',
+        description: [
+          'Declare the latest expectation for whether the current turn should produce a user-facing artifact; this is not an artifact declaration.',
+          'Call with exactly one valid shape: dataType for an expected user-facing artifact, or nothing:true only after deciding this turn should produce no user-facing artifact.',
+          'Never pass nothing:false; omit nothing unless it is true.',
+          'Use dataType when your current agent judgment is that this turn should produce an artifact, then use braid.artifact_declare with attachToTurn:true to actually declare and attach the artifact output.',
+          'Use expect nothing (nothing:true) only after deciding this turn should produce no user-facing artifact. Observed output candidates are context for your agent judgment, not automatic proof that an artifact is required.',
+          'You may call this multiple times as your judgment changes; Braid audits the latest expectation.',
+        ].join(' '),
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          oneOf: [
+            { required: ['dataType'], not: { required: ['nothing'] } },
+            {
+              required: ['nothing'],
+              properties: { nothing: { type: 'boolean', const: true } },
+              not: { required: ['dataType'] },
+            },
+          ],
+          properties: {
+            dataType: { type: 'string', description: 'Artifact dataType expected from this turn, such as report, mockup, spec, dataset, or meta.' },
+            nothing: { type: 'boolean', description: 'Must be true when used. Never pass false; omit this field when using dataType.' },
+            reason: { type: 'string', description: 'Optional short reason for the expectation decision.' },
+          },
+        },
+      },
+      call(ctx, input) {
+        return handlers.expect(ctx, normalizeArtifactExpectArgs(input));
       },
     },
     {

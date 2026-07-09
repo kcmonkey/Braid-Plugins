@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { RUN_BEGIN_SENTINEL, RUN_DONE_SENTINEL } from './runStep';
+import { RUN_BEGIN_SENTINEL, RUN_DONE_SENTINEL } from '../../../src/run/lifecycle';
 import { planContextText } from './methodology';
 
 describe('plan methodology run scope', () => {

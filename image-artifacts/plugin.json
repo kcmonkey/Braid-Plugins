@@ -1,0 +1,11 @@
+{
+  "id": "image-artifacts",
+  "name": "Image Artifacts",
+  "version": "0.1.0",
+  "scope": "builtin",
+  "description": "Generates image artifacts through Settings-owned artifact producer defaults.",
+  "contributes": {
+    "hostServices": ["image-artifacts.host-service"],
+    "agentTools": ["image_generate"]
+  }
+}

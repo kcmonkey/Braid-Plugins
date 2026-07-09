@@ -1,0 +1,16 @@
+{
+  "id": "video-artifacts",
+  "name": "Video Artifacts",
+  "version": "1.0.0",
+  "description": "Video artifact type, host-resource preview renderer, and video generation producer.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "artifactTypes": ["video"],
+    "artifactRenderers": ["video"],
+    "hostServices": ["video-artifacts.host-service"],
+    "artifactGenerationProviders": ["grok-video"]
+  }
+}

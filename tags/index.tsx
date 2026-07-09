@@ -60,7 +60,7 @@ function revision(cfg: TagConfig): string {
   }))}`;
 }
 
-function deriveKey(board: BoardLike, cfg: TagConfig): string {
+export function tagDeriveKey(board: BoardLike, cfg: TagConfig): string {
   return `${revision(cfg)}:${hashText(`${board.prompt}\n${board.answer}`)}`;
 }
 
@@ -80,6 +80,21 @@ function parseTags(text: string, cfg: TagConfig): string[] {
     if (out.length >= MAX_TAGS) break;
   }
   return out;
+}
+
+function deriveRequest(board: BoardLike, config: TagConfig, state: unknown) {
+  if (board.status !== 'done' || !board.answer || board.compact || board.collapsedGraph) return null;
+  const key = tagDeriveKey(board, config);
+  if (asTagState(state)?.revision === key) return null;
+  return {
+    key,
+    system: classifyPrompt(config),
+    content: `Q: ${board.prompt}\n\nA: ${board.answer}`,
+  };
+}
+
+function hasCustomLlmRoute(config: TagConfig): boolean {
+  return !!config.engine || !!config.model?.trim();
 }
 
 function TagConfigPanel({ config, onChange, activeProvider, providerCaps }: {
@@ -122,23 +137,30 @@ export const tagPlugin: BoardElementPlugin<TagConfig> = {
   manifest,
   defaultConfig: defaultTagConfig,
   derive({ board, config, state }) {
-    if (board.status !== 'done' || !board.answer || board.compact || board.collapsedGraph) return null;
-    const key = deriveKey(board, config);
+    const req = deriveRequest(board, config, state);
     // Re-derive ONLY when the content/config key changes — NOT when the result happened to be empty.
     // `applyDerived` stamps `revision` for every reply (including a zero-tag classification or a oneShot
     // failure that returns ''), so keying the guard on `revision === key` alone stops an unclassifiable
     // board (or a transient failure) from re-requesting the LLM one-shot forever. (the effect re-fires on
     // every nodes change, so a `tags.length`-gated guard would loop indefinitely for empty results.)
-    if (asTagState(state)?.revision === key) return null;
+    if (!req) return null;
     return {
-      key,
-      system: classifyPrompt(config),
-      content: `Q: ${board.prompt}\n\nA: ${board.answer}`,
+      ...req,
       engine: config.engine,
       model: config.model,
+      route: config.engine ? 'active' : 'summary',
     };
   },
+  contributeSummaryDerivation({ board, config, state }) {
+    // Bundled board-summary derivation always runs on the summary route. If the user configured this plugin
+    // with its own provider/model, leave it to the standalone derive path so that routing contract is preserved.
+    if (hasCustomLlmRoute(config)) return null;
+    return deriveRequest(board, config, state);
+  },
   applyDerived(_prevState, text, config, key): TagState {
+    return { tags: parseTags(text, config), revision: key };
+  },
+  applySummaryDerivation(_prevState, text, config, key): TagState {
     return { tags: parseTags(text, config), revision: key };
   },
   render({ slot, config, state }) {

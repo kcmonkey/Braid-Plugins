@@ -1,11 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginManifest, RunPolicyPlugin, SeedBraidFile } from '../../../src/plugin-api/types';
-import type { SettlePredicate, SettleVerdict } from '../../../src/protocol';
-import { boardTurns, hasPendingAsk, latestAnswer, latestPrompt, type BoardLike as BoardData } from '../shared/board';
-import { runStep, runArm, runDoneVisible, runCompletionSummaryVisible, sig, MAX_CONTINUES, RUN_DONE_SENTINEL, type RunState } from './runStep';
+import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginManifest, SeedBraidFile } from '../../../src/plugin-api/types';
+import { boardTurns, type BoardLike as BoardData } from '../shared/board';
+import { MAX_CONTINUES, type RunState } from '../../../src/run/lifecycle';
 import { detectCreatedPlan, latestCreatedPlan, planWriteSignal } from './detect';
 import { planContextText } from './methodology';
-import { firstHeading, parseGates, parsePlanSnapshot, parseSettlePredicates, type PlanSnapshot } from './parse';
+import { firstHeading, parseGates, parsePlanSnapshot, type PlanSnapshot } from './parse';
 // The FULL authoring methodology, shipped IN this plugin (esbuild `.md` text loader inlines it). This is the
 // SSOT; `seedBraidFiles` drops a copy at `.braid/plans/_authoring.md` so the agent can Read it on demand. (方向O)
 import PLAN_AUTHORING from './plan-authoring.md';
@@ -22,8 +21,8 @@ const AUTHORING_DOC = `<!-- Managed by the Braid Plan plugin — edits are overw
 // NO buttons (the user's ask): you drive the plan by TALKING to the agent, not by clicking. A context provider
 // (P1 seam) routes plan-related turns to the authoritative plan files, and tells runtime continuations to reuse
 // unchanged plan context instead of rereading stable files every tick. The agent emits a BRAID_RUN_BEGIN marker
-// when you ask it to EXECUTE the plan (vs just discuss). That marker arms the always-on
-// run loop (Gap E, `planRunPolicy`); the agent emits BRAID_RUN_DONE only when the USER'S requested scope is done
+// when you ask it to EXECUTE the plan (vs just discuss). That marker arms the host-owned
+// run loop; the agent emits BRAID_RUN_DONE only when the USER'S requested scope is done
 // (current phase if they asked for that, or every roadmap phase if they asked for the full plan). So "run the plan"
 // / "一口气跑完" starts an autonomous run with no UI control. The plugin's job is READ + VISUALIZE:
 //   - the board card chip shows `◆ planId · phase · done/total` (quick progress at a glance);
@@ -34,7 +33,7 @@ const AUTHORING_DOC = `<!-- Managed by the Braid Plan plugin — edits are overw
 
 // `open` = the user explicitly asked (via the right-click menu) to bind/change a plan on this board → the
 // detail card reveals the picker. NOT shown by default. Cleared on commit/cancel.
-interface PlanState { planId: string; run?: RunState; open?: boolean; settlePredicates?: SettlePredicate[] }
+interface PlanState { planId: string; run?: RunState; open?: boolean }
 // The plan FORMAT (how to author/structure a Braid plan) is a FIXED constant in methodology.ts — identical to
 // the Contractors_Showdown contract format, injected on every board. There is no per-plugin config. (D11)
 type PlanConfig = Record<string, never>;
@@ -54,84 +53,6 @@ function runOf(state: PlanState | undefined): RunState | undefined {
   const r = (state as { run?: RunState } | undefined)?.run;
   return r && (r.status === 'running' || r.status === 'paused') && typeof r.continues === 'number' ? r : undefined;
 }
-function runDisplayPrompt(board: BoardData, run: RunState | undefined): string {
-  return (run?.userPrompt || latestPrompt(board) || 'Run the bound Braid plan').trim();
-}
-function userRequestedPlanExecution(prompt: string): boolean {
-  const text = prompt.trim();
-  if (!text) return false;
-  const lower = text.toLowerCase();
-  const hasPlanObject = /\b(plan|phase|roadmap)\b/.test(lower) || /(计划|阶段|当前阶段|整个|全部)/.test(text);
-  if (/\b(run|execute|complete|finish)\b/.test(lower) && hasPlanObject) return true;
-  if (/\b(continue|resume)\b/.test(lower) && (/\b(running|executing|execution)\b/.test(lower) || /\b(plan|phase|roadmap)\b/.test(lower))) return true;
-  if (/(一口气跑完|完整执行|跑完整个)/.test(text)) return true;
-  if (/(执行|完成|跑完)/.test(text) && hasPlanObject) return true;
-  if (/(继续|接着).*(执行|跑|完成)/.test(text)) return true;
-  return false;
-}
-function settlePredicatesEqual(a: SettlePredicate[] | undefined, b: SettlePredicate[] | undefined): boolean {
-  return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
-}
-function withSettlePredicates(state: PlanState, predicates: SettlePredicate[]): PlanState {
-  const { settlePredicates: _drop, ...rest } = state;
-  return predicates.length ? { ...rest, settlePredicates: predicates } : rest;
-}
-function withoutRun(planId: string, state: PlanState | undefined): PlanState {
-  return { planId, ...(state?.open ? { open: true } : {}), ...(state?.settlePredicates?.length ? { settlePredicates: state.settlePredicates } : {}) };
-}
-
-// The auto-continue prompt the run loop re-drives with (the loop lives in `planRunPolicy`, driven at the canvas
-// level so a run advances regardless of whether the card is rendered).
-const CONTINUE_PROMPT =
-  "Continue the Braid plan execution scope the user requested — do NOT stop to ask for confirmation, and do NOT " +
-  "just summarize and wait. Reuse plan files and skill bodies already read in this same provider thread unless " +
-  "you changed them in the current run; do not re-read stable plan or skill files merely because this is an " +
-  "auto-continuation. Re-read only the specific plan file after you changed it, when a phase was promoted, " +
-  "before final completion verification, or when the user questions plan state. Do not read " +
-  "`.braid/plans/_authoring.md` during execution unless you are creating or changing a plan. If the user asked to complete " +
-  "only the current phase, finish every acceptance gate in current-phase.md, run the phase/global verification " +
-  "the plan requires, then reply with the exact completion-report shape below. The run policy will NOT treat a " +
-  `bare ${RUN_DONE_SENTINEL} marker as complete without this heading:\n\n` +
-  "## Execution Summary\n" +
-  "- Completed: <what changed>\n" +
-  "- Verification: <acceptance gates / commands / checks that passed>\n" +
-  "- Remaining: <gaps, risks, or none>\n\n" +
-  `${RUN_DONE_SENTINEL}\n\n` +
-  `Keep ${RUN_DONE_SENTINEL} as the final line with no text after it. If the ` +
-  "user asked to complete the full/entire/whole plan or all phases, then after each phase passes: update " +
-  "evidence/history as needed, promote the next Phase Roadmap item into current-phase.md, and keep working. For " +
-  `a full-plan run, emit ${RUN_DONE_SENTINEL} only after the roadmap has no remaining phases and global ` +
-  "verification passes, using the same `## Execution Summary` report shape and final marker. If you genuinely need a human decision, or hit an error you cannot recover from, explain " +
-  "briefly and stop.";
-
-const COMPLETION_REPORT_PROMPT =
-  `You emitted the completion marker without the required \`## Execution Summary\` report. Do not do more ` +
-  "implementation work unless it is strictly needed to verify the report. Read current-phase.md, contract.md, " +
-  "and evidence files if needed, then reply only with this Markdown shape:\n\n" +
-  "## Execution Summary\n" +
-  "- Completed: <what changed>\n" +
-  "- Verification: <acceptance gates / commands / checks that passed>\n" +
-  "- Remaining: <gaps, risks, or none>\n\n" +
-  `${RUN_DONE_SENTINEL}`;
-
-function describePredicate(p: SettlePredicate): string {
-  return p.kind === 'run' ? `run: ${p.command}` : `${p.kind}: ${p.pattern}`;
-}
-
-function settleFailureSummary(verdict: SettleVerdict): string {
-  const failed = verdict.results.filter((r) => !r.pass);
-  return failed.map((r, i) => `${i + 1}. ${describePredicate(r.predicate)}\n${r.detail.trim() || 'No detail returned.'}`).join('\n\n');
-}
-
-function settleGateRepairPrompt(verdict: SettleVerdict): string {
-  return [
-    'The host-ran Settle Gate failed. Do not claim completion yet.',
-    'Fix the failing predicates below, rerun the relevant verification, update plan evidence/current-phase as needed, then emit the normal completion report only after the gate can pass.',
-    '',
-    settleFailureSummary(verdict),
-  ].join('\n');
-}
-
 // Refetch plan files when the board settles, and while live only when this board writes the bound plan files. That
 // keeps normal token streaming from causing read storms while still reflecting an agent that advances current-phase
 // during a long autonomous run.
@@ -168,19 +89,6 @@ function usePhaseDoc(planId: string, api: BoardPluginApi, version: string) {
   return { md, err };
 }
 
-function useSyncSettlePredicates(boardId: string, board: BoardData, planId: string, phaseMd: string | null | undefined, api: BoardPluginApi) {
-  useEffect(() => {
-    if (!planId || phaseMd == null) return;
-    const prev = asPlanState(board.elements?.plan);
-    if (!prev || safePlanId(prev.planId) !== planId) return;
-    const nextPredicates = parseSettlePredicates(phaseMd);
-    if (settlePredicatesEqual(prev.settlePredicates, nextPredicates)) return;
-    api.patchBoard(boardId, {
-      elements: { ...(board.elements ?? {}), plan: withSettlePredicates(prev, nextPredicates) },
-    });
-  }, [boardId, board, planId, phaseMd, api]);
-}
-
 // Reads the three plan files and parses the full snapshot. Used by the richer ChatView panel (one panel at a
 // time, so 3 reads per settle is cheap).
 function usePlanSnapshot(planId: string, api: BoardPluginApi, version: string) {
@@ -210,7 +118,6 @@ function usePlanSnapshot(planId: string, api: BoardPluginApi, version: string) {
 // Compact card chip: `◆ planId  [▶ n/6 | ⏸]  done/total  · phase`. Read-only; one file read per settled turn.
 function PlanChip({ boardId, planId, api, board, run, inline = false }: { boardId: string; planId: string; api: BoardPluginApi; board: BoardData; run?: RunState; inline?: boolean }) {
   const { md, err } = usePhaseDoc(planId, api, planVersion(board, planId));
-  useSyncSettlePredicates(boardId, board, planId, md, api);
   const phase = md ? firstHeading(md) : undefined;
   const gates = md ? parseGates(md) : [];
   const done = gates.filter((g) => g.done).length;
@@ -239,7 +146,6 @@ function PlanChip({ boardId, planId, api, board, run, inline = false }: { boardI
 // remaining gates, and declared gaps. Always shows the compact header; a ▾ toggle reveals the detail.
 function PlanPanel({ boardId, planId, api, board }: { boardId: string; planId: string; api: BoardPluginApi; board: BoardData }) {
   const { snap, phaseMd, err } = usePlanSnapshot(planId, api, planVersion(board, planId));
-  useSyncSettlePredicates(boardId, board, planId, phaseMd, api);
   // Default COLLAPSED so the panel doesn't eat the conversation area; the always-visible header carries the
   // concise status (plan · phase · progress · run) and the user expands on demand for the full details.
   const [open, setOpen] = useState(false);
@@ -471,7 +377,6 @@ export const planElementPlugin: BoardElementPlugin<PlanConfig> = {
     return planId ? `plan ${planId}` : undefined;
   },
 };
-
 export const planContextProvider: ContextProviderPlugin<PlanConfig> = {
   id: 'plan',
   label: 'Plan',
@@ -487,171 +392,5 @@ export const planContextProvider: ContextProviderPlugin<PlanConfig> = {
   // plugin is self-contained on ANY project and the agent reads the depth ON DEMAND (not injected every turn).
   seedBraidFiles(): SeedBraidFile[] {
     return [{ path: AUTHORING_DOC_PATH, text: AUTHORING_DOC }];
-  },
-};
-
-// The run loop, owned at the canvas level (Gap E). NL-armed: when the agent (told by the context provider) emits
-// BRAID_RUN_BEGIN, `runArm` adopts a running state; thereafter the tested `runStep` decides continue/pause/wait
-// and the driver re-drives with CONTINUE_PROMPT (forcing per-turn bypass so approval prompts don't block the
-// run). A manual Stop (core ■) arrives as `interrupted` and disarms the run. All domain logic + the hard cap live
-// here; core just applies what this returns.
-export const planRunPolicy: RunPolicyPlugin<PlanConfig> = {
-  id: 'plan',
-  label: 'Plan',
-  manifest,
-  defaultConfig: {},
-  // Also consulted for UNBOUND boards so a board that just created a plan can auto-bind.
-  observeUnbound: true,
-  // A board is "running plan X" (for the sequential-overlap warning) only while its run is ACTIVELY `running`.
-  // A paused/absent run is not an overlap — so a board and its own continuation only warn when BOTH are live.
-  runGroupKey(state) {
-    const ps = asPlanState(state);
-    const planId = safePlanId(ps?.planId ?? '');
-    return planId && runOf(ps)?.status === 'running' ? planId : undefined;
-  },
-  step({ board, state, interrupted, settleVerdict }) {
-    const planState = asPlanState(state);
-    const planId = safePlanId(planState?.planId ?? '');
-    if (!planId) {
-      // Agent-creates-plan: a SETTLED unbound board whose tool steps created exactly one plan auto-binds to it.
-      if (board.status === 'done') {
-        const created = detectCreatedPlan(board);
-        if (created) return { state: { planId: created } };
-      }
-      return null;
-    }
-    const run = runOf(planState);
-    // RE-BIND: a board already bound to plan A that GENERATES a new plan B (writes B/contract.md) should follow B —
-    // the binding tracks the plan the board is actually authoring. Only when SETTLED and NOT mid-run, so an
-    // in-progress execution of A isn't hijacked; switching drops A's run/open state (a fresh plan starts clean). The
-    // detector keys on the most-recent contract.md write, so editing/referencing another plan does NOT switch.
-    if (!run && board.status === 'done') {
-      const created = latestCreatedPlan(board);
-      if (created && created !== planId) return { state: { planId: created } };
-    }
-    // `seenTurns` is stamped on every action so arming can EDGE-trigger on a newer turn (see runArm). turnCount
-    // grows by one per turn (the arming turn, then each auto-continue), so a stopped/completed turn is "seen".
-    const turnCount = boardTurns(board).length;
-    const la = latestAnswer(board);
-    const displayPrompt = runDisplayPrompt(board, run);
-    const settlePredicates = planState?.settlePredicates ?? [];
-    // A board with FEWER turns than when the run last acted was truncated in place by a ChatView fork/split
-    // (splitBoardAtTurn / splitBoardIntoTurnBoards rewrite a board's turns[]). Its answer no longer matches the
-    // run's lastSig, so the auto-continue loop would re-drive it as a phantom "Generating…" turn. A manual
-    // fork/split is the user taking over → pause once. seenTurns stays above the new turn count, so a stale BEGIN
-    // marker now sitting in the top turn can't re-arm it, and the next tick reads `paused` → wait (no churn loop).
-    if (run?.status === 'running' && turnCount < (run.seenTurns ?? 0)) {
-      return { state: { planId, run: { ...run, status: 'paused' } } };
-    }
-    const liveCompletion = (board.status === 'streaming' || board.status === 'waiting') && runDoneVisible(la);
-    if (liveCompletion) {
-      const answerSig = sig(la);
-      if (!runCompletionSummaryVisible(la)) {
-        if (!(run?.status === 'running' && run.lastSig === answerSig && run.note === 'completion marker missing Execution Summary')) {
-          return {
-            state: {
-              planId,
-              run: {
-                status: 'running',
-                continues: run?.continues ?? 0,
-                lastSig: answerSig,
-                seenTurns: turnCount,
-                userPrompt: displayPrompt,
-                ...(run?.summaryRepairSent ? { summaryRepairSent: true } : {}),
-                note: 'completion marker missing Execution Summary',
-              },
-            },
-            stop: true,
-          };
-        }
-        return null;
-      }
-      if (settlePredicates.length) {
-        if (!(run?.status === 'running' && run.lastSig === answerSig && run.note === 'verifying Settle Gate')) {
-          return {
-            state: {
-              planId,
-              run: {
-                status: 'running',
-                continues: run?.continues ?? 0,
-                lastSig: answerSig,
-                seenTurns: turnCount,
-                userPrompt: displayPrompt,
-                note: 'verifying Settle Gate',
-              },
-              settlePredicates,
-            },
-            stop: true,
-          };
-        }
-        return null;
-      }
-      if (!(run?.status === 'paused' && run.lastSig === answerSig && run.note === 'completed ✓')) {
-        return {
-          state: { planId, run: { status: 'paused', continues: run?.continues ?? 0, lastSig: answerSig, seenTurns: turnCount, note: 'completed ✓' } },
-          stop: true,
-        };
-      }
-    }
-    // Manual Stop (core ■) disarms an active run — otherwise the loop would auto-continue right past the stop.
-    // Stamp seenTurns so the just-stopped turn's lingering BEGIN marker can't immediately re-arm (review fix).
-    if (interrupted && run?.status === 'running') {
-      return { state: { planId, run: { ...run, status: 'paused', seenTurns: turnCount, note: 'paused — you stopped it' } } };
-    }
-    // An interrupted board with NO active run but a (possibly stale) BEGIN marker that runArm WOULD fire on must
-    // not auto-(re)start. This is the ChatView fork/split case: truncating a board in place can surface an old
-    // arming turn as the new latest answer, which would otherwise re-arm the run as a phantom "Generating…" turn
-    // (the fork marks the source board interrupted). Stamp it seen so the stale marker can't arm; a genuinely new
-    // run request on a LATER turn still arms (turnCount climbs past seenTurns).
-    if (interrupted && !run && runArm(run, la, turnCount)) {
-      return { state: { planId, run: { status: 'paused', continues: 0, seenTurns: turnCount } } };
-    }
-    // ARM by natural language: the agent emits a BRAID_RUN_BEGIN line when YOU ask it to execute the plan. No
-    // keyword matching — the agent classifies intent. `runArm` edge-triggers on turnCount > seenTurns so a stale
-    // marker (after a Stop / completion) can't restart the run; only a genuinely new request does.
-    const armed = runArm(run, la, turnCount);
-    if (armed) {
-      // The model's BEGIN marker is necessary but not sufficient: a bound-board answer can misclassify ordinary
-      // prompts like "继续测试" as execution intent. Gate arming on the user's latest prompt so discussion/testing
-      // questions cannot start a bypass-permissions auto-run by accident.
-      if (!userRequestedPlanExecution(latestPrompt(board))) return null;
-      return { state: { planId, run: { ...armed, userPrompt: displayPrompt } } };
-    }
-    // A paused run note describes the turn it stopped/completed on. Once a newer turn has moved on without
-    // re-arming, the old "you stopped it" / cap / needs-answer label is stale UI state; drop it instead of
-    // continuing to pin the plan header to an old interruption.
-    if (run?.status === 'paused' && turnCount > (run.seenTurns ?? 0)) return { state: withoutRun(planId, planState) };
-    // CONTINUE / PAUSE / WAIT. A pending AskUserQuestion is a real human decision → pause. A permission prompt is
-    // NOT a pause (continues bypass approvals; turn 1 just waits for your approval, then the run resumes).
-    const d = runStep(run, board.status, la, hasPendingAsk(board), { settlePredicates, ...(settleVerdict ? { settleVerdict } : {}) });
-    if (d.action === 'wait') return null;
-    const next: RunState = { ...d.next, seenTurns: turnCount, userPrompt: d.next.userPrompt ?? displayPrompt };
-    if (d.action === 'verify') {
-      return {
-        verify: d.predicates,
-        state: { planId, run: next, ...(settlePredicates.length ? { settlePredicates } : {}) },
-        event: { kind: 'verify', title: 'Plan verifying Settle Gate', detail: `${d.predicates.length} host predicate(s) queued.`, status: 'busy' },
-      };
-    }
-    if (d.action === 'continue') {
-      const completionRepair = d.reason === 'completionSummaryMissing';
-      const settleRepairVerdict = d.reason === 'settleVerificationFailed' ? d.verdict : undefined;
-      return {
-        drive: completionRepair ? COMPLETION_REPORT_PROMPT : settleRepairVerdict ? settleGateRepairPrompt(settleRepairVerdict) : CONTINUE_PROMPT,
-        displayPrompt: next.userPrompt,
-        state: { planId, run: next, ...(settlePredicates.length ? { settlePredicates } : {}) },
-        permissionMode: 'bypassPermissions',
-        event: completionRepair
-          ? { kind: 'repair', title: 'Plan requested execution summary', detail: 'The completion marker was missing the required report block.', status: 'done' }
-          : settleRepairVerdict
-          ? { kind: 'repair', title: 'Plan requested Settle Gate repair', detail: settleFailureSummary(settleRepairVerdict), status: 'error' }
-          : { kind: 'continue', title: 'Plan auto-continued', detail: 'Continuing the current phase without adding a user-authored prompt.', status: 'done' },
-      };
-    }
-    return {
-      state: { planId, run: next, ...(settlePredicates.length ? { settlePredicates } : {}) },
-      ...(d.stop ? { stop: true } : {}),
-      ...(d.verified ? { event: { kind: 'verified', title: 'Plan completed with host-verified Settle Gate', status: 'done' } } : {}),
-    };
   },
 };

@@ -22,7 +22,7 @@ works with every engine.
 | Plugin | ID | Default | Description |
 |---|---|---|---|
 | **Coordinator** | `coordinator` | on | Coordinates shared workspace resources across boards — agents negotiate editor sessions, builds, and file claims without stepping on each other. |
-| **Knowledge Vault** | `knowledge` | on | Durable project knowledge vault under `.braid/knowledge/`. A dormant context provider tells the agent to record reusable facts as notes and read them on demand. |
+| **Memory** | `memory` | on | Artifact-backed durable project memory. Provides `memory_record` / `memory_recall`, a compact catalog, and inspection UI. |
 | **Plan** | `plan` | off | Bind a board to a `.braid/plans/<name>/` plan. Shows current-phase status as a read-only chip, injects plan-context routing into the board's turns, and tracks phase completion. |
 | **Tags** | `tags` | on | Derive and render board topic tags from the board's content using cheap-model classification against a curated tag vocabulary. |
 | **Prompt Macros** | `prompt-macros` | on | Add configurable prompt buttons to settled boards. Define reusable prompt templates that inject into the composer with one click. |
@@ -36,18 +36,19 @@ through the `coordinate` agent tool — claim, release, wait, and request resour
 conflict prevention (e.g. two boards can't launch the same editor simultaneously). Ships with a workspace
 panel, live coordination notices injected into board context, and a badge showing active claims.
 
-### Knowledge Vault
+### Memory
 
-A dormant context provider that teaches every board the **record / recall** protocol on `.braid/knowledge/`:
+A host service and agent-tool plugin for artifact-backed taxonomy-native durable project memory:
 
-- **Record**: The agent writes durable, reusable, project-specific facts to `.braid/knowledge/<topic>.md`
-  notes (title, claim, scope, evidence, metadata) and appends a routing entry to `_index.md`.
-- **Recall**: Before answering from memory, the agent reads `_index.md` first, then reads the specific
-  note(s) relevant to the question. Note bodies are never auto-injected — only bounded index metadata
-  enters context, keeping token usage low even with hundreds of notes.
+- **Record**: The agent uses `memory_record` verbs (`locator`, `snapshot`, `lesson`, `transcript`) so each
+  record is born with its corpus class, lifecycle state, provenance, recall cue, and evidence locators.
+- **Recall**: The plugin injects a compact memory catalog into turn context and exposes `memory_recall`
+  for explicit lookup. Record bodies are stored as `memory-record` artifacts and read on demand.
+- **Inspect**: The workspace panel shows record class, status, freshness, evidence, read counts, and
+  citation counts. Usage signals are maintenance hints, not authority.
 
-Notes carry a typed lifecycle (`current` / `stale` / `superseded` / `disputed`) so outdated knowledge is
-preserved but excluded from default routing.
+Records carry routing status (`current` / `stale` / `superseded` / `disputed`) separately from freshness
+(`fresh` / `provisional` / `needs-verification`) so route eligibility does not masquerade as truth.
 
 ### Plan
 
@@ -190,7 +191,7 @@ npx vitest run
 
 # Run tests for a specific plugin
 npx vitest run coordinator/coordinator.test.ts
-npx vitest run knowledge/parse.test.ts
+npx vitest run memory/model.test.ts
 npx vitest run plan/detect.test.ts
 ```
 

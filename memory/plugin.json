@@ -2,14 +2,16 @@
   "id": "memory",
   "name": "Memory",
   "version": "1.0.0",
-  "description": "Project-local persistent memory tools stored under .braid/memory/.",
+  "description": "Project-local persistent memory tools stored as artifact-backed records.",
   "defaultEnabled": true,
   "canDisable": true,
   "scope": "builtin",
   "runtime": "builtin",
   "contributes": {
-    "agentTools": ["memory_record", "memory_recall"],
+    "agentTools": ["memory_record", "memory_recall", "memory_get", "memory_catalog"],
     "hostServices": ["memory.hostService"],
-    "turnContext": ["memory.turnContext"]
+    "turnContext": ["memory.turnContext"],
+    "workspacePanels": ["memoryInspectionPanel"],
+    "workspaceBadges": ["memoryInspectionBadge"]
   }
 }
