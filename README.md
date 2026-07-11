@@ -26,7 +26,6 @@ works with every engine.
 | **Plan** | `plan` | off | Bind a board to a `.braid/plans/<name>/` plan. Shows current-phase status as a read-only chip, injects plan-context routing into the board's turns, and tracks phase completion. |
 | **Tags** | `tags` | on | Derive and render board topic tags from the board's content using cheap-model classification against a curated tag vocabulary. |
 | **Prompt Macros** | `prompt-macros` | on | Add configurable prompt buttons to settled boards. Define reusable prompt templates that inject into the composer with one click. |
-| **Context Ref** | `context-ref` | off | Reference context-provider plugin. When enabled, injects a marker block into every turn. Used as an e2e test gate for the `contextProviders` plugin seam — **not a real feature**. |
 
 ### Coordinator
 
@@ -76,12 +75,6 @@ Adds configurable **board actions**: prompt-buttons that appear on settled board
 prompt template. Clicking a macro button injects the template text into the composer — useful for recurring
 workflows like "review this for correctness bugs", "summarize the decisions in this branch", or
 "check for security issues".
-
-### Context Ref
-
-A **reference implementation** of the `contextProviders` plugin seam. When enabled, it injects a
-`[ContextRef]` marker block into every turn's system context. Not intended for production use — it exists
-to exercise and gate the context-provider plugin contract end-to-end. Disabled by default.
 
 ## Shared Library
 
