@@ -48,6 +48,13 @@ export function sortSkillEntries(entries: readonly SkillEntry[]): SkillEntry[] {
   return [...entries].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+// Shared discovery filter: a `.braid/skills/` subfolder counts as a skill unless its name is reserved (leading
+// `_`, e.g. the `_README.md` docs) or hidden (leading `.`). Used by BOTH the webview loader and the host-side
+// Skill tool so the two never drift on which folders are skills.
+export function isSkillDirName(name: string): boolean {
+  return !name.startsWith('_') && !name.startsWith('.');
+}
+
 // Return the instruction body of a SKILL.md — everything after the leading `---` frontmatter block. When there is
 // no frontmatter, the whole text is the body. Used by the manual `/` invoke to insert only the instructions.
 export function skillBody(md: string): string {

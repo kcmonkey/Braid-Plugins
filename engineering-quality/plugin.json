@@ -1,0 +1,15 @@
+{
+  "id": "engineering-quality",
+  "name": "Engineering Quality",
+  "version": "1.0.0",
+  "description": "Requires evidence-backed engineering closeout after source changes.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "agentTools": ["engineering_expect"],
+    "toolMiddleware": ["engineeringQualityObserver"],
+    "hostServices": ["engineeringQuality.hostService"]
+  }
+}
