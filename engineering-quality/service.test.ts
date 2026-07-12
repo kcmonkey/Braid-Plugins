@@ -142,7 +142,7 @@ describe('engineering quality host service', () => {
 
     await expect(h.call({ ...ready, changeKind: 'bugfix' })).resolves.toMatchObject({
       ok: false,
-      result: expect.stringContaining('related-surface search'),
+      result: expect.stringMatching(/related-surface/i),
     });
 
     await h.observe('search', 'Grep', { pattern: 'sameInvariant', path: 'src' });
@@ -163,7 +163,7 @@ describe('engineering quality host service', () => {
 
     await expect(h.call({ ...ready, changeKind: 'bugfix' })).resolves.toMatchObject({
       ok: false,
-      result: expect.stringContaining('related-surface search'),
+      result: expect.stringMatching(/related-surface/i),
     });
   });
 
@@ -179,7 +179,7 @@ describe('engineering quality host service', () => {
     const highRiskReady = { ...ready, risk: 'high', reviewKind: 'independent' };
     await expect(h.call(highRiskReady)).resolves.toMatchObject({
       ok: false,
-      result: expect.stringContaining('independent Reviewer report'),
+      result: expect.stringMatching(/independent-review/i),
     });
 
     await h.observe('spawn', 'spawn_agent', { profile: 'Reviewer', task: 'Review the implementation.', reportType: 'review' });
@@ -210,7 +210,7 @@ describe('engineering quality host service', () => {
 
     await expect(h.call({ ...ready, risk: 'high', reviewKind: 'independent' })).resolves.toMatchObject({
       ok: false,
-      result: expect.stringContaining('independent Reviewer report'),
+      result: expect.stringMatching(/independent-review/i),
     });
   });
 
@@ -232,7 +232,7 @@ describe('engineering quality host service', () => {
 
     await expect(h.call({ ...ready, risk: 'high', reviewKind: 'independent' })).resolves.toMatchObject({
       ok: false,
-      result: expect.stringContaining('independent Reviewer report'),
+      result: expect.stringMatching(/independent-review/i),
     });
   });
 
@@ -255,7 +255,7 @@ describe('engineering quality host service', () => {
     const highRiskReady = { ...ready, risk: 'high', reviewKind: 'independent' };
     await expect(h.call(highRiskReady)).resolves.toMatchObject({
       ok: false,
-      result: expect.stringContaining('independent Reviewer report'),
+      result: expect.stringMatching(/independent-review/i),
     });
 
     await h.observe('reports-new', 'agent_reports', {});
@@ -322,7 +322,63 @@ describe('engineering quality host service', () => {
     await expect(h.call({ status: 'not-applicable', reason: 'A later turn made no source changes.' }, 3)).resolves.toMatchObject({ ok: true });
   });
 
-  it('opens a fresh evidence contract when an adversarial pass revises an earlier ready stance', async () => {
+  it('returns one batched missing checklist instead of only the first gate', async () => {
+    const h = harness();
+    await h.observe('edit', 'Edit', { file_path: 'src/engine/session.ts' });
+    await h.result('edit', 'updated', false);
+
+    const blocked = await h.call({ ...ready, changeKind: 'bugfix', risk: 'high', reviewKind: 'independent' });
+    expect(blocked.ok).toBe(false);
+    expect(String(blocked.result)).toContain('Missing:');
+    expect(String(blocked.result)).toMatch(/verification/i);
+    expect(String(blocked.result)).toMatch(/related-surface/i);
+    expect(String(blocked.result)).toMatch(/independent-review/i);
+    expect(String(blocked.result)).toMatch(/Do every missing item/i);
+  });
+
+  it('allows high-risk self ready when Independent Reviewer spawn is unavailable after the latest change', async () => {
+    const h = harness();
+    await h.observe('edit', 'Edit', { file_path: 'src/engine/session.ts' });
+    await h.result('edit', 'updated', false);
+    await h.observe('search', 'Grep', { pattern: 'session', path: 'src/engine' });
+    await h.result('search', 'matches', false);
+    await h.observe('test', 'Bash', { command: 'npm test', action: 'run' });
+    await h.result('test', 'passed', false);
+
+    await h.observe('spawn', 'spawn_agent', { profile: 'Reviewer', task: 'Review the implementation.', reportType: 'review' });
+    await h.result('spawn', 'Reviewer blocked: model "grok-4.5" is not in provider "xai" model catalog', true);
+
+    const degraded = await h.call({
+      ...ready,
+      risk: 'high',
+      reviewKind: 'self',
+      review: 'Self-reviewed final diff. Independent Reviewer is unavailable: model grok-4.5 not in xai catalog / spawn blocked.',
+    });
+    expect(degraded).toMatchObject({ ok: true });
+    const payload = JSON.parse(String(degraded.result));
+    expect(payload.degraded).toBe(true);
+    expect(payload.limitations).toEqual(expect.arrayContaining(['independent-reviewer-unavailable']));
+  });
+
+  it('still rejects high-risk self ready without a failed Reviewer spawn attempt', async () => {
+    const h = harness();
+    await h.observe('edit', 'Edit', { file_path: 'src/engine/session.ts' });
+    await h.result('edit', 'updated', false);
+    await h.observe('test', 'Bash', { command: 'npm test', action: 'run' });
+    await h.result('test', 'passed', false);
+
+    await expect(h.call({
+      ...ready,
+      risk: 'high',
+      reviewKind: 'self',
+      review: 'Self review only.',
+    })).resolves.toMatchObject({
+      ok: false,
+      result: expect.stringMatching(/independent-review/i),
+    });
+  });
+
+    it('opens a fresh evidence contract when an adversarial pass revises an earlier ready stance', async () => {
     const h = harness();
     await h.observe('edit', 'Edit', { file_path: 'src/domain/value.ts' });
     await h.result('edit', 'updated', false);

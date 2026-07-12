@@ -8,6 +8,7 @@ import type {
   ToolMiddlewarePlugin,
   ToolResultMiddlewareContext,
 } from '../../../src/plugin-api/types';
+import { isSourceMutationTool, normalizeToolName } from '../../../src/plugin-api/toolSemantics';
 import type {
   ExpectStanceProcessEvidence,
   ObligationLedgerEvent,
@@ -31,7 +32,6 @@ const RISKS = new Set<EngineeringRisk>(['low', 'medium', 'high']);
 const REVIEW_KINDS = new Set<EngineeringReviewKind>(['self', 'independent', 'not-needed']);
 const RISK_RANK: Record<EngineeringRisk, number> = { low: 0, medium: 1, high: 2 };
 
-const MUTATION_TOOLS = new Set(['edit', 'write', 'multiedit', 'notebookedit', 'filechange', 'patch', 'apply_patch']);
 const SEARCH_TOOLS = new Set(['grep', 'glob', 'search']);
 const NON_ENGINEERING_EXTENSIONS = new Set([
   '.md', '.mdx', '.rst', '.txt',
@@ -66,6 +66,8 @@ interface EngineeringTurnState {
   verificationMutationSerial?: number;
   reviewerSpawnMutationSerial?: number;
   reviewerHandles: Set<string>;
+  reviewerUnavailableMutationSerial?: number;
+  reviewerUnavailableReason?: string;
   independentReviewMutationSerial?: number;
   readyMutationSerial?: number;
   lastStanceTurnIndex?: number;
@@ -75,13 +77,6 @@ interface EngineeringTurnState {
 function nonEmpty(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed || undefined;
-}
-
-function normalizedToolName(toolName: string): string {
-  const raw = toolName.trim().toLowerCase();
-  const doubleUnderscore = raw.split('__').filter(Boolean);
-  const tail = doubleUnderscore.length > 1 ? doubleUnderscore[doubleUnderscore.length - 1] : raw;
-  return tail.split(/[./:]/).filter(Boolean).at(-1) ?? tail;
 }
 
 function inputRecord(input: unknown): Record<string, unknown> {
@@ -137,7 +132,7 @@ function verificationCommand(input: unknown): string | undefined {
 }
 
 function isSearchUse(toolName: string, input: unknown): boolean {
-  if (SEARCH_TOOLS.has(normalizedToolName(toolName))) return true;
+  if (SEARCH_TOOLS.has(normalizeToolName(toolName))) return true;
   const record = inputRecord(input);
   if (record.action === 'search' || record.action === 'list') return true;
   const command = commandText(input);
@@ -145,7 +140,7 @@ function isSearchUse(toolName: string, input: unknown): boolean {
 }
 
 function isReviewerSpawn(toolName: string, input: unknown): boolean {
-  if (normalizedToolName(toolName) !== 'spawn_agent') return false;
+  if (normalizeToolName(toolName) !== 'spawn_agent') return false;
   return String(inputRecord(input).profile ?? '').trim().toLowerCase() === 'reviewer';
 }
 
@@ -179,19 +174,47 @@ function reviewerReportPresent(content: string, handles: ReadonlySet<string>): b
   }
 }
 
+/** True when a Reviewer spawn failure/blocked catalog message makes independent review infeasible. */
+function isReviewerUnavailableContent(content: string): boolean {
+  const text = String(content ?? '').toLowerCase();
+  return /blocked|unavailable|not in provider|model catalog|cannot spawn|failed to spawn|is not in provider/.test(text);
+}
+
+function documentsReviewerUnavailability(review: string | undefined): boolean {
+  const text = String(review ?? '').toLowerCase();
+  return /unavailable|blocked|not in .*catalog|cannot spawn|spawn failed|model catalog|reviewer.*(blocked|unavailable)/.test(text);
+}
+
+function formatReadyBlocked(missing: string[]): string {
+  const lines = missing.map((item, index) => `${index + 1}. ${item}`);
+  return [
+    'engineering_expect status:"ready" blocked. Missing:',
+    ...lines,
+    'Do every missing item, then call status:"ready" once. Do not re-call ready for each item.',
+    'If Independent Reviewer cannot spawn (blocked/catalog), attempt spawn_agent profile:"Reviewer", then use reviewKind:"self" and document the unavailability in review.',
+  ].join('\n');
+}
+
 function minimumRisk(state: EngineeringTurnState): EngineeringRisk {
   if (state.changedPaths.size >= 5 || [...state.changedPaths].some((path) => HIGH_RISK_PATH.test(path))) return 'high';
   if (state.changedPaths.size >= 2) return 'medium';
   return 'low';
 }
 
-function evidenceItems(changeKind: EngineeringChangeKind, risk: EngineeringRisk, reviewKind: EngineeringReviewKind): ExpectStanceProcessEvidence[] {
+function evidenceItems(
+  changeKind: EngineeringChangeKind,
+  risk: EngineeringRisk,
+  reviewKind: EngineeringReviewKind,
+  opts?: { independentReviewDegraded?: boolean },
+): ExpectStanceProcessEvidence[] {
   const items: ExpectStanceProcessEvidence[] = [
     { type: 'source-change', count: 1 },
     { type: 'verification-pass', count: 1 },
   ];
   if (changeKind === 'bugfix') items.push({ type: 'related-surface-search', count: 1 });
-  if (risk === 'high' || reviewKind === 'independent') items.push({ type: 'independent-review', count: 1 });
+  if ((risk === 'high' || reviewKind === 'independent') && !opts?.independentReviewDegraded) {
+    items.push({ type: 'independent-review', count: 1 });
+  }
   return items;
 }
 
@@ -339,8 +362,8 @@ class EngineeringQualityHostService implements HostService {
 
   private observeToolUse(ctx: ToolMiddlewareContext): void {
     if (ctx.source !== 'observed' || typeof ctx.turnIndex !== 'number') return;
-    const name = normalizedToolName(ctx.toolName);
-    const paths = MUTATION_TOOLS.has(name) ? mutationPaths(ctx.input).filter(engineeringRelevantPath) : [];
+    const name = normalizeToolName(ctx.toolName);
+    const paths = isSourceMutationTool(ctx.toolName) ? mutationPaths(ctx.input).filter(engineeringRelevantPath) : [];
     const command = verificationCommand(ctx.input);
     const search = isSearchUse(ctx.toolName, ctx.input);
     const reviewerSpawn = isReviewerSpawn(ctx.toolName, ctx.input);
@@ -370,7 +393,16 @@ class EngineeringQualityHostService implements HostService {
     const pending = state.pendingTools.get(toolKey(ctx.turnIndex, ctx.toolUseId));
     if (!pending) return;
     state.pendingTools.delete(toolKey(ctx.turnIndex, ctx.toolUseId));
-    if (ctx.isError) return;
+    if (ctx.isError) {
+      if (pending.kind === 'reviewer-spawn' && pending.mutationSerial === state.mutationSerial) {
+        state.reviewerUnavailableMutationSerial = pending.mutationSerial;
+        state.reviewerUnavailableReason = String(ctx.content ?? 'Reviewer spawn failed').slice(0, 500);
+        state.reviewerSpawnMutationSerial = undefined;
+        state.reviewerHandles.clear();
+        state.independentReviewMutationSerial = undefined;
+      }
+      return;
+    }
     switch (pending.kind) {
       case 'mutation':
         this.rearmAfterReady(state);
@@ -381,6 +413,8 @@ class EngineeringQualityHostService implements HostService {
         state.verificationMutationSerial = undefined;
         state.reviewerSpawnMutationSerial = undefined;
         state.reviewerHandles.clear();
+        state.reviewerUnavailableMutationSerial = undefined;
+        state.reviewerUnavailableReason = undefined;
         state.independentReviewMutationSerial = undefined;
         this.ensureBinding(state);
         return;
@@ -401,6 +435,14 @@ class EngineeringQualityHostService implements HostService {
           if (handle) {
             state.reviewerSpawnMutationSerial = pending.mutationSerial;
             state.reviewerHandles.add(handle);
+            state.reviewerUnavailableMutationSerial = undefined;
+            state.reviewerUnavailableReason = undefined;
+          } else if (isReviewerUnavailableContent(ctx.content)) {
+            state.reviewerUnavailableMutationSerial = pending.mutationSerial;
+            state.reviewerUnavailableReason = String(ctx.content ?? '').slice(0, 500);
+            state.reviewerSpawnMutationSerial = undefined;
+            state.reviewerHandles.clear();
+            state.independentReviewMutationSerial = undefined;
           }
         }
         return;
@@ -423,35 +465,63 @@ class EngineeringQualityHostService implements HostService {
     changeKind?: EngineeringChangeKind;
     risk?: EngineeringRisk;
     reviewKind?: EngineeringReviewKind;
+    independentReviewDegraded?: boolean;
   } {
     const changeKindRaw = nonEmpty(req.changeKind)?.toLowerCase() as EngineeringChangeKind | undefined;
     const riskRaw = nonEmpty(req.risk)?.toLowerCase() as EngineeringRisk | undefined;
     const reviewKindRaw = nonEmpty(req.reviewKind)?.toLowerCase() as EngineeringReviewKind | undefined;
-    if (!changeKindRaw || !CHANGE_KINDS.has(changeKindRaw)) return { error: 'engineering_expect status:"ready" requires a valid changeKind.' };
-    if (!riskRaw || !RISKS.has(riskRaw)) return { error: 'engineering_expect status:"ready" requires risk:"low", "medium", or "high".' };
-    if (!reviewKindRaw || !REVIEW_KINDS.has(reviewKindRaw)) return { error: 'engineering_expect status:"ready" requires reviewKind:"self" or "independent".' };
+    const hard: string[] = [];
+    if (!changeKindRaw || !CHANGE_KINDS.has(changeKindRaw)) hard.push('changeKind: use bugfix|feature|refactor|config|test|other');
+    if (!riskRaw || !RISKS.has(riskRaw)) hard.push('risk: use low|medium|high');
+    if (!reviewKindRaw || !REVIEW_KINDS.has(reviewKindRaw)) hard.push('reviewKind: use self|independent (not-needed invalid for source changes)');
     for (const [field, value] of [['impact', req.impact], ['regression', req.regression], ['review', req.review], ['verification', req.verification]] as const) {
-      if (!nonEmpty(value)) return { error: `engineering_expect status:"ready" requires a non-empty ${field} assessment.` };
+      if (!nonEmpty(value)) hard.push(`${field}: non-empty assessment required`);
+    }
+    if (hard.length) return { error: formatReadyBlocked(hard) };
+    if (reviewKindRaw === 'not-needed') {
+      return { error: formatReadyBlocked(['reviewKind: source-changing ready requires self or independent; not-needed is invalid']) };
     }
     const floor = minimumRisk(state);
-    if (RISK_RANK[riskRaw] < RISK_RANK[floor]) {
-      return { error: `Observed paths require at least risk:"${floor}"; reassess blast radius before declaring ready.` };
-    }
-    if (reviewKindRaw === 'not-needed') {
-      return { error: 'Source-changing ready stances require self or independent code review; reviewKind:"not-needed" is not valid.' };
+    const missing: string[] = [];
+    if (RISK_RANK[riskRaw!] < RISK_RANK[floor]) {
+      missing.push(`risk: observed paths require at least risk:"${floor}" (reassess blast radius)`);
     }
     if (state.verificationMutationSerial !== state.mutationSerial || !state.verificationPasses.size) {
-      return { error: 'engineering_expect status:"ready" requires a successful verification command result after the latest source change.' };
+      missing.push('verification: successful verification command result after the latest source change');
     }
     if (changeKindRaw === 'bugfix' && state.successfulSearchMutationSerial !== state.mutationSerial) {
-      return { error: 'Bugfix readiness requires a successful related-surface search for sibling implementations, callers, or the same invariant.' };
+      missing.push('related-surface-search: successful search for sibling implementations, callers, or the same invariant after the latest source change');
     }
-    if (riskRaw === 'high' || reviewKindRaw === 'independent') {
-      if (reviewKindRaw !== 'independent' || state.independentReviewMutationSerial !== state.mutationSerial) {
-        return { error: 'High-risk readiness requires an independent Reviewer report gathered after the latest source change.' };
+
+    let independentReviewDegraded = false;
+    const wantsIndependent = riskRaw === 'high' || reviewKindRaw === 'independent';
+    if (wantsIndependent) {
+      const hasReport = state.independentReviewMutationSerial === state.mutationSerial;
+      const unavailable = state.reviewerUnavailableMutationSerial === state.mutationSerial;
+      if (hasReport) {
+        if (reviewKindRaw !== 'independent') {
+          missing.push('reviewKind: set independent when a Reviewer report was gathered after the latest source change');
+        }
+      } else if (unavailable && reviewKindRaw === 'self') {
+        if (!documentsReviewerUnavailability(req.review)) {
+          missing.push('review: document Independent Reviewer unavailability (blocked/catalog/spawn failure) when using reviewKind:"self" on high-risk without a report');
+        } else {
+          independentReviewDegraded = true;
+        }
+      } else if (unavailable) {
+        missing.push('independent-review: Reviewer is unavailable this turn — use reviewKind:"self" and document the limitation in review, or fix the Reviewer model catalog and gather a report');
+      } else {
+        missing.push('independent-review: spawn Reviewer and gather a report after the latest source change; if spawn is blocked, attempt spawn then use reviewKind:"self" and document unavailability');
       }
     }
-    return { changeKind: changeKindRaw, risk: riskRaw, reviewKind: reviewKindRaw };
+
+    if (missing.length) return { error: formatReadyBlocked(missing) };
+    return {
+      changeKind: changeKindRaw,
+      risk: riskRaw,
+      reviewKind: reviewKindRaw,
+      independentReviewDegraded,
+    };
   }
 
   private async handleExpect(ctx: AgentToolContext, req: EngineeringExpectRequest) {
@@ -515,7 +585,9 @@ class EngineeringQualityHostService implements HostService {
     if (validation.error || !validation.changeKind || !validation.risk || !validation.reviewKind) {
       return { ok: false, result: validation.error ?? 'Engineering readiness could not be validated.' };
     }
-    const items = evidenceItems(validation.changeKind, validation.risk, validation.reviewKind);
+    const items = evidenceItems(validation.changeKind, validation.risk, validation.reviewKind, {
+      independentReviewDegraded: validation.independentReviewDegraded,
+    });
     const signature = evidenceSignature(items);
     const recorded = state.recordedProcessEvidence.get(state.obligationId);
     if (recorded && recorded !== signature) {
@@ -531,6 +603,9 @@ class EngineeringQualityHostService implements HostService {
       });
       state.recordedProcessEvidence.set(state.obligationId, signature);
     }
+    const limitations = validation.independentReviewDegraded
+      ? ['independent-reviewer-unavailable']
+      : [];
     const summary = [
       `changeKind=${validation.changeKind}`,
       `risk=${validation.risk}`,
@@ -538,6 +613,8 @@ class EngineeringQualityHostService implements HostService {
       `regression=${nonEmpty(req.regression)}`,
       `review=${nonEmpty(req.review)}`,
       `verification=${nonEmpty(req.verification)}`,
+      ...(limitations.length ? [`limitations=${limitations.join(',')}`] : []),
+      ...(state.reviewerUnavailableReason ? [`reviewerUnavailable=${state.reviewerUnavailableReason}`] : []),
     ].join('; ');
     this.record({
       type: 'expect-stance-decided',
@@ -555,6 +632,8 @@ class EngineeringQualityHostService implements HostService {
         changeKind: validation.changeKind,
         risk: validation.risk,
         reviewKind: validation.reviewKind,
+        degraded: limitations.length > 0,
+        limitations,
         changedPaths: [...state.changedPaths].sort(),
         verificationCommands: [...state.verificationPasses],
         evidence: items,
