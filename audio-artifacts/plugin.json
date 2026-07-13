@@ -1,8 +1,8 @@
 {
   "id": "audio-artifacts",
   "name": "Audio Artifacts",
-  "version": "1.0.0",
-  "description": "Audio artifact type and text-to-speech artifact generation producer.",
+  "version": "1.1.0",
+  "description": "Audio artifact type with separate speech, sound-effect, and music generation tools and defaults.",
   "defaultEnabled": true,
   "canDisable": true,
   "scope": "builtin",

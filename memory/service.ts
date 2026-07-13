@@ -37,7 +37,7 @@ import { createMemoryInspectionSnapshot, MEMORY_INSPECTION_STATE_KEY } from './i
 import { getMemoryIndexSnapshot } from './indexCache';
 
 const manifest = manifestJson as PluginManifest;
-export const MEMORY_COMPLETE_CATALOG_THRESHOLD = 300;
+export const MEMORY_COMPLETE_CATALOG_THRESHOLD = 24;
 const MAX_RESULT_CHARS = 4000;
 const MAX_CONTENT_CHARS = 700;
 
@@ -60,10 +60,8 @@ function formatBirthErrors(errors: { code: string; message: string }[]): string 
 function memoryProtocolText(): string {
   return [
     '[Braid memory]',
-    'Durable project memory uses class-bound write verbs; class is derived mechanically, never supplied by the agent.',
-    'Write with braid.memory_record using verb=locator|snapshot|lesson|transcript. Locator stores only a pointer; snapshot needs source+capturedAt; lesson needs evidenceLocators and is provisional; transcript needs quote+quoteSource.',
-    'Every new memory needs title, recallCue, and provenance. Never claim a lesson was recorded unless memory_record returned success in this turn.',
-    'Use action=status with id+status to mark current/stale/superseded/disputed. Use braid.memory_recall before relying on prior project facts.',
+    'Recall with memory_recall before relying on project memory; use memory_get for an exact record.',
+    'Write with memory_record class-bound verbs; class is derived from the verb, and a memory is recorded only after a successful memory_record result.',
   ].join('\n');
 }
 

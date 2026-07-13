@@ -7,8 +7,8 @@ import type { AgentToolPlugin, HostServiceContext } from '../../../src/plugin-ap
 import type { AgentToolResult } from '../../../src/engine/types';
 import type { ArtifactGenerationDefaults, ArtifactGenerationServiceView } from '../../../src/protocol';
 
-function defaults(audio = ''): ArtifactGenerationDefaults {
-  return { image: '', 'model-3d': '', video: '', audio };
+function defaults(speech = '', soundEffect = '', music = ''): ArtifactGenerationDefaults {
+  return { image: '', 'model-3d': '', video: '', audio: { speech, soundEffect, music } };
 }
 
 function makeCtx(project: string, artifactDefaults: ArtifactGenerationDefaults = defaults(), options: {
@@ -79,9 +79,9 @@ function makeHarness(project: string, artifactDefaults?: ArtifactGenerationDefau
   const service = audioArtifactsHostServicePlugin.create(host.ctx);
   const tools = service.agentTools?.() ?? [];
   const byName = new Map(tools.map((tool) => [tool.tool.name, tool as AgentToolPlugin<Record<string, unknown>>]));
-  const call = (args: Record<string, unknown>, signal = new AbortController().signal): Promise<AgentToolResult> => {
-    const tool = byName.get('audio_generate');
-    if (!tool) throw new Error('missing audio_generate tool');
+  const call = (args: Record<string, unknown>, signal = new AbortController().signal, toolName = 'speech_generate'): Promise<AgentToolResult> => {
+    const tool = byName.get(toolName);
+    if (!tool) throw new Error(`missing ${toolName} tool`);
     return tool.call({ canvasId: 'c1', boardId: 'b1', turnIndex: 6, provider: 'codex', signal }, args);
   };
   return { service, tools, call, ...host };
@@ -91,31 +91,125 @@ function parse(result: AgentToolResult): any {
   return JSON.parse(result.result);
 }
 
-function openRouterService(model = 'openai/tts-1', serviceId = 'engine:openrouter:audio'): ArtifactGenerationServiceView {
+function openRouterService(model = 'openai/tts-1', serviceId = 'engine:openrouter:audio:speech'): ArtifactGenerationServiceView {
   return {
     serviceId,
     label: 'OpenRouter Audio',
     dataTypes: ['audio'],
+    producerKinds: ['audio.speech'],
     source: 'engine',
     provider: 'openrouter',
     authKind: 'provider-account',
     configured: true,
     credentialStatus: 'configured',
     requiresCostConfirmation: true,
-    capabilityScopes: [{ provider: 'openrouter', dataType: 'audio', model, endpoint: '/audio/speech' }],
+    capabilityScopes: [{ provider: 'openrouter', dataType: 'audio', producerKind: 'audio.speech', model, endpoint: '/audio/speech' }],
+  };
+}
+
+function openRouterMusicService(
+  model = 'google/lyria-3-clip-preview',
+  serviceId = 'engine:openrouter:audio:music',
+): ArtifactGenerationServiceView {
+  return {
+    serviceId,
+    label: 'OpenRouter Music: Lyria 3 Clip Preview',
+    dataTypes: ['audio'],
+    producerKinds: ['audio.music'],
+    source: 'engine',
+    provider: 'openrouter',
+    authKind: 'provider-account',
+    configured: true,
+    credentialStatus: 'configured',
+    requiresCostConfirmation: true,
+    capabilityScopes: [{ provider: 'openrouter', dataType: 'audio', producerKind: 'audio.music', model, endpoint: '/chat/completions' }],
   };
 }
 
 describe('audio artifacts host service', () => {
-  it('exposes audio_generate without provider selection arguments', () => {
+  it('exposes semantic audio producer tools plus the speech compatibility alias', () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-tool-'));
     try {
       const harness = makeHarness(project);
-      const tool = harness.tools.find((candidate) => candidate.tool.name === 'audio_generate');
+      expect(harness.tools.map((candidate) => candidate.tool.name)).toEqual([
+        'speech_generate',
+        'sound_effect_generate',
+        'music_generate',
+        'audio_generate',
+      ]);
+      const tool = harness.tools.find((candidate) => candidate.tool.name === 'speech_generate');
       expect(tool?.tool.namespace).toBe('braid');
       expect(tool?.tool.description).toContain('Braid Settings');
       expect(tool?.tool.description).toContain('confirmCost');
       expect(JSON.stringify(tool?.tool.inputSchema)).not.toContain('providerId');
+      expect(tool?.tool.inputSchema.required).toEqual(['input']);
+      expect(harness.tools.find((candidate) => candidate.tool.name === 'sound_effect_generate')?.tool.inputSchema.required).toEqual(['prompt']);
+      expect(harness.tools.find((candidate) => candidate.tool.name === 'sound_effect_generate')?.tool.description).toContain('Do not substitute a speech provider');
+      expect(harness.tools.find((candidate) => candidate.tool.name === 'music_generate')?.tool.description).toContain('Do not substitute a speech provider');
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps audio_generate as a speech-only compatibility alias', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-alias-'));
+    try {
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech'), {
+        artifactGenerationServices: [openRouterService()],
+        generateAudioWithEngine: async (_provider, request) => {
+          expect(request).toMatchObject({ kind: 'speech', input: 'legacy narration' });
+          return { bytes: new Uint8Array([1]), mime: 'audio/mpeg' };
+        },
+      });
+      const result = await harness.call({
+        requestId: 'legacy-audio-alias',
+        input: 'legacy narration',
+        options: { model: 'openai/tts-1', voice: 'alloy' },
+        confirmCost: true,
+      }, new AbortController().signal, 'audio_generate');
+      expect(result.ok).toBe(true);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('migrates a persisted legacy TTS request and service id before retrying it', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-legacy-retry-'));
+    try {
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech'), {
+        artifactGenerationServices: [openRouterService()],
+        generateAudioWithEngine: async (provider, request) => {
+          expect(provider).toBe('openrouter');
+          expect(request).toMatchObject({
+            requestId: 'legacy-pending',
+            kind: 'speech',
+            input: 'legacy narration',
+          });
+          return { bytes: new Uint8Array([1]), mime: 'audio/mpeg' };
+        },
+      });
+      harness.aggregates.set('audio-request:legacy-pending', [{
+        payload: {
+          requestKey: 'legacy-pending',
+          canvasId: 'c1',
+          boardId: 'b1',
+          turnIndex: 6,
+          providerId: 'engine:openrouter:audio',
+          request: {
+            requestId: 'legacy-pending',
+            input: 'legacy narration',
+            options: { model: 'openai/tts-1', voice: 'alloy' },
+          },
+          status: 'pending',
+        },
+      }]);
+      const result = await harness.call({
+        requestId: 'legacy-pending',
+        input: 'legacy narration',
+        options: { model: 'openai/tts-1', voice: 'alloy' },
+        confirmCost: true,
+      }, new AbortController().signal, 'audio_generate');
+      expect(result.ok).toBe(true);
     } finally {
       fs.rmSync(project, { recursive: true, force: true });
     }
@@ -133,11 +227,68 @@ describe('audio artifacts host service', () => {
     }
   });
 
+  it('rejects malformed optionsJson before resolving or dispatching a provider', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-invalid-options-'));
+    try {
+      const harness = makeHarness(project);
+      const result = await harness.call({ input: 'hello', optionsJson: '[not-json' });
+      expect(result.ok).toBe(false);
+      expect(parse(result).error).toContain('valid JSON object');
+      expect(harness.produceCalls).toHaveLength(0);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('does not route sound effects or music through the configured OpenRouter speech service', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-semantic-routing-'));
+    let engineCalls = 0;
+    try {
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech'), {
+        artifactGenerationServices: [openRouterService()],
+        generateAudioWithEngine: async () => {
+          engineCalls += 1;
+          return { bytes: new Uint8Array([1]), mime: 'audio/mpeg' };
+        },
+      });
+      const soundEffect = await harness.call({ requestId: 'sfx-1', prompt: 'single handgun shot', confirmCost: true }, new AbortController().signal, 'sound_effect_generate');
+      const music = await harness.call({ requestId: 'music-1', prompt: 'slow piano nocturne', confirmCost: true }, new AbortController().signal, 'music_generate');
+      expect(soundEffect.ok).toBe(false);
+      expect(parse(soundEffect).error).toContain('Sound Effect');
+      expect(music.ok).toBe(false);
+      expect(parse(music).error).toContain('Music');
+      expect(engineCalls).toBe(0);
+      expect(harness.produceCalls).toHaveLength(0);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a speech service manually placed in the Sound Effect default slot', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-misbound-sfx-'));
+    let engineCalls = 0;
+    try {
+      const harness = makeHarness(project, defaults('', 'engine:openrouter:audio:speech'), {
+        artifactGenerationServices: [openRouterService()],
+        generateAudioWithEngine: async () => {
+          engineCalls += 1;
+          return { bytes: new Uint8Array([1]), mime: 'audio/mpeg' };
+        },
+      });
+      const result = await harness.call({ requestId: 'misbound-sfx', prompt: 'door slam', confirmCost: true }, new AbortController().signal, 'sound_effect_generate');
+      expect(result.ok).toBe(false);
+      expect(parse(result).error).toContain('Speech producer, not Sound Effect');
+      expect(engineCalls).toBe(0);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
   it('blocks paid OpenRouter TTS until confirmCost is explicit', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-cost-'));
     let engineCalls = 0;
     try {
-      const harness = makeHarness(project, defaults('engine:openrouter:audio'), {
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech'), {
         artifactGenerationServices: [openRouterService()],
         generateAudioWithEngine: async () => {
           engineCalls += 1;
@@ -158,13 +309,14 @@ describe('audio artifacts host service', () => {
     let engineCalls = 0;
     let secretReads = 0;
     try {
-      const harness = makeHarness(project, defaults('engine:openrouter:audio'), {
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech'), {
         artifactGenerationServices: [openRouterService()],
         generateAudioWithEngine: async (provider, request) => {
           engineCalls += 1;
           expect(provider).toBe('openrouter');
           expect(request).toMatchObject({
             requestId: 'openrouter-audio',
+            kind: 'speech',
             input: 'Hello artifact world.',
             options: { model: 'openai/tts-1', voice: 'alloy', response_format: 'mp3' },
           });
@@ -213,6 +365,7 @@ describe('audio artifacts host service', () => {
           voice: 'alloy',
           response_format: 'mp3',
           generation_id: 'gen-audio-123',
+          generationKind: 'speech',
         },
       });
     } finally {
@@ -224,8 +377,8 @@ describe('audio artifacts host service', () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-openrouter-default-model-'));
     let engineCalls = 0;
     try {
-      const harness = makeHarness(project, defaults('engine:openrouter:audio:openai%2Ftts-1'), {
-        artifactGenerationServices: [openRouterService('openai/tts-1', 'engine:openrouter:audio:openai%2Ftts-1')],
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech:openai%2Ftts-1'), {
+        artifactGenerationServices: [openRouterService('openai/tts-1', 'engine:openrouter:audio:speech:openai%2Ftts-1')],
         generateAudioWithEngine: async (provider, request) => {
           engineCalls += 1;
           expect(provider).toBe('openrouter');
@@ -251,11 +404,98 @@ describe('audio artifacts host service', () => {
     }
   });
 
+  it('dispatches Music through the selected OpenRouter Lyria service and preserves Music metadata', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-openrouter-music-'));
+    let engineCalls = 0;
+    try {
+      const serviceId = 'engine:openrouter:audio:music';
+      const harness = makeHarness(project, defaults('', '', serviceId), {
+        artifactGenerationServices: [openRouterMusicService()],
+        generateAudioWithEngine: async (provider, request) => {
+          engineCalls += 1;
+          expect(provider).toBe('openrouter');
+          expect(request).toMatchObject({
+            requestId: 'openrouter-music',
+            kind: 'music',
+            prompt: 'A warm analog synthwave loop.',
+            options: { model: 'google/lyria-3-clip-preview' },
+          });
+          return {
+            bytes: new Uint8Array([0x49, 0x44, 0x33]),
+            mime: 'audio/mpeg',
+            label: 'openrouter-music.mp3',
+            metadata: {
+              provider: 'openrouter',
+              endpoint: '/chat/completions',
+              model: 'google/lyria-3-clip-preview',
+              format: 'mp3',
+            },
+          };
+        },
+      });
+
+      const result = await harness.call({
+        requestId: 'openrouter-music',
+        prompt: 'A warm analog synthwave loop.',
+        confirmCost: true,
+      }, new AbortController().signal, 'music_generate');
+
+      expect(result.ok).toBe(true);
+      expect(parse(result)).toMatchObject({ requestId: 'openrouter-music', status: 'succeeded' });
+      expect(engineCalls).toBe(1);
+      expect(harness.produceCalls).toHaveLength(1);
+      expect(harness.produceCalls[0].input).toMatchObject({
+        source: 'born',
+        dataType: 'audio',
+        mime: 'audio/mpeg',
+        label: 'openrouter-music.mp3',
+        metadata: {
+          provider: 'openrouter',
+          endpoint: '/chat/completions',
+          model: 'google/lyria-3-clip-preview',
+          format: 'mp3',
+          generationKind: 'music',
+        },
+      });
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before engine dispatch when an OpenRouter Music model is outside the selected capability scope', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-openrouter-music-capability-'));
+    let engineCalls = 0;
+    try {
+      const serviceId = 'engine:openrouter:audio:music';
+      const harness = makeHarness(project, defaults('', '', serviceId), {
+        artifactGenerationServices: [openRouterMusicService()],
+        generateAudioWithEngine: async () => {
+          engineCalls += 1;
+          return { bytes: new Uint8Array([1]), mime: 'audio/mpeg' };
+        },
+      });
+
+      const result = await harness.call({
+        requestId: 'openrouter-not-music',
+        prompt: 'A warm analog synthwave loop.',
+        options: { model: 'openai/gpt-audio' },
+        confirmCost: true,
+      }, new AbortController().signal, 'music_generate');
+
+      expect(result.ok).toBe(false);
+      expect(parse(result).error).toContain('not advertised as Music-capable');
+      expect(engineCalls).toBe(0);
+      expect(harness.produceCalls).toHaveLength(0);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed before engine dispatch when the OpenRouter speech model is not capability-scoped', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-openrouter-capability-'));
     let engineCalls = 0;
     try {
-      const harness = makeHarness(project, defaults('engine:openrouter:audio'), {
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech'), {
         artifactGenerationServices: [openRouterService('openai/tts-1')],
         generateAudioWithEngine: async () => {
           engineCalls += 1;
@@ -281,7 +521,7 @@ describe('audio artifacts host service', () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-openrouter-idempotent-'));
     let engineCalls = 0;
     try {
-      const harness = makeHarness(project, defaults('engine:openrouter:audio'), {
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech'), {
         artifactGenerationServices: [openRouterService()],
         generateAudioWithEngine: async () => {
           engineCalls += 1;
@@ -305,6 +545,38 @@ describe('audio artifacts host service', () => {
       });
       expect(second.ok).toBe(true);
       expect(parse(second)).toMatchObject({ requestId: 'audio-idem', status: 'succeeded', artifactId: 'audio-1', reused: true });
+      expect(engineCalls).toBe(1);
+      expect(harness.produceCalls).toHaveLength(1);
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reuse one requestId across different audio producer kinds', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-audio-cross-kind-id-'));
+    let engineCalls = 0;
+    try {
+      const harness = makeHarness(project, defaults('engine:openrouter:audio:speech'), {
+        artifactGenerationServices: [openRouterService()],
+        generateAudioWithEngine: async () => {
+          engineCalls += 1;
+          return { bytes: new Uint8Array([0x49, 0x44, 0x33]), mime: 'audio/mpeg' };
+        },
+      });
+      const speech = await harness.call({
+        requestId: 'shared-audio-id',
+        input: 'narration',
+        options: { model: 'openai/tts-1', voice: 'alloy' },
+        confirmCost: true,
+      });
+      const music = await harness.call({
+        requestId: 'shared-audio-id',
+        prompt: 'piano nocturne',
+        confirmCost: true,
+      }, new AbortController().signal, 'music_generate');
+      expect(speech.ok).toBe(true);
+      expect(music.ok).toBe(false);
+      expect(parse(music).error).toContain('belongs to Speech generation');
       expect(engineCalls).toBe(1);
       expect(harness.produceCalls).toHaveLength(1);
     } finally {

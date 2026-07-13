@@ -615,6 +615,11 @@ describe('memory host service', () => {
       const context = await service.turnContext();
       expect(context).toContain('[Braid memory]');
       expect((context?.match(/Catalog Memory \d/g) ?? [])).toHaveLength(12);
+      const protocol = context?.split('\n\n', 1)[0] ?? '';
+      expect(protocol.length).toBeLessThanOrEqual(360);
+      expect(protocol).toContain('memory_recall');
+      expect(protocol).toContain('class-bound verbs');
+      expect(protocol).toContain('successful memory_record result');
       expect(context).toContain('深读:memory_recall 或 memory id');
       expect(context).not.toContain('type=');
       expect(context).not.toContain('readCount');
@@ -626,6 +631,7 @@ describe('memory host service', () => {
   it('injects bounded overview above the threshold while pull tools reach the needle', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-overview-'));
     try {
+      expect(MEMORY_COMPLETE_CATALOG_THRESHOLD).toBe(24);
       let store: MemoryStore = emptyMemoryStore();
       let needleId = '';
       for (let i = 0; i < MEMORY_COMPLETE_CATALOG_THRESHOLD + 5; i += 1) {

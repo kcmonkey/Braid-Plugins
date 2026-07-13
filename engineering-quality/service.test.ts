@@ -167,7 +167,7 @@ describe('engineering quality host service', () => {
     });
   });
 
-  it('requires a reported independent Reviewer result for high-risk readiness', async () => {
+  it('requires a reported Reviewer result only when independent review is selected', async () => {
     const h = harness();
     await h.observe('edit', 'Edit', { file_path: 'src/engine/session.ts' });
     await h.result('edit', 'updated', false);
@@ -336,46 +336,46 @@ describe('engineering quality host service', () => {
     expect(String(blocked.result)).toMatch(/Do every missing item/i);
   });
 
-  it('allows high-risk self ready when Independent Reviewer spawn is unavailable after the latest change', async () => {
+  it('allows explicitly high-risk work to close with self review without spawning a Reviewer', async () => {
     const h = harness();
     await h.observe('edit', 'Edit', { file_path: 'src/engine/session.ts' });
     await h.result('edit', 'updated', false);
-    await h.observe('search', 'Grep', { pattern: 'session', path: 'src/engine' });
-    await h.result('search', 'matches', false);
     await h.observe('test', 'Bash', { command: 'npm test', action: 'run' });
     await h.result('test', 'passed', false);
 
-    await h.observe('spawn', 'spawn_agent', { profile: 'Reviewer', task: 'Review the implementation.', reportType: 'review' });
-    await h.result('spawn', 'Reviewer blocked: model "grok-4.5" is not in provider "xai" model catalog', true);
-
-    const degraded = await h.call({
+    const result = await h.call({
       ...ready,
       risk: 'high',
       reviewKind: 'self',
-      review: 'Self-reviewed final diff. Independent Reviewer is unavailable: model grok-4.5 not in xai catalog / spawn blocked.',
+      review: 'Checked the final diff directly; no separate Reviewer was needed.',
     });
-    expect(degraded).toMatchObject({ ok: true });
-    const payload = JSON.parse(String(degraded.result));
-    expect(payload.degraded).toBe(true);
-    expect(payload.limitations).toEqual(expect.arrayContaining(['independent-reviewer-unavailable']));
+    expect(result).toMatchObject({ ok: true });
+    const payload = JSON.parse(String(result.result));
+    expect(payload.degraded).toBe(false);
+    expect(payload.limitations).toEqual([]);
   });
 
-  it('still rejects high-risk self ready without a failed Reviewer spawn attempt', async () => {
+  it('does not infer risk from sensitive-looking path names', async () => {
     const h = harness();
     await h.observe('edit', 'Edit', { file_path: 'src/engine/session.ts' });
     await h.result('edit', 'updated', false);
     await h.observe('test', 'Bash', { command: 'npm test', action: 'run' });
     await h.result('test', 'passed', false);
 
-    await expect(h.call({
-      ...ready,
-      risk: 'high',
-      reviewKind: 'self',
-      review: 'Self review only.',
-    })).resolves.toMatchObject({
-      ok: false,
-      result: expect.stringMatching(/independent-review/i),
-    });
+    await expect(h.call(ready)).resolves.toMatchObject({ ok: true });
+  });
+
+  it('does not infer risk from the number of changed files', async () => {
+    const h = harness();
+    for (let index = 0; index < 5; index += 1) {
+      const id = `edit-${index}`;
+      await h.observe(id, 'Edit', { file_path: `src/domain/value-${index}.ts` });
+      await h.result(id, 'updated', false);
+    }
+    await h.observe('test', 'Bash', { command: 'npm test', action: 'run' });
+    await h.result('test', 'passed', false);
+
+    await expect(h.call(ready)).resolves.toMatchObject({ ok: true });
   });
 
     it('opens a fresh evidence contract when an adversarial pass revises an earlier ready stance', async () => {

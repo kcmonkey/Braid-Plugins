@@ -9,11 +9,18 @@ import type {
   PluginManifest,
 } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
-import type { EngineId } from '../../../src/protocol';
-import { artifactGenerationDefaultFor, parseEngineAudioServiceId, parseEngineAudioServiceModel } from '../../../src/artifactGeneration';
+import type { ArtifactGenerationProducerKind, AudioGenerationKind, EngineId } from '../../../src/protocol';
+import {
+  artifactGenerationDefaultFor,
+  artifactGenerationServiceSupports,
+  engineAudioServiceId,
+  parseEngineAudioServiceId,
+  parseEngineAudioServiceKind,
+  parseEngineAudioServiceModel,
+} from '../../../src/artifactGeneration';
 import manifestJson from './plugin.json';
 import { AUDIO_DATA_TYPE, AUDIO_DEFAULT_MIME } from './artifactType';
-import { createAudioGenerateAgentTool, type AudioGenerateToolRequest } from './agentTool';
+import { createAudioGenerateAgentTools, type AudioGenerateToolRequest } from './agentTool';
 
 const manifest = manifestJson as PluginManifest;
 const AGGREGATE_PREFIX = 'audio-request:';
@@ -35,7 +42,28 @@ interface AudioDriverRecord {
 interface AudioServiceTarget {
   providerId: string;
   engine: EngineId;
+  kind: AudioGenerationKind;
+  producerKind: ArtifactGenerationProducerKind;
   requiresCostConfirmation: boolean;
+}
+
+function producerKindFor(kind: AudioGenerationKind): ArtifactGenerationProducerKind {
+  if (kind === 'speech') return 'audio.speech';
+  if (kind === 'sound-effect') return 'audio.soundEffect';
+  return 'audio.music';
+}
+
+function kindLabel(kind: AudioGenerationKind): string {
+  if (kind === 'speech') return 'Speech';
+  if (kind === 'sound-effect') return 'Sound Effect';
+  return 'Music';
+}
+
+function canonicalProviderId(providerId: string): string {
+  const engine = parseEngineAudioServiceId(providerId);
+  const kind = parseEngineAudioServiceKind(providerId);
+  if (!engine || !kind) return providerId;
+  return engineAudioServiceId(engine, parseEngineAudioServiceModel(providerId), kind);
 }
 
 function stableJson(value: unknown): string {
@@ -67,7 +95,15 @@ function asRecord(value: unknown): AudioDriverRecord | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const candidate = value as AudioDriverRecord;
   if (!candidate.requestKey || !candidate.providerId || !candidate.request) return undefined;
-  return candidate;
+  const providerId = canonicalProviderId(candidate.providerId);
+  const request = candidate.request as unknown as { kind?: AudioGenerationKind; input?: unknown; prompt?: unknown } & Record<string, unknown>;
+  if (!request.kind && typeof request.input === 'string') {
+    // Persisted records from the pre-classification audio tool were always TTS.
+    return { ...candidate, providerId, request: { ...request, kind: 'speech', input: request.input } as AudioGenerationRequest };
+  }
+  if (request.kind !== 'speech' && request.kind !== 'sound-effect' && request.kind !== 'music') return undefined;
+  if (request.kind === 'speech' ? typeof request.input !== 'string' : typeof request.prompt !== 'string') return undefined;
+  return providerId === candidate.providerId ? candidate : { ...candidate, providerId };
 }
 
 class AudioArtifactsHostService implements HostService {
@@ -75,43 +111,54 @@ class AudioArtifactsHostService implements HostService {
   label = 'Audio Artifacts Host Service';
   manifest = manifest;
   private readonly records = new Map<string, AudioDriverRecord>();
-  private readonly inFlight = new Map<string, Promise<AgentToolResult>>();
+  private readonly inFlight = new Map<string, { kind: AudioGenerationKind; promise: Promise<AgentToolResult> }>();
 
   constructor(private readonly host: HostServiceContext) {}
 
   agentTools() {
-    return [createAudioGenerateAgentTool(this.host, { generate: (ctx, req) => this.handleGenerate(ctx, req) })];
+    return createAudioGenerateAgentTools(this.host, { generate: (ctx, req) => this.handleGenerate(ctx, req) });
   }
 
   async onBoardAbort(event: HostRunBoardEvent): Promise<void> {
-    await this.releaseLiveBoardRecords(event, 'Audio generation request was interrupted; re-run audio_generate with the same requestId to resume.');
+    await this.releaseLiveBoardRecords(event, 'Audio generation request was interrupted; re-run the same producer tool with the same requestId to resume.');
   }
 
   async onRunError(event: HostRunBoardEvent): Promise<void> {
-    await this.releaseLiveBoardRecords(event, event.message || 'Audio generation request was interrupted; re-run audio_generate with the same requestId to resume.');
+    await this.releaseLiveBoardRecords(event, event.message || 'Audio generation request was interrupted; re-run the same producer tool with the same requestId to resume.');
   }
 
-  private configuredService(ctx: AgentToolContext): { target?: AudioServiceTarget; error?: string } {
-    const serviceId = artifactGenerationDefaultFor(this.host.artifactDefaults(ctx.canvasId), AUDIO_DATA_TYPE);
+  private async configuredService(ctx: AgentToolContext, kind: AudioGenerationKind): Promise<{ target?: AudioServiceTarget; error?: string }> {
+    const producerKind = producerKindFor(kind);
+    const serviceId = artifactGenerationDefaultFor(this.host.artifactDefaults(ctx.canvasId), producerKind);
     if (!serviceId) {
       return {
-        error: 'No default audio generation service is configured. Choose one in Braid Settings > Artifact Defaults.',
+        error: `No default ${kindLabel(kind)} generation service is configured. Choose one in Braid Settings > Artifact Defaults.`,
       };
     }
     const engine = parseEngineAudioServiceId(serviceId);
     if (!engine || !this.host.generateAudioWithEngine) {
       return {
-        error: `The configured audio generation service '${serviceId}' is unavailable in this host.`,
+        error: `The configured ${kindLabel(kind)} generation service '${serviceId}' is unavailable in this host.`,
       };
     }
-    return { target: { providerId: serviceId, engine, requiresCostConfirmation: true } };
+    const serviceKind = parseEngineAudioServiceKind(serviceId);
+    if (serviceKind && serviceKind !== kind) {
+      return { error: `The configured service '${serviceId}' is a ${kindLabel(serviceKind)} producer, not ${kindLabel(kind)}.` };
+    }
+    const services = await this.host.artifactGenerationServices?.(ctx.canvasId);
+    const service = services?.find((candidate) => candidate.serviceId === serviceId);
+    if (!service || !artifactGenerationServiceSupports(service, producerKind)) {
+      return { error: `The configured service '${serviceId}' is not advertised for ${kindLabel(kind)} generation.` };
+    }
+    return { target: { providerId: serviceId, engine, kind, producerKind, requiresCostConfirmation: service.requiresCostConfirmation !== false } };
   }
 
   private requestKey(ctx: AgentToolContext, providerId: string, req: AudioGenerateToolRequest): string {
     if (req.requestId) return req.requestId;
     return `${ctx.canvasId}:${ctx.boardId}:${ctx.turnIndex}:${shortHash(stableJson({
       providerId,
-      input: req.input ?? '',
+      kind: req.kind,
+      content: req.kind === 'speech' ? req.input ?? '' : req.prompt ?? '',
       options: req.options ?? {},
     }))}`;
   }
@@ -121,31 +168,47 @@ class AudioArtifactsHostService implements HostService {
   }
 
   private async validateEngineCapability(ctx: AgentToolContext, target: AudioServiceTarget, request: AudioGenerationRequest): Promise<string | undefined> {
-    if (target.engine !== 'openrouter') return undefined;
-    const model = stringField(request.options?.model);
-    if (!model) return 'OpenRouter audio generation requires a speech-capable model in request options.';
     const services = await this.host.artifactGenerationServices?.(ctx.canvasId);
     const service = services?.find((candidate) => candidate.serviceId === target.providerId);
+    if (!service || !artifactGenerationServiceSupports(service, target.producerKind)) {
+      return `The configured service '${target.providerId}' is not advertised for ${kindLabel(request.kind)} generation.`;
+    }
+    if (target.engine !== 'openrouter') return undefined;
+    if (request.kind === 'sound-effect') {
+      return 'OpenRouter does not advertise a Sound Effect generation endpoint. Configure a compatible provider in Braid Settings > Artifact Defaults.';
+    }
+    const model = stringField(request.options?.model);
+    if (!model) {
+      return request.kind === 'speech'
+        ? 'OpenRouter speech generation requires a speech-capable model in request options.'
+        : 'OpenRouter Music generation requires a music-capable model in request options.';
+    }
+    const expectedProducerKind = producerKindFor(request.kind);
+    const expectedEndpoint = request.kind === 'speech' ? '/audio/speech' : '/chat/completions';
     const scopes = service?.capabilityScopes ?? [];
     const supported = scopes.some((scope) => scope.provider === 'openrouter'
       && scope.dataType === AUDIO_DATA_TYPE
-      && scope.endpoint === '/audio/speech'
+      && (scope.producerKind ?? 'audio.speech') === expectedProducerKind
+      && scope.endpoint === expectedEndpoint
       && scope.model === model);
     if (!supported) {
-      return `OpenRouter model '${model}' is not advertised as speech-capable for the /audio/speech endpoint. Choose a model from Braid Settings > Artifact Defaults.`;
+      const capabilityLabel = request.kind === 'speech' ? 'speech' : 'Music';
+      return `OpenRouter model '${model}' is not advertised as ${capabilityLabel}-capable for the ${expectedEndpoint} endpoint. Choose a model from Braid Settings > Artifact Defaults.`;
     }
     return undefined;
   }
 
   private async openRouterDefaultModel(ctx: AgentToolContext, target: AudioServiceTarget): Promise<string | undefined> {
-    if (target.engine !== 'openrouter') return undefined;
+    if (target.engine !== 'openrouter' || target.kind === 'sound-effect') return undefined;
     const scopedModel = parseEngineAudioServiceModel(target.providerId);
     if (scopedModel) return scopedModel;
     const services = await this.host.artifactGenerationServices?.(ctx.canvasId);
     const service = services?.find((candidate) => candidate.serviceId === target.providerId);
+    const expectedEndpoint = target.kind === 'speech' ? '/audio/speech' : '/chat/completions';
     return service?.capabilityScopes?.find((scope) => scope.provider === 'openrouter'
       && scope.dataType === AUDIO_DATA_TYPE
-      && scope.endpoint === '/audio/speech'
+      && (scope.producerKind ?? 'audio.speech') === target.producerKind
+      && scope.endpoint === expectedEndpoint
       && stringField(scope.model))?.model;
   }
 
@@ -181,27 +244,54 @@ class AudioArtifactsHostService implements HostService {
   }
 
   private async handleGenerate(ctx: AgentToolContext, req: AudioGenerateToolRequest): Promise<AgentToolResult> {
-    if (!req.input?.trim()) return this.result(false, { error: 'Input text is required for audio generation.' });
+    if (req.optionsJson && !req.options) {
+      return this.result(false, { error: 'optionsJson must be a valid JSON object.' });
+    }
+    const content = req.kind === 'speech' ? req.input?.trim() : req.prompt?.trim();
+    if (!content) {
+      return this.result(false, {
+        error: req.kind === 'speech'
+          ? 'Input text is required for Speech generation.'
+          : `A prompt is required for ${kindLabel(req.kind)} generation.`,
+      });
+    }
     const existingById = req.requestId ? await this.readRecord(req.requestId) : undefined;
-    const configured = existingById ? undefined : this.configuredService(ctx);
+    if (existingById && existingById.request.kind !== req.kind) {
+      return this.result(false, {
+        requestId: req.requestId,
+        error: `Request '${req.requestId}' belongs to ${kindLabel(existingById.request.kind)} generation and cannot be reused for ${kindLabel(req.kind)}.`,
+      });
+    }
+    const configured = existingById ? undefined : await this.configuredService(ctx, req.kind);
     const target = existingById
       ? (() => {
         const engine = parseEngineAudioServiceId(existingById.providerId);
-        return engine && this.host.generateAudioWithEngine ? { providerId: existingById.providerId, engine, requiresCostConfirmation: true } : undefined;
+        const kind = existingById.request.kind;
+        return engine && this.host.generateAudioWithEngine
+          ? { providerId: existingById.providerId, engine, kind, producerKind: producerKindFor(kind), requiresCostConfirmation: true }
+          : undefined;
       })()
       : configured?.target;
     if (!target) {
       const error = existingById
-        ? `The recorded audio generation service '${existingById.providerId}' is unavailable.`
-        : configured?.error ?? 'No audio generation provider is available.';
+        ? `The recorded ${kindLabel(existingById.request.kind)} generation service '${existingById.providerId}' is unavailable.`
+        : configured?.error ?? `No ${kindLabel(req.kind)} generation provider is available.`;
       return this.result(false, { error });
     }
     const requestKey = existingById?.requestKey ?? this.requestKey(ctx, target.providerId, req);
     const alreadyRunning = this.inFlight.get(requestKey);
-    if (alreadyRunning) return alreadyRunning;
+    if (alreadyRunning) {
+      if (alreadyRunning.kind !== req.kind) {
+        return this.result(false, {
+          requestId: requestKey,
+          error: `Request '${requestKey}' is already running as ${kindLabel(alreadyRunning.kind)} generation and cannot run as ${kindLabel(req.kind)}.`,
+        });
+      }
+      return alreadyRunning.promise;
+    }
     const running = this.dispatchGenerate(ctx, req, target, requestKey, existingById)
       .finally(() => this.inFlight.delete(requestKey));
-    this.inFlight.set(requestKey, running);
+    this.inFlight.set(requestKey, { kind: req.kind, promise: running });
     return running;
   }
 
@@ -223,11 +313,14 @@ class AudioArtifactsHostService implements HostService {
         error: 'This provider may consume paid credits. Re-run with confirmCost: true to dispatch it.',
       });
     }
-    const request: AudioGenerationRequest = await this.withOpenRouterDefaultModel(ctx, target, {
-      requestId: requestKey,
-      input: req.input!.trim(),
-      options: req.options,
-    });
+    const content = req.kind === 'speech' ? req.input!.trim() : req.prompt!.trim();
+    const base = { requestId: requestKey, options: req.options };
+    const semanticRequest: AudioGenerationRequest = req.kind === 'speech'
+      ? { ...base, kind: 'speech', input: content }
+      : req.kind === 'sound-effect'
+        ? { ...base, kind: 'sound-effect', prompt: content }
+        : { ...base, kind: 'music', prompt: content };
+    const request: AudioGenerationRequest = await this.withOpenRouterDefaultModel(ctx, target, semanticRequest);
     const capabilityError = await this.validateEngineCapability(ctx, target, request);
     if (capabilityError) return this.result(false, { requestId: requestKey, status: 'failed', error: capabilityError });
     let record = existing;
@@ -250,7 +343,7 @@ class AudioArtifactsHostService implements HostService {
         dataType: AUDIO_DATA_TYPE,
         label: audio.label || `${requestKey}.mp3`,
         mime: audio.mime || AUDIO_DEFAULT_MIME,
-        ...(audio.metadata ? { metadata: audio.metadata } : {}),
+        metadata: { ...(audio.metadata ?? {}), generationKind: record.request.kind },
         pluginId: manifest.id,
         bytes: audio.bytes,
         ...(req.attachToTurn !== false ? { attachTo: { turnIndex: ctx.turnIndex } } : {}),

@@ -24,6 +24,9 @@ const DEFAULT_MIME = 'text/markdown';
 const ARTIFACT_PRODUCER_TOOLS = new Map<string, string>([
   ['image_generate', 'image'],
   ['video_generate', 'video'],
+  ['speech_generate', 'audio'],
+  ['sound_effect_generate', 'audio'],
+  ['music_generate', 'audio'],
   ['audio_generate', 'audio'],
   ['model_generate', 'model-3d'],
 ]);

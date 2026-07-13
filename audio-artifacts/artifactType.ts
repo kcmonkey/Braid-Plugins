@@ -16,7 +16,7 @@ export const audioArtifactType: ArtifactTypePlugin = {
   manifest,
   dataType: AUDIO_DATA_TYPE,
   validationInput: 'metadata',
-  description: 'First-class audio artifact. Accepts audio/* payloads produced by TTS or imported as project media.',
+  description: 'First-class audio artifact. Accepts audio/* payloads produced as speech, sound effects, music, or imported project media.',
   schema: {
     type: 'object',
     properties: {

@@ -22,11 +22,12 @@ describe('skills context injection', () => {
       { name: 'test-engineering', description: 'Use when writing tests.', path: '.braid/skills/test-engineering/SKILL.md' },
       { name: 'ui-design', description: 'Use when polishing UI.', path: '.braid/skills/ui-design/SKILL.md' },
     ]) ?? '';
+    expect(SKILLS_PROTOCOL.length).toBeLessThanOrEqual(450);
     expect(text).toContain('choose the smallest matching set');
     expect(text).toContain('do not pre-read all skills');
     expect(text).toContain('including during plan runs');
-    expect(text).toContain('one primary skill');
-    expect(text).toContain('reuse it instead of re-reading');
+    expect(text).toContain('primary `SKILL.md` before acting');
+    expect(text).toContain('Reuse an unchanged body already read');
   });
 
   it('dedupes by name and sorts', () => {

@@ -11,14 +11,10 @@ export const README_PATH = '.braid/skills/_README.md';
 const README_HEADER = '<!-- Managed by the Braid Skills plugin - edits are overwritten on plugin update. -->';
 
 export const SKILLS_PROTOCOL =
-  'This project has reusable agent SKILLS under `.braid/skills/`. Each skill is a folder ' +
-  '`.braid/skills/<name>/SKILL.md`: its frontmatter has a name + description, its body holds the instructions, ' +
-  'and it may ship helper scripts/resources alongside it. Only skill names + descriptions are listed here — ' +
-  'NOT the bodies. When a task matches a skill, choose the smallest matching set from names/descriptions; do not ' +
-  'pre-read all skills, including during plan runs. Read one primary skill\'s SKILL.md on demand BEFORE acting, ' +
-  'then read additional skill bodies only if the task actually touches that surface or the opened skill requires ' +
-  'it. If a skill body was already read in this same provider thread and you have not changed it, reuse it instead ' +
-  'of re-reading. Ignore skills that do not apply.';
+  'Reusable project skills live under `.braid/skills/`; this block lists names, descriptions, and read paths, not bodies. ' +
+  'When a task matches, choose the smallest matching set and read the primary `SKILL.md` before acting. ' +
+  'Load another body only when the task or primary skill requires it; do not pre-read all skills, including during plan runs. ' +
+  'Reuse an unchanged body already read in this provider thread; ignore non-matches.';
 
 function asEntry(value: unknown): SkillEntry | undefined {
   if (!value || typeof value !== 'object') return undefined;

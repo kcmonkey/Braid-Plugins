@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { ArtifactRendererPlugin, BoardPluginApi, PluginManifest } from '../../../src/plugin-api/types';
 import type { ArtifactRef } from '../../../src/protocol';
 import manifestJson from './plugin.json';
@@ -11,6 +12,17 @@ const manifest = manifestJson as PluginManifest;
 
 type PreviewStatus = 'loading' | 'ready' | 'error';
 
+type PbrRendererConfigTarget = Pick<
+  THREE.WebGLRenderer,
+  'outputColorSpace' | 'toneMapping' | 'toneMappingExposure'
+>;
+
+export function configurePbrRenderer(renderer: PbrRendererConfigTarget): void {
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1;
+}
+
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
@@ -19,16 +31,27 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 }
 
 function disposeObject(root: THREE.Object3D): void {
+  const disposedTextures = new Set<THREE.Texture>();
   root.traverse((object) => {
     const mesh = object as THREE.Mesh;
     mesh.geometry?.dispose?.();
     const material = mesh.material;
     if (Array.isArray(material)) {
-      for (const item of material) item.dispose?.();
+      for (const item of material) disposeMaterial(item, disposedTextures);
     } else {
-      material?.dispose?.();
+      if (material) disposeMaterial(material, disposedTextures);
     }
   });
+}
+
+function disposeMaterial(material: THREE.Material, disposedTextures: Set<THREE.Texture>): void {
+  for (const value of Object.values(material)) {
+    const texture = value as THREE.Texture | undefined;
+    if (!texture?.isTexture || disposedTextures.has(texture)) continue;
+    disposedTextures.add(texture);
+    texture.dispose();
+  }
+  material.dispose();
 }
 
 async function readArtifactArrayBuffer(api: BoardPluginApi, artifact: ArtifactRef): Promise<ArrayBuffer> {
@@ -90,6 +113,7 @@ function Model3dArtifactPreview({
     let renderer: THREE.WebGLRenderer | undefined;
     let controls: OrbitControls | undefined;
     let sceneRoot: THREE.Object3D | undefined;
+    let environmentTarget: THREE.WebGLRenderTarget | undefined;
     let resizeObserver: ResizeObserver | undefined;
 
     const cleanup = () => {
@@ -98,6 +122,7 @@ function Model3dArtifactPreview({
       resizeObserver?.disconnect();
       controls?.dispose();
       if (sceneRoot) disposeObject(sceneRoot);
+      environmentTarget?.dispose();
       renderer?.forceContextLoss?.();
       renderer?.dispose();
       mount.replaceChildren();
@@ -115,13 +140,27 @@ function Model3dArtifactPreview({
         scene.background = new THREE.Color(0x171716);
         const camera = new THREE.PerspectiveCamera(38, width / height, 0.01, 1000);
         renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });
+        configurePbrRenderer(renderer);
         renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
         renderer.setSize(width, height);
         renderer.domElement.className = 'model3d-preview__canvas';
         mount.replaceChildren(renderer.domElement);
 
-        const hemi = new THREE.HemisphereLight(0xf8f5e8, 0x242424, 1.6);
-        const key = new THREE.DirectionalLight(0xffffff, 2.2);
+        const environment = new RoomEnvironment();
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        try {
+          environmentTarget = pmremGenerator.fromScene(environment, 0.04, 0.1, 100, {
+            size: compact ? 64 : 128,
+          });
+          scene.environment = environmentTarget.texture;
+          scene.environmentIntensity = 0.9;
+        } finally {
+          environment.dispose();
+          pmremGenerator.dispose();
+        }
+
+        const hemi = new THREE.HemisphereLight(0xf8f5e8, 0x242424, 0.9);
+        const key = new THREE.DirectionalLight(0xffffff, 1.8);
         key.position.set(3, 4, 5);
         scene.add(hemi, key);
         sceneRoot = gltf.scene;
@@ -151,7 +190,7 @@ function Model3dArtifactPreview({
           frame = requestAnimationFrame(animate);
         };
         setStatus('ready');
-        setMessage('3D model preview');
+        setMessage('PBR 3D model preview');
         if (compact) {
           controls.update();
           renderer.render(scene, camera);

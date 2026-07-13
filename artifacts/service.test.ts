@@ -682,6 +682,9 @@ describe('artifacts host service', () => {
       const tools = [
         'agent__braid__image_generate',
         'agent__braid__video_generate',
+        'agent__braid__speech_generate',
+        'agent__braid__sound_effect_generate',
+        'agent__braid__music_generate',
         'agent__braid__audio_generate',
         'agent__braid__model_generate',
         'video_generate',
@@ -697,6 +700,9 @@ describe('artifacts host service', () => {
       expect(harness.obligationEvents).toEqual([
         expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'image_generate', dataType: 'image' }),
         expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'video_generate', dataType: 'video' }),
+        expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'speech_generate', dataType: 'audio' }),
+        expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'sound_effect_generate', dataType: 'audio' }),
+        expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'music_generate', dataType: 'audio' }),
         expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'audio_generate', dataType: 'audio' }),
         expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'model_generate', dataType: 'model-3d' }),
         expect.objectContaining({ type: 'artifact-output-intent-observed', toolName: 'video_generate', dataType: 'video' }),
