@@ -15,7 +15,6 @@ import type {
 import type { AgentToolResult } from '../../../src/engine/types';
 import { artifactGenerationDefaultFor } from '../../../src/artifactGeneration';
 import { artifactOutputObligationId } from '../../../src/obligations';
-import { modelGenerationProviderPlugins } from '../../../src/plugin-runtime/registry';
 import manifestJson from './plugin.json';
 import { MODEL_3D_DATA_TYPE, MODEL_3D_GLB_MIME } from './artifactType';
 import { createModelGenerateAgentTool, type ModelGenerateToolRequest } from './agentTool';
@@ -75,6 +74,11 @@ function providerSupports(plugin: ModelGenerationProviderPlugin, kind: ModelGene
   return kind === 'image-to-3d' ? plugin.capabilities.imageTo3d === true : plugin.capabilities.textTo3d === true;
 }
 
+export type ModelGenerationProviderResolver = (
+  serviceId: string,
+  kind: ModelGenerationRequestKind,
+) => ModelGenerationProviderPlugin | undefined;
+
 function taskIsTerminal(task: ModelGenerationTaskSnapshot): boolean {
   return task.status === 'succeeded' || task.status === 'failed' || task.status === 'canceled';
 }
@@ -87,7 +91,10 @@ class ModelArtifactsHostService implements HostService {
   private readonly inFlight = new Map<string, Promise<AgentToolResult>>();
   private readonly watchers = new Map<string, { abort: AbortController; timer?: ReturnType<typeof setTimeout>; polls: number }>();
 
-  constructor(private readonly host: HostServiceContext) {}
+  constructor(
+    private readonly host: HostServiceContext,
+    private readonly resolveProvider: ModelGenerationProviderResolver,
+  ) {}
 
   agentTools() {
     return [createModelGenerateAgentTool(this.host, { generate: (ctx, req) => this.handleGenerate(ctx, req) })];
@@ -193,8 +200,8 @@ class ModelArtifactsHostService implements HostService {
   private providerById(serviceId: string, kind: ModelGenerationRequestKind): ModelGenerationProviderPlugin | undefined {
     const normalized = serviceId.trim();
     if (!normalized) return undefined;
-    return modelGenerationProviderPlugins()
-      .find((plugin) => (plugin.providerId === normalized || plugin.id === normalized) && providerSupports(plugin, kind));
+    const plugin = this.resolveProvider(normalized, kind);
+    return plugin && providerSupports(plugin, kind) ? plugin : undefined;
   }
 
   private stopWatcher(requestKey: string): void {
@@ -427,9 +434,13 @@ class ModelArtifactsHostService implements HostService {
   }
 }
 
-export const modelArtifactsHostServicePlugin: HostServicePlugin = {
-  id: 'model-artifacts.host-service',
-  label: 'Model Artifacts Host Service',
-  manifest,
-  create: (ctx) => new ModelArtifactsHostService(ctx),
-};
+export function createModelArtifactsHostServicePlugin(
+  resolveProvider: ModelGenerationProviderResolver,
+): HostServicePlugin {
+  return {
+    id: 'model-artifacts.host-service',
+    label: 'Model Artifacts Host Service',
+    manifest,
+    create: (ctx) => new ModelArtifactsHostService(ctx, resolveProvider),
+  };
+}

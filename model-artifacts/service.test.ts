@@ -2,11 +2,22 @@ import { describe, expect, it } from 'vitest';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import { modelArtifactsHostServicePlugin } from './service';
+import { createModelArtifactsHostServicePlugin } from './service';
 import type { AgentToolPlugin, HostServiceContext, ModelGenerationProviderPlugin, ModelGenerationTaskSnapshot } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
 import type { ArtifactGenerationDefaults } from '../../../src/protocol';
-import { registerModelGenerationProvider } from '../../../src/plugin-runtime/registry';
+
+const testProviders: ModelGenerationProviderPlugin[] = [];
+const modelArtifactsHostServicePlugin = createModelArtifactsHostServicePlugin((serviceId) =>
+  testProviders.find((plugin) => plugin.providerId === serviceId || plugin.id === serviceId));
+
+function registerTestProvider(provider: ModelGenerationProviderPlugin): () => void {
+  testProviders.push(provider);
+  return () => {
+    const index = testProviders.indexOf(provider);
+    if (index >= 0) testProviders.splice(index, 1);
+  };
+}
 
 function makeCtx(project: string, artifactDefaults: ArtifactGenerationDefaults = { image: '', 'model-3d': '' }) {
   const produceCalls: Array<{ canvasId: string; boardId: string; input: any }> = [];
@@ -124,7 +135,7 @@ function registerFakeProvider(options: {
       },
     }),
   };
-  const unregister = registerModelGenerationProvider(provider);
+  const unregister = registerTestProvider(provider);
   return {
     provider,
     unregister,

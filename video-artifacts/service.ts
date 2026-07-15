@@ -16,7 +16,6 @@ import type { AgentToolResult } from '../../../src/engine/types';
 import type { EngineId } from '../../../src/protocol';
 import { artifactGenerationDefaultFor, parseEngineVideoServiceId, parseEngineVideoServiceModel } from '../../../src/artifactGeneration';
 import { artifactOutputObligationId } from '../../../src/obligations';
-import { videoGenerationProviderPlugins } from '../../../src/plugin-runtime/registry';
 import manifestJson from './plugin.json';
 import { VIDEO_DATA_TYPE, VIDEO_MP4_MIME } from './artifactType';
 import { createVideoGenerateAgentTool, type VideoGenerateToolRequest } from './agentTool';
@@ -86,6 +85,11 @@ function providerSupports(plugin: VideoGenerationProviderPlugin, kind: VideoGene
   return kind === 'image-to-video' ? plugin.capabilities.imageToVideo === true : plugin.capabilities.textToVideo === true;
 }
 
+export type VideoGenerationProviderResolver = (
+  serviceId: string,
+  kind: VideoGenerationRequestKind,
+) => VideoGenerationProviderPlugin | undefined;
+
 function taskIsTerminal(task: VideoGenerationTaskSnapshot): boolean {
   return task.status === 'succeeded' || task.status === 'failed' || task.status === 'canceled' || task.status === 'expired';
 }
@@ -103,7 +107,10 @@ class VideoArtifactsHostService implements HostService {
   private readonly watchers = new Map<string, { abort: AbortController; timer?: ReturnType<typeof setTimeout>; polls: number }>();
   private readonly terminalSettlements = new Map<string, Promise<TaskSnapshotOutcome>>();
 
-  constructor(private readonly host: HostServiceContext) {}
+  constructor(
+    private readonly host: HostServiceContext,
+    private readonly resolveProvider: VideoGenerationProviderResolver,
+  ) {}
 
   agentTools() {
     return [createVideoGenerateAgentTool(this.host, { generate: (ctx, req) => this.handleGenerate(ctx, req) })];
@@ -210,8 +217,8 @@ class VideoArtifactsHostService implements HostService {
   private providerById(serviceId: string, kind: VideoGenerationRequestKind): VideoGenerationProviderPlugin | undefined {
     const normalized = serviceId.trim();
     if (!normalized) return undefined;
-    return videoGenerationProviderPlugins()
-      .find((plugin) => (plugin.providerId === normalized || plugin.id === normalized) && providerSupports(plugin, kind));
+    const plugin = this.resolveProvider(normalized, kind);
+    return plugin && providerSupports(plugin, kind) ? plugin : undefined;
   }
 
   private targetForRecord(record: DriverRecord): VideoServiceTarget | undefined {
@@ -535,9 +542,13 @@ class VideoArtifactsHostService implements HostService {
   }
 }
 
-export const videoArtifactsHostServicePlugin: HostServicePlugin = {
-  id: 'video-artifacts.host-service',
-  label: 'Video Artifacts Host Service',
-  manifest,
-  create: (ctx) => new VideoArtifactsHostService(ctx),
-};
+export function createVideoArtifactsHostServicePlugin(
+  resolveProvider: VideoGenerationProviderResolver,
+): HostServicePlugin {
+  return {
+    id: 'video-artifacts.host-service',
+    label: 'Video Artifacts Host Service',
+    manifest,
+    create: (ctx) => new VideoArtifactsHostService(ctx, resolveProvider),
+  };
+}

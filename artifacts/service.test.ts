@@ -2,14 +2,22 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { artifactsHostServicePlugin } from './service';
+import { createArtifactsHostServicePlugin, type ArtifactTypeRegistryView } from './service';
 import type { AgentToolPlugin, HostServiceContext, LiveMessageContext } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
-import { registerArtifactType, resolveArtifactTypePlugin } from '../../../src/plugin-runtime/registry';
+import { HostPluginRegistry, META_ARTIFACT_DATA_TYPE } from '../../../src/plugin-runtime/hostRegistry';
 import type { ObligationLedgerEvent } from '../../../src/obligations';
 import { VIDEO_DATA_TYPE, VIDEO_MP4_MIME, videoArtifactType } from '../video-artifacts/artifactType';
 
-function makeHarness(project: string, options: { live?: boolean } = {}) {
+function artifactTypes(registry: HostPluginRegistry): ArtifactTypeRegistryView {
+  return {
+    metaDataType: META_ARTIFACT_DATA_TYPE,
+    descriptors: (options) => registry.artifactTypeDescriptors(options),
+    resolve: (dataType, options) => registry.resolveArtifactTypeDescriptor(dataType, options),
+  };
+}
+
+function makeHarness(project: string, options: { live?: boolean; registry?: HostPluginRegistry } = {}) {
   const produceCalls: Array<{ canvasId: string; boardId: string; input: any }> = [];
   const attachedObligations: any[] = [];
   const delivered: LiveMessageContext[] = [];
@@ -57,7 +65,8 @@ function makeHarness(project: string, options: { live?: boolean } = {}) {
     publishWorkspaceState: () => undefined,
     publishWorkspaceEvent: () => undefined,
   } as HostServiceContext;
-  const service = artifactsHostServicePlugin.create(ctx);
+  const registry = options.registry ?? new HostPluginRegistry();
+  const service = createArtifactsHostServicePlugin(artifactTypes(registry)).create(ctx);
   const tools = service.agentTools?.() ?? [];
   const byName = new Map(tools.map((tool) => [tool.tool.name, tool as AgentToolPlugin<Record<string, unknown>>]));
   const call = (name: string, args: Record<string, unknown>, signal = new AbortController().signal): Promise<AgentToolResult> => {
@@ -82,13 +91,14 @@ function makeHarness(project: string, options: { live?: boolean } = {}) {
   const settle = async (turnIndex = 2) => {
     await service.onTurnSettled?.({ canvasId: 'c1', boardId: 'b1', turnIndex, provider: 'codex', answer: 'done' });
   };
-  return { call, tools, produceCalls, attachedObligations, obligationEvents, service, delivered, get deliveryAttempts() { return deliveryAttempts; }, observeToolUse, settle };
+  return { call, tools, produceCalls, attachedObligations, obligationEvents, service, registry, delivered, get deliveryAttempts() { return deliveryAttempts; }, observeToolUse, settle };
 }
 
 describe('artifacts host service', () => {
   it('exposes artifact declaration guidance on the core artifact tool contract', () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-guidance-'));
-    const unregister = registerArtifactType({
+    const registry = new HostPluginRegistry();
+    const unregister = registry.registrar.registerArtifactType({
       id: 'test.phase9-brief-description',
       dataType: 'phase9-brief-description',
       label: 'Phase 9 Brief',
@@ -100,7 +110,7 @@ describe('artifacts host service', () => {
       },
     });
     try {
-      const harness = makeHarness(project);
+      const harness = makeHarness(project, { registry });
       const description = harness.tools.find((tool) => tool.tool.name === 'artifact_declare')?.tool.description ?? '';
 
       expect(description).toContain('durable');
@@ -132,7 +142,8 @@ describe('artifacts host service', () => {
 
   it('lists defined artifact types without injecting schema payloads', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-type-list-'));
-    const unregister = registerArtifactType({
+    const registry = new HostPluginRegistry();
+    const unregister = registry.registrar.registerArtifactType({
       id: 'test.phase9-brief-list',
       dataType: 'phase9-brief-list',
       label: 'Phase 9 Brief List',
@@ -145,7 +156,7 @@ describe('artifacts host service', () => {
       validate: () => ({ ok: true }),
     });
     try {
-      const harness = makeHarness(project);
+      const harness = makeHarness(project, { registry });
 
       const result = await harness.call('artifact_types', {});
 
@@ -171,9 +182,10 @@ describe('artifacts host service', () => {
 
   it('lists the video artifact type and validates video MIME metadata', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-video-type-'));
-    const unregister = registerArtifactType(videoArtifactType);
+    const registry = new HostPluginRegistry();
+    const unregister = registry.registrar.registerArtifactType(videoArtifactType);
     try {
-      const harness = makeHarness(project);
+      const harness = makeHarness(project, { registry });
 
       const result = await harness.call('artifact_types', {});
 
@@ -187,7 +199,7 @@ describe('artifacts host service', () => {
       });
       expect(video.description).toContain(VIDEO_MP4_MIME);
 
-      const type = resolveArtifactTypePlugin(VIDEO_DATA_TYPE);
+      const type = registry.resolveArtifactType(VIDEO_DATA_TYPE);
       await expect(Promise.resolve(type.validate?.({
         dataType: VIDEO_DATA_TYPE,
         artifactClass: 'born',
@@ -222,7 +234,8 @@ describe('artifacts host service', () => {
       required: ['summary'],
       properties: { summary: { type: 'string' } },
     };
-    const unregister = registerArtifactType({
+    const registry = new HostPluginRegistry();
+    const unregister = registry.registrar.registerArtifactType({
       id: 'test.phase9-brief-detail',
       dataType: 'phase9-brief-detail',
       label: 'Phase 9 Brief Detail',
@@ -231,7 +244,7 @@ describe('artifacts host service', () => {
       validate: () => ({ ok: true }),
     });
     try {
-      const harness = makeHarness(project);
+      const harness = makeHarness(project, { registry });
 
       const exact = JSON.parse((await harness.call('artifact_types', { dataType: 'phase9-brief-detail' })).result);
       expect(exact).toMatchObject({

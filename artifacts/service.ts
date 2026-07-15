@@ -5,16 +5,12 @@ import type {
   HostService,
   HostServicePlugin,
   HostTurnSettledEvent,
+  ArtifactTypeDescriptor,
   PluginManifest,
   ToolMiddlewareContext,
   ToolMiddlewarePlugin,
 } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
-import {
-  artifactTypeDescriptors,
-  META_ARTIFACT_DATA_TYPE,
-  resolveArtifactTypeDescriptor,
-} from '../../../src/plugin-runtime/registry';
 import type { ObligationLedgerEvent, ObligationTarget } from '../../../src/obligations';
 import { createArtifactAgentTools, type ArtifactDeclareToolRequest, type ArtifactExpectToolRequest, type ArtifactTypesToolRequest } from './agentTool';
 import manifestJson from './plugin.json';
@@ -35,6 +31,16 @@ type DeliverableCandidate = {
   path: string;
   toolName: string;
 };
+
+export interface ArtifactTypeRegistryView {
+  readonly metaDataType: string;
+  descriptors(options?: { includeSchema?: boolean }): readonly ArtifactTypeDescriptor[];
+  resolve(dataType?: string, options?: { includeSchema?: boolean }): {
+    descriptor: ArtifactTypeDescriptor;
+    exact: boolean;
+    requestedDataType: string;
+  };
+}
 
 function turnCandidateKey(canvasId: string, boardId: string, turnIndex: number): string {
   return `${canvasId}::${boardId}::${turnIndex}`;
@@ -190,7 +196,10 @@ class ArtifactsHostService implements HostService {
   private readonly candidates = new Map<string, Map<string, DeliverableCandidate>>();
   private readonly coveredPaths = new Map<string, Set<string>>();
 
-  constructor(private readonly host: Parameters<HostServicePlugin['create']>[0]) {}
+  constructor(
+    private readonly host: Parameters<HostServicePlugin['create']>[0],
+    private readonly artifactTypes: ArtifactTypeRegistryView,
+  ) {}
 
   private obligationTarget(ctx: AgentToolContext | ToolMiddlewareContext): ObligationTarget | undefined {
     if (typeof ctx.turnIndex !== 'number') return undefined;
@@ -242,7 +251,7 @@ class ArtifactsHostService implements HostService {
   }
 
   private typeSummary(): string {
-    const types = artifactTypeDescriptors()
+    const types = this.artifactTypes.descriptors()
       .map((type) => `${type.dataType} (${type.label})`)
       .join('; ');
     return `Defined artifact dataTypes: ${types}. Use braid.artifact_types for detailed guidance/schema.`;
@@ -250,7 +259,7 @@ class ArtifactsHostService implements HostService {
 
   private async handleDeclare(ctx: AgentToolContext, req: ArtifactDeclareToolRequest): Promise<AgentToolResult> {
     if (ctx.signal.aborted) return { ok: false, result: 'Artifact declaration canceled.' };
-    const dataType = nonEmpty(req.dataType) ?? META_ARTIFACT_DATA_TYPE;
+    const dataType = nonEmpty(req.dataType) ?? this.artifactTypes.metaDataType;
     const label = nonEmpty(req.label);
     const hasText = typeof req.text === 'string' && req.text.length > 0;
     const sourcePath = nonEmpty(req.path);
@@ -340,11 +349,11 @@ class ArtifactsHostService implements HostService {
     if (ctx.signal.aborted) return { ok: false, result: 'Artifact type discovery canceled.' };
     const requestedDataType = nonEmpty(req.dataType);
     if (requestedDataType) {
-      const resolved = resolveArtifactTypeDescriptor(requestedDataType, { includeSchema: true });
+      const resolved = this.artifactTypes.resolve(requestedDataType, { includeSchema: true });
       return {
         ok: true,
         result: JSON.stringify({
-          defaultDataType: META_ARTIFACT_DATA_TYPE,
+          defaultDataType: this.artifactTypes.metaDataType,
           requestedDataType: resolved.requestedDataType,
           resolved: resolved.exact ? 'exact' : 'meta',
           type: resolved.descriptor,
@@ -354,8 +363,8 @@ class ArtifactsHostService implements HostService {
     return {
       ok: true,
       result: JSON.stringify({
-        defaultDataType: META_ARTIFACT_DATA_TYPE,
-        types: artifactTypeDescriptors({ includeSchema: false }),
+        defaultDataType: this.artifactTypes.metaDataType,
+        types: this.artifactTypes.descriptors({ includeSchema: false }),
       }, null, 2),
     };
   }
@@ -430,11 +439,13 @@ class ArtifactsHostService implements HostService {
   }
 }
 
-export const artifactsHostServicePlugin: HostServicePlugin = {
-  id: 'artifacts.hostService',
-  label: 'Artifacts Host Service',
-  manifest,
-  create(ctx) {
-    return new ArtifactsHostService(ctx);
-  },
-};
+export function createArtifactsHostServicePlugin(artifactTypes: ArtifactTypeRegistryView): HostServicePlugin {
+  return {
+    id: 'artifacts.hostService',
+    label: 'Artifacts Host Service',
+    manifest,
+    create(ctx) {
+      return new ArtifactsHostService(ctx, artifactTypes);
+    },
+  };
+}

@@ -12,7 +12,6 @@ import type {
 import type { AgentToolResult } from '../../../src/engine/types';
 import type { EngineId } from '../../../src/protocol';
 import { artifactGenerationDefaultFor, parseEngineImageServiceId, parseEngineImageServiceModel } from '../../../src/artifactGeneration';
-import { imageGenerationProviderPlugins } from '../../../src/plugin-runtime/registry';
 import manifestJson from './plugin.json';
 import { createImageGenerateAgentTool, type ImageGenerateToolRequest } from './agentTool';
 
@@ -39,6 +38,8 @@ interface ImageServiceTarget {
   engine?: EngineId;
   requiresCostConfirmation: boolean;
 }
+
+export type ImageGenerationProviderResolver = (serviceId: string) => ImageGenerationProviderPlugin | undefined;
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -79,7 +80,10 @@ class ImageArtifactsHostService implements HostService {
   private readonly records = new Map<string, ImageDriverRecord>();
   private readonly inFlight = new Map<string, Promise<AgentToolResult>>();
 
-  constructor(private readonly host: HostServiceContext) {}
+  constructor(
+    private readonly host: HostServiceContext,
+    private readonly resolveProvider: ImageGenerationProviderResolver,
+  ) {}
 
   agentTools() {
     return [createImageGenerateAgentTool(this.host, { generate: (ctx, req) => this.handleGenerate(ctx, req) })];
@@ -104,8 +108,7 @@ class ImageArtifactsHostService implements HostService {
   private providerById(serviceId: string): ImageGenerationProviderPlugin | undefined {
     const normalized = serviceId.trim();
     if (!normalized) return undefined;
-    return imageGenerationProviderPlugins()
-      .find((plugin) => plugin.providerId === normalized || plugin.id === normalized);
+    return this.resolveProvider(normalized);
   }
 
   private configuredService(ctx: AgentToolContext): { target?: ImageServiceTarget; error?: string } {
@@ -315,9 +318,13 @@ class ImageArtifactsHostService implements HostService {
   }
 }
 
-export const imageArtifactsHostServicePlugin: HostServicePlugin = {
-  id: 'image-artifacts.host-service',
-  label: 'Image Artifacts Host Service',
-  manifest,
-  create: (ctx) => new ImageArtifactsHostService(ctx),
-};
+export function createImageArtifactsHostServicePlugin(
+  resolveProvider: ImageGenerationProviderResolver,
+): HostServicePlugin {
+  return {
+    id: 'image-artifacts.host-service',
+    label: 'Image Artifacts Host Service',
+    manifest,
+    create: (ctx) => new ImageArtifactsHostService(ctx, resolveProvider),
+  };
+}

@@ -2,11 +2,22 @@ import { describe, expect, it } from 'vitest';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import { imageArtifactsHostServicePlugin } from './service';
+import { createImageArtifactsHostServicePlugin } from './service';
 import type { AgentToolPlugin, HostServiceContext, ImageGenerationProviderPlugin } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
 import type { ArtifactGenerationDefaults, ArtifactGenerationServiceView } from '../../../src/protocol';
-import { registerImageGenerationProvider } from '../../../src/plugin-runtime/registry';
+
+const testProviders: ImageGenerationProviderPlugin[] = [];
+const imageArtifactsHostServicePlugin = createImageArtifactsHostServicePlugin((serviceId) =>
+  testProviders.find((plugin) => plugin.providerId === serviceId || plugin.id === serviceId));
+
+function registerTestProvider(provider: ImageGenerationProviderPlugin): () => void {
+  testProviders.push(provider);
+  return () => {
+    const index = testProviders.indexOf(provider);
+    if (index >= 0) testProviders.splice(index, 1);
+  };
+}
 
 function makeCtx(project: string, artifactDefaults: ArtifactGenerationDefaults = { image: '', 'model-3d': '' }, options: {
   generateImageWithEngine?: HostServiceContext['generateImageWithEngine'];
@@ -106,7 +117,7 @@ function registerFakeProvider(options: {
       },
     }),
   };
-  const unregister = registerImageGenerationProvider(provider);
+  const unregister = registerTestProvider(provider);
   return {
     provider,
     unregister,
@@ -401,7 +412,7 @@ describe('image artifacts host service', () => {
         },
       }),
     };
-    const unregister = registerImageGenerationProvider(provider);
+    const unregister = registerTestProvider(provider);
     try {
       const harness = makeHarness(project, { image: provider.providerId, 'model-3d': '' });
       const result = await harness.call({ requestId: 'api-key-missing', prompt: 'a poster' });

@@ -2,11 +2,22 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { videoArtifactsHostServicePlugin } from './service';
+import { createVideoArtifactsHostServicePlugin } from './service';
 import type { AgentToolPlugin, HostServiceContext, VideoGenerationProvider, VideoGenerationProviderPlugin, VideoGenerationTaskSnapshot } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
 import type { ArtifactGenerationDefaults, ArtifactGenerationServiceView } from '../../../src/protocol';
-import { registerVideoGenerationProvider } from '../../../src/plugin-runtime/registry';
+
+const testProviders: VideoGenerationProviderPlugin[] = [];
+const videoArtifactsHostServicePlugin = createVideoArtifactsHostServicePlugin((serviceId) =>
+  testProviders.find((plugin) => plugin.providerId === serviceId || plugin.id === serviceId));
+
+function registerTestProvider(provider: VideoGenerationProviderPlugin): () => void {
+  testProviders.push(provider);
+  return () => {
+    const index = testProviders.indexOf(provider);
+    if (index >= 0) testProviders.splice(index, 1);
+  };
+}
 
 function defaults(video = ''): ArtifactGenerationDefaults {
   return { image: '', 'model-3d': '', video };
@@ -142,7 +153,7 @@ function registerFakeProvider(options: {
       },
     }),
   };
-  const unregister = registerVideoGenerationProvider(provider);
+  const unregister = registerTestProvider(provider);
   return {
     provider,
     unregister,
