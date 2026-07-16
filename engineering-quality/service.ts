@@ -373,6 +373,30 @@ class EngineeringQualityHostService implements HostService {
 
   private observeToolResult(ctx: ToolResultMiddlewareContext): void {
     if (ctx.append) return;
+    for (const observation of ctx.nestedToolObservations ?? []) {
+      const nestedId = observation.use.toolUseId;
+      if (!nestedId || nestedId !== observation.result.toolUseId) continue;
+      this.observeToolUse({
+        canvasId: ctx.canvasId,
+        boardId: ctx.boardId,
+        turnIndex: ctx.turnIndex,
+        provider: ctx.provider,
+        source: 'observed',
+        toolUseId: nestedId,
+        toolName: observation.use.toolName,
+        input: observation.use.input,
+      });
+      this.observeToolResult({
+        canvasId: ctx.canvasId,
+        boardId: ctx.boardId,
+        turnIndex: ctx.turnIndex,
+        provider: ctx.provider,
+        toolUseId: nestedId,
+        content: observation.result.content,
+        isError: observation.result.isError,
+        append: observation.result.append,
+      });
+    }
     const state = this.states.get(stateKey(ctx.canvasId, ctx.boardId));
     if (!state) return;
     const pending = state.pendingTools.get(toolKey(ctx.turnIndex, ctx.toolUseId));

@@ -43,6 +43,18 @@ export function normalizeEngineeringExpectArgs(input: Record<string, unknown>): 
   };
 }
 
+const engineeringExpectProperties = {
+  status: { type: 'string', enum: ['ready', 'not-ready', 'not-applicable'], description: 'Current engineering-readiness stance.' },
+  changeKind: { type: 'string', enum: ['bugfix', 'feature', 'refactor', 'config', 'test', 'other'], description: 'Primary kind of source change.' },
+  risk: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Explicit blast-radius judgment. Braid does not infer risk from paths or changed-file count.' },
+  impact: { type: 'string', description: 'Related implementations, callers, contracts, provider/host counterparts, and state transitions inspected.' },
+  regression: { type: 'string', description: 'Concrete regression risks and how tests protect them; for bug fixes, include RED→GREEN evidence or the explicit limitation.' },
+  reviewKind: { type: 'string', enum: ['self', 'independent', 'not-needed'], description: 'Review mode. Source-changing ready cannot use not-needed. Self is valid at every risk; independent requires a delivered Reviewer report.' },
+  review: { type: 'string', description: 'Final-diff review findings and repairs, or the independent review report reference.' },
+  verification: { type: 'string', description: 'Exact successful commands/results plus any remaining manual or provider checks.' },
+  reason: { type: 'string', description: 'Required reason for not-ready or not-applicable.' },
+} as const;
+
 export function createEngineeringAgentTools(handlers: EngineeringToolHandlers): AgentToolPlugin<Record<string, unknown>>[] {
   return [{
     id: 'engineering-quality.expect',
@@ -66,28 +78,33 @@ export function createEngineeringAgentTools(handlers: EngineeringToolHandlers): 
         oneOf: [
           {
             required: ['status', 'changeKind', 'risk', 'impact', 'regression', 'reviewKind', 'review', 'verification'],
-            properties: { status: { type: 'string', enum: ['ready'] } },
+            properties: {
+              status: { ...engineeringExpectProperties.status, enum: ['ready'] },
+              changeKind: engineeringExpectProperties.changeKind,
+              risk: engineeringExpectProperties.risk,
+              impact: engineeringExpectProperties.impact,
+              regression: engineeringExpectProperties.regression,
+              reviewKind: { ...engineeringExpectProperties.reviewKind, enum: ['self', 'independent'] },
+              review: engineeringExpectProperties.review,
+              verification: engineeringExpectProperties.verification,
+            },
           },
           {
             required: ['status', 'reason'],
-            properties: { status: { type: 'string', enum: ['not-ready'] } },
+            properties: {
+              status: { ...engineeringExpectProperties.status, enum: ['not-ready'] },
+              reason: engineeringExpectProperties.reason,
+            },
           },
           {
             required: ['status', 'reason'],
-            properties: { status: { type: 'string', enum: ['not-applicable'] } },
+            properties: {
+              status: { ...engineeringExpectProperties.status, enum: ['not-applicable'] },
+              reason: engineeringExpectProperties.reason,
+            },
           },
         ],
-        properties: {
-          status: { type: 'string', enum: ['ready', 'not-ready', 'not-applicable'], description: 'Current engineering-readiness stance.' },
-          changeKind: { type: 'string', enum: ['bugfix', 'feature', 'refactor', 'config', 'test', 'other'], description: 'Primary kind of source change.' },
-          risk: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Explicit blast-radius judgment. Braid does not infer risk from paths or changed-file count.' },
-          impact: { type: 'string', description: 'Related implementations, callers, contracts, provider/host counterparts, and state transitions inspected.' },
-          regression: { type: 'string', description: 'Concrete regression risks and how tests protect them; for bug fixes, include RED→GREEN evidence or the explicit limitation.' },
-          reviewKind: { type: 'string', enum: ['self', 'independent', 'not-needed'], description: 'Review mode. Source-changing ready cannot use not-needed. Self is valid at every risk; independent requires a delivered Reviewer report.' },
-          review: { type: 'string', description: 'Final-diff review findings and repairs, or the independent review report reference.' },
-          verification: { type: 'string', description: 'Exact successful commands/results plus any remaining manual or provider checks.' },
-          reason: { type: 'string', description: 'Required reason for not-ready or not-applicable.' },
-        },
+        properties: engineeringExpectProperties,
       },
     },
     call(ctx, input) {

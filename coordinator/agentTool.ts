@@ -2,7 +2,7 @@ import type { AgentToolPlugin, AgentToolContext, PluginManifest } from '../../..
 import type { AgentToolResult } from '../../../src/engine/types';
 import manifestJson from './plugin.json';
 
-const ACTIONS = ['status', 'claim', 'release', 'wait', 'request'] as const;
+const ACTIONS = ['status', 'claim', 'release', 'wait', 'wait-file', 'request'] as const;
 const MODES = ['shared', 'exclusive', 'state'] as const;
 const PRIORITIES = ['low', 'normal', 'high'] as const;
 
@@ -13,6 +13,7 @@ export type CoordinatePriority = typeof PRIORITIES[number];
 export interface CoordinateToolRequest {
   action: CoordinateAction;
   resource?: string;
+  path?: string;
   desiredState?: string;
   mode?: CoordinateMode;
   priority?: CoordinatePriority;
@@ -35,6 +36,7 @@ export function normalizeCoordinateArgs(input: Record<string, unknown>): Coordin
   return {
     action: isOneOf(ACTIONS, input.action) ? input.action : 'status',
     resource: typeof input.resource === 'string' ? input.resource : undefined,
+    path: typeof input.path === 'string' ? input.path : undefined,
     desiredState: typeof input.desiredState === 'string' ? input.desiredState : undefined,
     mode: isOneOf(MODES, input.mode) ? input.mode : undefined,
     priority: isOneOf(PRIORITIES, input.priority) ? input.priority : undefined,
@@ -52,14 +54,15 @@ export function createCoordinatorAgentTool(handle: CoordinateToolHandler): Agent
     tool: {
       namespace: 'braid',
       name: 'coordinate',
-      description: 'Coordinate shared workspace resources (e.g. an editor, a build) with OTHER Braid boards in the same project. action="status": list declared resources + who holds/wants what. action="claim": claim a resource BEFORE an editor/build lifecycle action (others are notified; tells you if you must wait). action="wait": claim AND block until the resource frees, then continue - call this ONCE instead of polling status/claim in a loop; it returns the instant the resource is free and spends no tokens while waiting (a resource held only by a finished/idle board is handed to you immediately). action="release": release your claims when done - and if another board is waiting on a resource you hold, SAVE first then release it at your NEXT safe tool step (you need not finish your whole turn). If you will still NEED that resource afterwards (e.g. you will keep editing after the other board\'s build), call action:"wait" on the SAME resource right after releasing: you auto-resume the instant it frees, then reopen/reload (e.g. relaunch the editor) and continue. action="request": ask a specific board (toBoardId) to release/coordinate, passing `text`. Resource ids and board ids come from status / the [Braid coordination] context. IMPORTANT: only an ACTIVE claim grants a resource - a PENDING claim (or an unanswered request) grants NOTHING. Never start a build, close the editor, or say another board "yielded", unless your OWN claim is ACTIVE (a claim/wait result saying you HOLD it / ACTIVE - not PENDING/BLOCKED). When a result says pending or blocked, treat it as pending and STOP; do not narrate progress on a window you were never granted.',
+      description: 'Coordinate shared workspace resources and file write claims with OTHER Braid boards in the same project. action="status": list declared resources + who holds/wants what. action="claim": claim a declared resource BEFORE an editor/build lifecycle action. action="wait": claim AND block until a declared resource frees. action="wait-file": block on an existing file claim using `path`; call it ONCE after a write is denied instead of polling or ending the turn merely because that file is busy. Files remain file claims and do not need entries in .braid/resources.json. action="release": release your claims when done. action="request": ask a specific board (toBoardId) to release/coordinate, passing `text`. IMPORTANT: only an ACTIVE claim grants a resource or file. A PENDING/BLOCKED result grants NOTHING. Stop only the gated conflicting action, then use the matching wait action once; never claim progress until the wait result says you HOLD it / ACTIVE.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
         required: ['action'],
         properties: {
-          action: { type: 'string', enum: ACTIONS, description: 'status | claim | release | wait | request' },
+          action: { type: 'string', enum: ACTIONS, description: 'status | claim | release | wait | wait-file | request' },
           resource: { type: 'string', description: 'Resource id for claim/wait/release (e.g. "ubt-build", "unreal-editor").' },
+          path: { type: 'string', description: 'Workspace-relative file path for action="wait-file".' },
           desiredState: { type: 'string', description: 'For state resources, the state you need (e.g. "open"/"closed").' },
           mode: { type: 'string', enum: MODES, description: "Claim mode (defaults to the resource's declared kind)." },
           priority: { type: 'string', enum: PRIORITIES, description: 'Claim priority.' },

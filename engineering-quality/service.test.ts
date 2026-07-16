@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   AgentToolPlugin,
   HostServiceContext,
+  NestedToolObservation,
   ToolMiddlewarePlugin,
   ToolResultMiddlewareContext,
 } from '../../../src/plugin-api/types';
@@ -40,7 +41,15 @@ function harness() {
       input,
     });
   };
-  const result = async (id: string, content = 'ok', isError = false, turnIndex = 2) => {
+  const result = async (
+    id: string,
+    content = 'ok',
+    isError = false,
+    turnIndex = 2,
+    nestedToolObservations?: readonly NestedToolObservation[],
+  ) => {
+    // functions.exec is the provider-visible top-level tool. Its nested tool observations must arrive
+    // as host-authored result metadata; JavaScript source and model-visible text are not trusted evidence.
     const ctx: ToolResultMiddlewareContext = {
       canvasId: 'c1',
       boardId: 'b1',
@@ -49,6 +58,7 @@ function harness() {
       toolUseId: id,
       content,
       isError,
+      ...(nestedToolObservations ? { nestedToolObservations } : {}),
     };
     await middleware.observeToolResult?.(ctx);
   };
@@ -131,6 +141,94 @@ describe('engineering quality host service', () => {
         ]),
       }),
     ]));
+  });
+
+  it('accepts successful search and verification nested by functions.exec only from trusted result observations', async () => {
+    const h = harness();
+    await h.observe('edit', 'Edit', { file_path: 'src/domain/value.ts' });
+    await h.result('edit', 'updated', false);
+
+    const execSource = [
+      'const [search, verification] = await Promise.all([',
+      '  tools.shell_command({ command: "rg -n sameInvariant src" }),',
+      '  tools.shell_command({ command: "npx vitest run src/domain/value.test.ts" }),',
+      ']);',
+      'text(search);',
+      'text(verification);',
+    ].join('\n');
+    const execOutput = [
+      'Script completed',
+      'Output:',
+      'Exit code: 0',
+      'src/domain/value.ts:4:sameInvariant',
+      'Exit code: 0',
+      '1 test passed',
+    ].join('\n');
+
+    // The model controls both the freeform JavaScript input and any prose it repeats later. Neither can
+    // satisfy an evidence gate without host-observed nested tool results.
+    await h.observe('exec-untrusted', 'functions.exec', execSource);
+    await h.result('exec-untrusted', execOutput, false);
+    const untrusted = await h.call({ ...ready, changeKind: 'bugfix' });
+    expect(untrusted).toMatchObject({ ok: false });
+    expect(String(untrusted.result)).toMatch(/verification/i);
+    expect(String(untrusted.result)).toMatch(/related-surface/i);
+
+    const nestedToolObservations: NestedToolObservation[] = [
+      {
+        use: {
+          toolUseId: 'nested-search',
+          toolName: 'shell_command',
+          input: { command: 'rg -n sameInvariant src' },
+        },
+        result: {
+          toolUseId: 'nested-search',
+          content: 'Exit code: 0\nsrc/domain/value.ts:4:sameInvariant',
+          isError: false,
+        },
+      },
+      {
+        use: {
+          toolUseId: 'nested-verification',
+          toolName: 'shell_command',
+          input: { command: 'npx vitest run src/domain/value.test.ts' },
+        },
+        result: {
+          toolUseId: 'nested-verification',
+          content: 'Exit code: 0\n1 test passed',
+          isError: false,
+        },
+      },
+    ];
+    await h.observe('exec-mismatched', 'functions.exec', execSource);
+    await h.result('exec-mismatched', execOutput, false, 2, [{
+      use: nestedToolObservations[0]!.use,
+      result: { ...nestedToolObservations[0]!.result, toolUseId: 'different-child' },
+    }]);
+    await expect(h.call({ ...ready, changeKind: 'bugfix' })).resolves.toMatchObject({ ok: false });
+
+    await h.observe('exec-trusted', 'functions.exec', execSource);
+    await h.result('exec-trusted', execOutput, false, 2, nestedToolObservations);
+
+    const trusted = await h.call({ ...ready, changeKind: 'bugfix' });
+    expect(trusted, String(trusted.result)).toMatchObject({ ok: true });
+  });
+
+  it('exposes every oneOf branch required field to schema consumers through that branch properties', () => {
+    const schema = harness().tool.tool.inputSchema;
+    expect(schema.oneOf).toHaveLength(3);
+
+    for (const branch of schema.oneOf ?? []) {
+      expect(branch.required?.length).toBeGreaterThan(0);
+      for (const field of branch.required ?? []) {
+        expect(schema.properties, `${field} must have a canonical top-level schema`).toHaveProperty(field);
+        expect(branch.properties, `${field} must be visible in its oneOf branch`).toHaveProperty(field);
+        expect(branch.properties?.[field]).toEqual(expect.any(Object));
+      }
+    }
+
+    const readyBranch = schema.oneOf?.find((branch) => branch.properties?.status?.enum?.includes('ready'));
+    expect(readyBranch?.properties?.reviewKind?.enum).toEqual(['self', 'independent']);
   });
 
   it('requires a successful related-surface search before a bugfix can be ready', async () => {

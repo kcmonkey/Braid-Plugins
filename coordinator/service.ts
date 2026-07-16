@@ -35,6 +35,7 @@ import {
   snapshotForCanvas,
   updateNegotiation,
   type ClaimConflict,
+  type ClaimRequest,
   type CoordinationState,
   type FileClaim,
   type ResourceClaim,
@@ -51,6 +52,7 @@ const COORD_WAIT_CAP_MIN = 15;
 const COORD_WAIT_CAP_MS = COORD_WAIT_CAP_MIN * 60_000;
 const COORD_ESCALATE_MIN = 3;
 const COORD_ESCALATE_MS = COORD_ESCALATE_MIN * 60_000;
+const FILE_WAIT_RECHECK_MS = 1_000;
 const manifest = manifestJson as PluginManifest;
 
 type ResourceClaimAttempt = {
@@ -76,6 +78,17 @@ type ResourceWaiter = {
   resolve(result: AgentToolResult): void;
 };
 
+type FileWaiter = {
+  canvasId: string;
+  boardId: string;
+  req: ClaimRequest;
+  timer: ReturnType<typeof setTimeout>;
+  escalateTimer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  resolve(result: AgentToolResult): void;
+};
+
 class CoordinatorHostService implements HostService {
   id = 'coordinator.hostService';
   label = 'Coordinator Host Service';
@@ -85,11 +98,26 @@ class CoordinatorHostService implements HostService {
   private readonly coordinationNoticeKeys = new Set<string>();
   private readonly coordinationEscalationKeys = new Set<string>();
   private readonly resourceWaiters = new Map<string, ResourceWaiter>();
+  private readonly fileWaiters = new Map<string, FileWaiter>();
+  private fileWaitRecheckTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
   private readonly coordinationConflictKeys = new Set<string>();
   private resourceCatalogFile: string | undefined;
   private resourceCatalogSignature: string | null | undefined;
 
   constructor(private readonly ctx: HostServiceContext) {}
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.fileWaitRecheckTimer) {
+      clearTimeout(this.fileWaitRecheckTimer);
+      this.fileWaitRecheckTimer = undefined;
+    }
+    const result: AgentToolResult = { ok: false, result: 'Wait canceled because the coordinator service was disposed.' };
+    for (const key of [...this.resourceWaiters.keys()]) this.resolveWaiter(key, result);
+    for (const key of [...this.fileWaiters.keys()]) this.resolveFileWaiter(key, result);
+  }
 
   agentTools() {
     return [createCoordinatorAgentTool((ctx, req) => this.handleCoordinateTool(ctx, req))];
@@ -206,7 +234,6 @@ class CoordinatorHostService implements HostService {
   }
 
   private tryResolveWaiters() {
-    if (!this.resourceWaiters.size) return;
     for (const [key, w] of [...this.resourceWaiters]) {
       const r = this.claimResources([w.req]);
       if (!r.conflicts.length) {
@@ -214,6 +241,35 @@ class CoordinatorHostService implements HostService {
         this.resolveWaiter(key, { ok: true, result: `${w.req.resource} is now free - you now HOLD ${w.req.resource} (ACTIVE). This grants ONLY ${w.req.resource}; you do NOT automatically hold any other resource (a separate editor/build window is a DIFFERENT claim). Proceed only with actions gated on ${w.req.resource}.` });
       }
     }
+    this.tryResolveFileWaiters();
+  }
+
+  private tryResolveFileWaiters(): boolean {
+    const liveOwners = this.ctx.liveOwnerKeys();
+    let changed = false;
+    for (const [key, w] of [...this.fileWaiters]) {
+      if (w.signal?.aborted || !isLiveOwner(w.req, liveOwners)) {
+        this.resolveFileWaiter(key, { ok: false, result: 'File wait canceled because the waiting board is no longer live.' });
+        changed = true;
+        continue;
+      }
+      const r = claimFile(this.coordination, w.req, liveOwners);
+      if (!r.conflict) {
+        this.coordination = r.state;
+        this.resolveFileWaiter(key, { ok: true, result: `${w.req.path} is now free - you now HOLD its file claim (ACTIVE). Retry only the write gated on this path; this grants no other file or declared resource.` });
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  private scheduleFileWaitRecheck() {
+    if (this.disposed || this.fileWaitRecheckTimer || !this.fileWaiters.size) return;
+    this.fileWaitRecheckTimer = setTimeout(() => {
+      this.fileWaitRecheckTimer = undefined;
+      if (this.tryResolveFileWaiters()) this.publishCoordination();
+      this.scheduleFileWaitRecheck();
+    }, FILE_WAIT_RECHECK_MS);
   }
 
   private resolveWaiter(key: string, result: AgentToolResult) {
@@ -227,14 +283,45 @@ class CoordinatorHostService implements HostService {
     waiter.resolve(result);
   }
 
+  private resolveFileWaiter(key: string, result: AgentToolResult) {
+    const waiter = this.fileWaiters.get(key);
+    if (!waiter) return;
+    clearTimeout(waiter.timer);
+    clearTimeout(waiter.escalateTimer);
+    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort);
+    this.fileWaiters.delete(key);
+    if (!this.fileWaiters.size && this.fileWaitRecheckTimer) {
+      clearTimeout(this.fileWaitRecheckTimer);
+      this.fileWaitRecheckTimer = undefined;
+    }
+    this.clearEscalationsForBoard(this.aKey(waiter.canvasId, waiter.boardId));
+    waiter.resolve(result);
+  }
+
   private cancelWaitersForCanvas(canvasId: string, msg: string) {
     for (const [key, waiter] of [...this.resourceWaiters]) {
       if (waiter.canvasId === canvasId) this.resolveWaiter(key, { ok: false, result: msg });
+    }
+    for (const [key, waiter] of [...this.fileWaiters]) {
+      if (waiter.canvasId === canvasId) this.resolveFileWaiter(key, { ok: false, result: msg });
+    }
+  }
+
+  private cancelFileWaitersForBoard(canvasId: string, boardId: string, msg: string) {
+    for (const [key, waiter] of [...this.fileWaiters]) {
+      if (waiter.canvasId === canvasId && waiter.boardId === boardId) {
+        this.resolveFileWaiter(key, { ok: false, result: msg });
+      }
     }
   }
 
   private waitBlockerBoardKeys(req: ResourceClaimRequest): string[] {
     const conflict = findResourceClaimConflict(this.coordination, req, this.ctx.liveOwnerKeys());
+    return conflict ? [...new Set(conflict.blocking.map((c) => this.aKey(c.canvasId, c.boardId)))] : [];
+  }
+
+  private fileWaitBlockerBoardKeys(req: ClaimRequest): string[] {
+    const conflict = findClaimConflict(this.coordination, req, this.ctx.liveOwnerKeys());
     return conflict ? [...new Set(conflict.blocking.map((c) => this.aKey(c.canvasId, c.boardId)))] : [];
   }
 
@@ -282,11 +369,28 @@ class CoordinatorHostService implements HostService {
     this.publishCoordination(canvasId);
   }
 
+  private emitFileWaitEscalation(canvasId: string, boardKeys: string[], paths: string[]) {
+    const boards = boardKeys.map((k) => k.slice(k.lastIndexOf('::') + 2));
+    const key = `${canvasId}::file-stall::|${[...boardKeys].sort().join('|')}|::${[...paths].sort().join('|')}`;
+    if (this.coordinationEscalationKeys.has(key)) return;
+    this.coordinationEscalationKeys.add(key);
+    const text = `Coordination STALL: a board has waited >${COORD_ESCALATE_MIN} min for ${paths.join(', ')} held by ${boards.join(', ')} with no handoff. Please intervene: ask or Stop the holder, or let the waiter ride the ${COORD_WAIT_CAP_MIN}-min cap.`;
+    this.coordination = addBoardMessage(this.coordination, {
+      canvasId,
+      fromBoardId: boards[0] ?? 'coordination',
+      kind: 'note',
+      text,
+      relatedPaths: paths,
+    }).state;
+    this.publishCoordination(canvasId);
+  }
+
   private clearEscalationsForBoard(boardKey: string) {
     for (const k of [...this.coordinationEscalationKeys]) if (k.includes(`|${boardKey}|`)) this.coordinationEscalationKeys.delete(k);
   }
 
   private releaseBoard(canvasId: string, boardId: string, summary?: string, transientOnly = false) {
+    this.cancelFileWaitersForBoard(canvasId, boardId, 'File wait canceled because the waiting board finished or stopped.');
     const beforeSnap = snapshotForCanvas(this.coordination, canvasId, Date.now(), this.ctx.liveOwnerKeys());
     const beforeFiles = beforeSnap.claims.filter((c) => c.boardId === boardId && c.status !== 'released');
     const beforeResources = beforeSnap.resourceClaims.filter((c) =>
@@ -617,6 +721,9 @@ class CoordinatorHostService implements HostService {
     if (!rawPaths.length) return { matched: false, paths: [], conflicts: [] };
     const paths = this.coordinationPathList(rawPaths);
     if (!paths.length) return { matched: false, paths: [], conflicts: [] };
+    // A liveness-only holder disappearance has no lifecycle event of its own. Drain the
+    // already-queued file waiters before a newcomer can claim the newly free path.
+    this.tryResolveFileWaiters();
     const actor = this.topLevelActor(boardId, provider);
     const now = Date.now();
     const liveOwners = this.ctx.liveOwnerKeys();
@@ -706,10 +813,13 @@ class CoordinatorHostService implements HostService {
     const blockers = [...new Set(attempt.conflicts.flatMap((conflict) =>
       conflict.blocking.map((claim) => claim.canvasId !== canvasId ? `${claim.boardId} on ${claim.canvasId}` : claim.boardId)))];
     const pathText = paths.join(', ') || 'the requested file';
+    const waitPath = attempt.conflicts[0]?.path ?? paths[0];
     const blockerText = blockers.join(', ') || 'another board';
     return [
       `[Braid coordination] Blocked this write because ${pathText} is currently claimed by ${blockerText}.`,
-      'Ask the blocking board to checkpoint/release, or wait until the file claim is released, then retry the write.',
+      waitPath
+        ? `Call braid.coordinate ONCE with action:"wait-file" and path:"${waitPath}"; it blocks until that file claim is ACTIVE. Stop only this gated write while waiting - do not poll or end the turn merely because the file is busy.`
+        : 'Ask the blocking board to checkpoint/release, then retry the write only after the file claim is ACTIVE.',
     ].join('\n');
   }
 
@@ -770,7 +880,7 @@ class CoordinatorHostService implements HostService {
       let delivered = false;
       if (req.toBoardId) {
         for (const key of sameCanvasLiveBoardKeys(this.ctx, canvasId, req.toBoardId)) {
-          delivered = this.ctx.deliverLiveBoardMessage({
+          delivered = await this.ctx.deliverLiveBoardMessage({
             canvasId,
             targetKey: key,
             fromBoardId: rb,
@@ -784,6 +894,75 @@ class CoordinatorHostService implements HostService {
       return { ok: true, result: req.toBoardId
         ? `Sent your request to board ${req.toBoardId}. ${delivered ? 'It is live and was notified now.' : 'It will see it on its next turn.'}`
         : 'Posted your request; other boards will see it on their next turn.' };
+    }
+    if (req.action === 'wait-file') {
+      const paths = this.coordinationPathList(req.path ? [req.path] : undefined);
+      if (paths.length !== 1) {
+        return { ok: false, result: 'wait-file needs one workspace-relative `path` (for example "src/shared.ts").' };
+      }
+      const path = paths[0];
+      const waiterKey = `file::${canvasId}::${rb}::${path}`;
+      if (this.fileWaiters.has(waiterKey)) {
+        return { ok: false, result: `Your board is already waiting for ${path}; keep the original wait-file call pending instead of starting another.` };
+      }
+      const actor = this.topLevelActor(rb, provider);
+      const claimReq: ClaimRequest = {
+        canvasId,
+        boardId: rb,
+        actor,
+        path,
+        access: 'edit',
+        summary: req.summary ?? 'Agent-requested file wait.',
+      };
+      // Preserve waiter FIFO when holder liveness changed without a lifecycle edge:
+      // queued waiters get first chance before this newcomer attempts the same path.
+      this.tryResolveFileWaiters();
+      const initial = claimFile(this.coordination, claimReq, this.ctx.liveOwnerKeys());
+      if (!initial.conflict) {
+        this.coordination = initial.state;
+        this.publishCoordination(canvasId);
+        return { ok: true, result: `Claimed ${path} - you now HOLD its file claim (ACTIVE). Retry only the write gated on this path; this grants no other file or declared resource.` };
+      }
+      this.recordFileConflicts(canvasId, rb, actor, [initial.conflict]);
+      const blockers = [...new Set(initial.conflict.blocking.map((claim) => claim.boardId))].join(', ');
+      return await new Promise<AgentToolResult>((resolve) => {
+        const timer = setTimeout(() => {
+          const changed = this.tryResolveFileWaiters();
+          if (changed) this.publishCoordination();
+          if (!this.fileWaiters.has(waiterKey)) return;
+          this.resolveFileWaiter(waiterKey, {
+            ok: false,
+            result: `Still blocked after ${COORD_WAIT_CAP_MIN} min - ${path} is held by ${blockers}. You do NOT hold this file claim; call wait-file again or request a handoff.`,
+          });
+        }, COORD_WAIT_CAP_MS);
+        const escalateTimer = setTimeout(() => {
+          const changed = this.tryResolveFileWaiters();
+          if (changed) this.publishCoordination();
+          if (!this.fileWaiters.has(waiterKey)) return;
+          const blockerKeys = this.fileWaitBlockerBoardKeys(claimReq);
+          if (blockerKeys.length) this.emitFileWaitEscalation(canvasId, blockerKeys, [path]);
+        }, COORD_ESCALATE_MS);
+        const onAbort = () => this.resolveFileWaiter(waiterKey, { ok: false, result: 'File wait canceled (the board was stopped).' });
+        if (signal?.aborted) {
+          clearTimeout(timer);
+          clearTimeout(escalateTimer);
+          resolve({ ok: false, result: 'File wait canceled (the board was stopped).' });
+          return;
+        }
+        this.fileWaiters.set(waiterKey, {
+          canvasId,
+          boardId: rb,
+          req: claimReq,
+          timer,
+          escalateTimer,
+          signal,
+          onAbort,
+          resolve,
+        });
+        this.scheduleFileWaitRecheck();
+        signal?.addEventListener('abort', onAbort, { once: true });
+        this.publishCoordination(canvasId);
+      });
     }
     const resource = (req.resource ?? '').trim();
     if (!resource) return { ok: false, result: 'claim/wait needs a `resource` id - call action:"status" first to see the declared resources.' };

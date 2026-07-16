@@ -20,12 +20,13 @@ export function coordinationPath(cwd: string, filePath: string): string {
   const raw = filePath.trim();
   if (!raw) return '';
   const rootCwd = cwd.trim();
-  if (!rootCwd) return normalizeWorkspacePath(raw);
+  if (!rootCwd) return '';
   const ops = pathOpsFor(rootCwd, raw);
   const root = ops.resolve(rootCwd);
   const resolved = ops.resolve(root, raw);
   const rel = ops.relative(root, resolved);
-  const canonical = !rel ? '.' : isInsideRelative(ops, rel) ? rel : resolved;
+  if (rel && !isInsideRelative(ops, rel)) return '';
+  const canonical = rel || '.';
   const normalized = normalizeWorkspacePath(canonical);
   return ops === nodePath.win32 ? normalized.toLowerCase() : normalized;
 }
