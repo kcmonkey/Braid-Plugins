@@ -31,6 +31,7 @@ export interface MemoryRecallToolRequest {
   query?: string;
   scope?: string;
   limit?: string;
+  semantic?: 'configured' | 'off';
 }
 
 export interface MemoryGetToolRequest {
@@ -58,8 +59,11 @@ export const manifest = manifestJson as PluginManifest;
 const stringValue = (value: unknown): string | undefined =>
   typeof value === 'string' ? value : undefined;
 
+const semanticValue = (value: unknown): MemoryRecallToolRequest['semantic'] =>
+  value === 'configured' || value === 'off' ? value : undefined;
+
 export function normalizeMemoryRecordArgs(input: Record<string, unknown>): MemoryRecordToolRequest {
-  return {
+  return Object.fromEntries(Object.entries({
     action: stringValue(input.action),
     verb: stringValue(input.verb),
     id: stringValue(input.id),
@@ -82,7 +86,7 @@ export function normalizeMemoryRecordArgs(input: Record<string, unknown>): Memor
     evidence: stringValue(input.evidence),
     class: stringValue(input.class),
     type: stringValue(input.type),
-  };
+  }).filter(([, value]) => value !== undefined)) as MemoryRecordToolRequest;
 }
 
 export function normalizeMemoryRecallArgs(input: Record<string, unknown>): MemoryRecallToolRequest {
@@ -90,6 +94,7 @@ export function normalizeMemoryRecallArgs(input: Record<string, unknown>): Memor
     query: stringValue(input.query),
     scope: stringValue(input.scope),
     limit: stringValue(input.limit),
+    semantic: semanticValue(input.semantic),
   };
 }
 
@@ -168,6 +173,7 @@ export function createMemoryAgentTools(handlers: MemoryToolHandlers): AgentToolP
             query: { type: 'string', description: 'Focused search query for relevant memories.' },
             scope: { type: 'string', description: 'Optional project area or feature scope filter.' },
             limit: { type: 'string', description: 'Optional result limit, 1 to 10. Defaults to 5.' },
+            semantic: { type: 'string', enum: ['configured', 'off'], description: 'Optional semantic mode. Use configured only to honor local plugin configuration; off always forces lexical recall.' },
           },
         },
       },

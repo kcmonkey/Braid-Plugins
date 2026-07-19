@@ -1,8 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { ArtifactStore } from '../../../src/persistence/artifactStore';
-import type { ApplyInlinePayloadBatchInput, ArtifactPayloadRead } from '../../../src/persistence/artifactStore';
-import type { ArtifactProducerRef } from '../../../src/protocol';
+import type {
+  ApplyInlinePayloadCasInput,
+  ArtifactCasConflict,
+} from '../../../src/persistence/artifactStore';
+import type { ArtifactProducerRef, ArtifactRef } from '../../../src/protocol';
 import {
   emptyMemoryStore,
   memoryEnvelopeIdFor,
@@ -38,6 +42,21 @@ export interface MemoryPaths {
   file: string;
 }
 
+/**
+ * The one canonical view a Memory mutation may be admitted against. Usage is
+ * deliberately overlaid only into `store`: it never changes `latestById` or
+ * `corpusRevision` and therefore cannot invalidate a canonical write.
+ */
+export interface MemoryCanonicalSnapshot {
+  store: MemoryStore;
+  latestById: Map<string, { ref: ArtifactRef; text: string }>;
+  corpusRevision: string;
+}
+
+export type MemoryCanonicalWriteResult =
+  | { status: 'committed'; store: MemoryStore; corpusRevision: string }
+  | { status: 'conflict'; conflicts: ArtifactCasConflict[]; corpusRevision: string };
+
 function isContained(parent: string, child: string): boolean {
   const relative = path.relative(parent, child);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -63,40 +82,65 @@ export function memoryUsagePath(cwd: string): string {
 }
 
 export async function readMemoryStore(cwd: string): Promise<MemoryStore> {
+  return (await readCanonicalMemorySnapshot(cwd)).store;
+}
+
+export async function readCanonicalMemorySnapshot(cwd: string): Promise<MemoryCanonicalSnapshot> {
   try {
-    if (!fs.existsSync(path.resolve(cwd || process.cwd()))) return emptyMemoryStore();
+    if (!fs.existsSync(path.resolve(cwd || process.cwd()))) return emptyCanonicalSnapshot();
     const artifactStore = ArtifactStore.forWorkspace(cwd);
-    const refs = await artifactStore.latestRefsByDataType(MEMORY_DATA_TYPE);
-    if (!refs.length) return emptyMemoryStore();
+    const latestPayloads = await artifactStore.latestInlinePayloadsByDataType(MEMORY_DATA_TYPE);
+    const latestById = new Map(latestPayloads.map((payload) => [payload.ref.id, {
+      ref: payload.ref,
+      text: payload.text,
+    }]));
     const records: MemoryRecord[] = [];
-    for (const ref of refs) {
-      const payload = await artifactStore.readPayload(ref);
-      const record = parseArtifactMemoryPayload(payload);
+    for (const { text } of latestPayloads) {
+      const record = parseArtifactMemoryText(text);
       if (record) records.push(record);
     }
-    return normalizeMemoryStore({ version: 1, records: applyMemoryUsage(records, readMemoryUsageStore(cwd)) });
+    // Legacy records participate in the canonical mutation input only until a
+    // successful guarded publication retires them. Artifact payloads win when
+    // both representations contain the same id.
+    const canonicalRecords = mergeMemoryRecords(readLegacyMarkdownRecords(cwd), records);
+    const store = normalizeMemoryStore({
+      version: 1,
+      records: applyMemoryUsage(canonicalRecords, readMemoryUsageStore(cwd)),
+    });
+    return {
+      store,
+      latestById,
+      corpusRevision: corpusRevisionFor(latestById),
+    };
   } catch (error: any) {
-    if (error?.code === 'ENOENT') return emptyMemoryStore();
+    if (error?.code === 'ENOENT') return emptyCanonicalSnapshot();
     throw error;
   }
 }
 
-export async function writeArtifactMemoryStore(cwd: string, store: MemoryStore, producer: ArtifactProducerRef): Promise<MemoryStore> {
-  const legacyRecords = readLegacyMarkdownRecords(cwd);
+/**
+ * Persist only the changed ids computed from `snapshot`. Callers must acquire
+ * this snapshot before evaluating their domain operation. This intentionally
+ * has no implicit fresh-read compatibility path: doing so would turn a stale
+ * domain decision into a blind write with a fresh expected version.
+ */
+export async function writeArtifactMemoryStore(
+  cwd: string,
+  snapshot: MemoryCanonicalSnapshot,
+  store: MemoryStore,
+  producer: ArtifactProducerRef,
+): Promise<MemoryCanonicalWriteResult> {
   const normalized = normalizeMemoryStore({
     version: 1,
-    records: mergeMemoryRecords(legacyRecords, normalizeMemoryStore(store).records),
+    records: normalizeMemoryStore(store).records,
   });
-  seedMemoryUsageFromRecords(cwd, normalized.records);
   const artifactStore = ArtifactStore.forWorkspace(cwd);
-  const latestPayloads = await artifactStore.latestInlinePayloadsByDataType(MEMORY_DATA_TYPE);
-  const latestById = new Map(latestPayloads.map((payload) => [payload.ref.id, payload]));
   const records: MemoryRecord[] = [];
-  const batchInputs: ApplyInlinePayloadBatchInput[] = [];
+  const batchInputs: ApplyInlinePayloadCasInput[] = [];
   for (const raw of normalized.records) {
     const record = normalizeRecordForArtifact(raw);
     const bytes = serializeArtifactMemoryRecord(record);
-    const latest = latestById.get(record.id);
+    const latest = snapshot.latestById.get(record.id);
     if (latest) {
       const currentRecord = parseArtifactMemoryText(latest.text);
       if (sameDurableMemoryContent(latest.text, bytes)) {
@@ -112,13 +156,48 @@ export async function writeArtifactMemoryStore(cwd: string, store: MemoryStore, 
       label: record.title,
       producer,
       bytes,
+      expectedLatestVersion: latest?.ref.version ?? null,
     });
     records.push(record);
   }
-  if (batchInputs.length) await artifactStore.applyInlinePayloadBatch(batchInputs);
+  const committed = await artifactStore.applyInlinePayloadBatchCas(batchInputs);
+  if (committed.status === 'conflict') {
+    return {
+      status: 'conflict',
+      conflicts: committed.conflicts,
+      corpusRevision: snapshot.corpusRevision,
+    };
+  }
+
+  // No legacy or cache side effects occur before every expected version in the
+  // batch commits. A conflicted successor/prior pair therefore has zero local
+  // retirement and zero corpus-revision bump.
+  seedMemoryUsageFromRecords(cwd, normalized.records);
   const removedLegacy = removeLegacyMarkdownFiles(cwd);
   if (batchInputs.length || removedLegacy) bumpMemoryRevisionToken(cwd);
-  return { version: 1, records };
+  const latestById = new Map(snapshot.latestById);
+  for (const ref of committed.refs) {
+    const text = batchInputs.find((input) => input.id === ref.id)?.bytes;
+    if (typeof text === 'string') latestById.set(ref.id, { ref, text });
+  }
+  return {
+    status: 'committed',
+    store: { version: 1, records },
+    corpusRevision: corpusRevisionFor(latestById),
+  };
+}
+
+function emptyCanonicalSnapshot(): MemoryCanonicalSnapshot {
+  const latestById = new Map<string, { ref: ArtifactRef; text: string }>();
+  return { store: emptyMemoryStore(), latestById, corpusRevision: corpusRevisionFor(latestById) };
+}
+
+function corpusRevisionFor(latestById: ReadonlyMap<string, { ref: ArtifactRef }>): string {
+  const entries = [...latestById.values()]
+    .map(({ ref }) => `${ref.id}@${ref.version}`)
+    .sort()
+    .join('\n');
+  return crypto.createHash('sha256').update(entries).digest('hex');
 }
 
 function mergeMemoryRecords(...groups: readonly MemoryRecord[][]): MemoryRecord[] {
@@ -269,11 +348,6 @@ function lastVerifiedFromFrontmatter(frontmatter: Record<string, unknown>): Memo
   const at = textField(frontmatter.lastVerifiedAt);
   const locator = textField(frontmatter.lastVerifiedLocator);
   return at && locator ? { at, locator } : undefined;
-}
-
-function parseArtifactMemoryPayload(payload: ArtifactPayloadRead): MemoryRecord | undefined {
-  if ('error' in payload || !('text' in payload)) return undefined;
-  return parseArtifactMemoryText(payload.text);
 }
 
 function parseArtifactMemoryText(text: string): MemoryRecord | undefined {

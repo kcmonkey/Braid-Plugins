@@ -45,6 +45,86 @@ export interface MemoryRecallInput {
   query?: string;
   scope?: string;
   limit?: string;
+  /** Explicit off wins over the plugin's configured semantic mode. */
+  semantic?: 'configured' | 'off';
+}
+
+/**
+ * Configuration for the deliberately local-only semantic candidate seam.
+ * It is separate from plugin enablement: disabling semantic recall never
+ * changes the Memory plugin's lexical recall availability.
+ */
+export interface MemorySemanticConfig {
+  mode: 'off' | 'local-experimental';
+  modelFingerprint?: string;
+  cache: 'session' | 'project';
+}
+
+export const DEFAULT_MEMORY_SEMANTIC_CONFIG: Readonly<MemorySemanticConfig> = Object.freeze({
+  mode: 'off',
+  cache: 'session',
+});
+
+/**
+ * Fail closed to the default lexical mode for malformed external config. This
+ * normalizes only the typed C0 seam; it neither creates a cache nor acquires a
+ * model/backend resource.
+ */
+export function normalizeMemorySemanticConfig(value: unknown): MemorySemanticConfig {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return DEFAULT_MEMORY_SEMANTIC_CONFIG;
+  const raw = value as Record<string, unknown>;
+  if ((raw.mode !== 'off' && raw.mode !== 'local-experimental')
+    || (raw.cache !== 'session' && raw.cache !== 'project')
+    || (raw.modelFingerprint !== undefined && typeof raw.modelFingerprint !== 'string')) {
+    return DEFAULT_MEMORY_SEMANTIC_CONFIG;
+  }
+  const modelFingerprint = raw.modelFingerprint?.trim();
+  if (raw.modelFingerprint !== undefined && !modelFingerprint) return DEFAULT_MEMORY_SEMANTIC_CONFIG;
+  return Object.freeze({
+    mode: raw.mode,
+    cache: raw.cache,
+    ...(modelFingerprint ? { modelFingerprint: modelFingerprint.slice(0, 200) } : {}),
+  });
+}
+
+/**
+ * Provenance for a recall score. A candidate can carry more than one score,
+ * but its first source stays the rank band that placed it in the result.
+ */
+export type RecallSource =
+  | { kind: 'lexical'; provenance: 'minisearch' }
+  | { kind: 'semantic'; provenance: 'session-local'; modelFingerprint: string }
+  | { kind: 'recency'; provenance: 'updatedAt' };
+
+export interface RecallScore {
+  source: RecallSource;
+  value: number;
+}
+
+/** Internal recall material; candidates are signals, never recalled truth. */
+export interface MemoryRecallCandidate {
+  record: MemoryRecord;
+  /** The band that determines this candidate's rank position. */
+  source: RecallSource;
+  /** Immutable score/provenance evidence; lexical+semantic keeps lexical first. */
+  scores: readonly RecallScore[];
+}
+
+/** A backend-neutral semantic signal. It deliberately has no blended rank. */
+export interface SemanticRecallMatch {
+  id: string;
+  score: number;
+  modelFingerprint?: string;
+}
+
+/**
+ * Optional semantic input to the pure local ranker. Supplying no `semantic`
+ * value means the exact lexical path; an empty array means a live semantic
+ * backend found no additional candidates and permits recency fill.
+ */
+export interface MemoryRecallCandidateOptions {
+  semantic?: readonly SemanticRecallMatch[];
+  semanticModelFingerprint?: string;
 }
 
 export type MemoryWriteVerb = 'locator' | 'snapshot' | 'lesson' | 'transcript';
@@ -67,6 +147,8 @@ export interface MemoryEnvelopeRecord {
   recallCue: string;
   provenance: string;
   status: MemoryRoutingStatus;
+  /** Carries raw-input omission across the birth-to-update boundary. */
+  statusProvided: boolean;
   freshness: MemoryFreshness;
   evidenceLocators: string[];
   recordedAt: string;
@@ -181,6 +263,12 @@ export function memoryEnvelopeIdFor(verb: MemoryWriteVerb, title: string, proven
   return `mem-${slugify(title)}-${hashText(`${verb}\0${provenance}\0${title}`)}`;
 }
 
+/** Accept either a stored id or its canonical `memory:<id>` reference form. */
+export function normalizeMemoryRefId(value: unknown): string {
+  const id = clampText(value, 160);
+  return id.startsWith('memory:') ? clampText(id.slice('memory:'.length), 160) : id;
+}
+
 const MEMORY_STATUSES: readonly MemoryRoutingStatus[] = ['current', 'stale', 'superseded', 'disputed'];
 const MEMORY_FRESHNESS: readonly MemoryFreshness[] = ['verified', 'unverified'];
 
@@ -188,6 +276,11 @@ export function normalizeMemoryStatus(value: unknown): MemoryRoutingStatus {
   return typeof value === 'string' && (MEMORY_STATUSES as readonly string[]).includes(value)
     ? value as MemoryRoutingStatus
     : 'stale';
+}
+
+/** New births are current by default; updates retain their existing route when omitted. */
+export function resolveBirthStatus(value: unknown, existing?: MemoryRoutingStatus): MemoryRoutingStatus {
+  return value === undefined ? existing ?? 'current' : normalizeMemoryStatus(value);
 }
 
 export function normalizeMemoryFreshness(value: unknown): MemoryFreshness {
@@ -207,10 +300,6 @@ export function memoryClassForVerb(verb: MemoryWriteVerb): MemoryCorpusClass {
 
 function isMemoryVerb(value: unknown): value is MemoryWriteVerb {
   return value === 'locator' || value === 'snapshot' || value === 'lesson' || value === 'transcript';
-}
-
-function own(input: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(input, key);
 }
 
 function error(code: string, message: string): MemoryBirthError {
@@ -261,10 +350,11 @@ export function birthMemoryEnvelope(input: MemoryEnvelopeInput, nowIso = new Dat
   if (!provenance) errors.push(error('provenance.required', 'Memory birth needs provenance.'));
 
   const evidenceLocators = normalizeLocatorList(input.evidenceLocators);
-  const status = normalizeMemoryStatus(input.status);
+  const statusProvided = input.status !== undefined;
+  const status = resolveBirthStatus(input.status);
   const freshness = normalizeMemoryFreshness(input.freshness);
   const lastVerifiedLocator = clampText(input.lastVerifiedLocator, 500);
-  const supersedes = clampText(input.supersedes, 160);
+  const supersedes = normalizeMemoryRefId(input.supersedes);
   let content = '';
   let locator = '';
   let source = '';
@@ -277,7 +367,7 @@ export function birthMemoryEnvelope(input: MemoryEnvelopeInput, nowIso = new Dat
         locator = clampText(input.locator, 500);
         content = locator;
         if (!locator) errors.push(error('locator.locator.required', 'Locator memories need a locator.'));
-        if (own(input, 'conclusion') || own(input, 'claim') || own(input, 'content')) {
+        if ([input.conclusion, input.claim, input.content].some((value) => normalizeContent(value))) {
           errors.push(error('locator.conclusion.forbidden', 'Locator memories carry a pointer only, not a conclusion.'));
         }
         break;
@@ -324,6 +414,7 @@ export function birthMemoryEnvelope(input: MemoryEnvelopeInput, nowIso = new Dat
       recallCue,
       provenance,
       status,
+      statusProvided,
       freshness,
       evidenceLocators,
       recordedAt: nowIso,
@@ -354,7 +445,7 @@ function envelopeToRecord(envelope: MemoryEnvelopeRecord, existing: MemoryRecord
     verb: envelope.verb,
     corpusClass: envelope.corpusClass,
     provisional: envelope.provisional,
-    status: envelope.status,
+    status: resolveBirthStatus(envelope.statusProvided ? envelope.status : undefined, existing?.status),
     freshness: envelope.freshness,
     recallCue: envelope.recallCue,
     provenance: envelope.provenance,
@@ -380,9 +471,30 @@ export function recordMemoryEnvelope(store: MemoryStore, envelope: MemoryEnvelop
   return { store: { version: 1, records }, record, created: existingIndex < 0 };
 }
 
+export type DirectSupersessionResult =
+  | { ok: true; store: MemoryStore }
+  | { ok: false; store: MemoryStore; error: 'supersedes.self' | 'supersedes.not_found' };
+
+/**
+ * Demote the direct predecessor without mutating either input. The caller owns
+ * recording the successor first, then persists this returned store atomically.
+ */
+export function applyDirectSupersession(store: MemoryStore, successor: Pick<MemoryRecord, 'id' | 'supersedes'>): DirectSupersessionResult {
+  const normalized = normalizeMemoryStore(store);
+  const successorId = normalizeMemoryRefId(successor.id);
+  const priorId = normalizeMemoryRefId(successor.supersedes);
+  if (!priorId) return { ok: true, store: normalized };
+  if (priorId === successorId) return { ok: false, store: normalized, error: 'supersedes.self' };
+  const priorIndex = normalized.records.findIndex((record) => record.id === priorId);
+  if (priorIndex < 0) return { ok: false, store: normalized, error: 'supersedes.not_found' };
+  const records = normalized.records.slice();
+  records[priorIndex] = { ...records[priorIndex], status: 'superseded' };
+  return { ok: true, store: { version: 1, records } };
+}
+
 export function transitionMemoryStatus(store: MemoryStore, id: unknown, status: unknown, nowIso = new Date().toISOString()): MemoryStatusTransitionResult {
   const normalized = normalizeMemoryStore(store);
-  const cleanId = clampText(id, 160);
+  const cleanId = normalizeMemoryRefId(id);
   if (!cleanId) return { ok: false, store: normalized, error: 'memory status transition needs a record id.' };
   if (typeof status !== 'string' || !(MEMORY_STATUSES as readonly string[]).includes(status)) {
     return { ok: false, store: normalized, error: `memory status transition needs one of: ${MEMORY_STATUSES.join(', ')}.` };
@@ -425,7 +537,7 @@ export function normalizeMemoryStore(raw: unknown): MemoryStore {
       verb: isMemoryVerb(record.verb) ? record.verb : undefined,
       corpusClass: record.corpusClass === 2 || record.corpusClass === 3 || record.corpusClass === 4 || record.corpusClass === 5 ? record.corpusClass : undefined,
       provisional: typeof record.provisional === 'boolean' ? record.provisional : undefined,
-      status: record.status ? normalizeMemoryStatus(record.status) : undefined,
+      status: normalizeMemoryStatus(record.status),
       freshness: record.freshness ? normalizeMemoryFreshness(record.freshness) : undefined,
       recallCue: clampText(record.recallCue, 600) || undefined,
       provenance: clampText(record.provenance, 500) || undefined,
@@ -441,7 +553,7 @@ export function normalizeMemoryStore(raw: unknown): MemoryStore {
       source: clampText(record.source, 500) || undefined,
       capturedAt: clampText(record.capturedAt, 80) || undefined,
       quoteSource: clampText(record.quoteSource, 500) || undefined,
-      supersedes: clampText(record.supersedes, 160) || undefined,
+      supersedes: normalizeMemoryRefId(record.supersedes) || undefined,
       readCount: typeof record.readCount === 'number' && Number.isFinite(record.readCount) && record.readCount > 0 ? Math.floor(record.readCount) : undefined,
       lastReadAt: clampText(record.lastReadAt, 64) || undefined,
     }))
@@ -680,17 +792,35 @@ function newestCandidates(records: MemoryRecord[], limit: number): MemoryRecord[
     .slice(0, limit);
 }
 
-export function recallMemoriesFromIndex(index: MemoryRecallIndex, input: MemoryRecallInput): MemoryRecord[] {
-  const query = clampText(input.query, 500);
-  const queryTokens = tokenizeMemoryText(query);
-  const scope = clampText(input.scope, MAX_SCOPE);
-  const limit = parseRecallLimit(input.limit);
-  const bucket = scopedBucket(index, scope);
-  // Never dead-end while memories exist (ADR-10): a scope matching nothing falls back to newest candidates
-  // across the whole store; a token-less query falls back to newest within the resolved scope.
-  if (!bucket.records.length) return newestCandidates(index.records, limit);
-  if (!queryTokens.length) return newestCandidates(bucket.records, limit);
+const LEXICAL_SOURCE: RecallSource = Object.freeze({ kind: 'lexical', provenance: 'minisearch' });
+const RECENCY_SOURCE: RecallSource = Object.freeze({ kind: 'recency', provenance: 'updatedAt' });
 
+function semanticSource(modelFingerprint: string): RecallSource {
+  return Object.freeze({ kind: 'semantic', provenance: 'session-local', modelFingerprint });
+}
+
+function candidate(record: MemoryRecord, source: RecallSource, value: number): MemoryRecallCandidate {
+  return Object.freeze({
+    record,
+    source,
+    scores: Object.freeze([Object.freeze({ source, value })]),
+  });
+}
+
+function candidateWithSemanticScore(candidate: MemoryRecallCandidate, score: number, modelFingerprint: string): MemoryRecallCandidate {
+  const source = semanticSource(modelFingerprint);
+  return Object.freeze({
+    ...candidate,
+    scores: Object.freeze([...candidate.scores, Object.freeze({ source, value: score })]),
+  });
+}
+
+function recencyCandidates(records: MemoryRecord[], limit: number): MemoryRecallCandidate[] {
+  const newest = newestCandidates(records, limit);
+  return newest.map((record, index) => candidate(record, RECENCY_SOURCE, newest.length - index));
+}
+
+function lexicalCandidates(bucket: MemorySearchBucket, query: string): MemoryRecallCandidate[] {
   const results = bucket.search.search(query, {
     boost: MEMORY_SEARCH_BOOST,
     combineWith: 'OR',
@@ -700,7 +830,7 @@ export function recallMemoriesFromIndex(index: MemoryRecallIndex, input: MemoryR
     weights: { prefix: 0.8, fuzzy: 0.45 },
   });
 
-  const matches = results
+  return results
     .map((result) => {
       const record = bucket.byId.get(String(result.id));
       return record ? { record, score: result.score } : undefined;
@@ -708,12 +838,115 @@ export function recallMemoriesFromIndex(index: MemoryRecallIndex, input: MemoryR
     .filter((entry): entry is { record: MemoryRecord; score: number } => !!entry)
     .sort((a, b) =>
       b.score - a.score ||
+      recallRoutingDemotion(a.record) - recallRoutingDemotion(b.record) ||
       b.record.updatedAt.localeCompare(a.record.updatedAt) ||
       a.record.title.localeCompare(b.record.title))
-    .slice(0, limit)
-    .map((entry) => entry.record);
+    .map((entry) => candidate(entry.record, LEXICAL_SOURCE, entry.score));
+}
 
-  return matches.length ? matches : newestCandidates(bucket.records, limit);
+function recallRoutingDemotion(record: MemoryRecord): number {
+  return record.status === 'superseded' || record.status === 'disputed' ? 1 : 0;
+}
+
+export interface MemoryRecallCandidateMergeInput {
+  lexical: readonly MemoryRecallCandidate[];
+  semantic: readonly SemanticRecallMatch[];
+  records: readonly MemoryRecord[];
+  recency: readonly MemoryRecord[];
+  limit: number;
+  semanticModelFingerprint?: string;
+}
+
+/**
+ * Pure, deterministic rank bands: lexical order is immutable; semantic-only
+ * follows; recency only fills remaining slots. Scores are provenance, not a
+ * numerical blended relevance claim.
+ */
+export function mergeRecallCandidateBands(input: MemoryRecallCandidateMergeInput): MemoryRecallCandidate[] {
+  const limit = Math.max(0, input.limit);
+  if (!limit) return [];
+
+  const records = new Map(input.records.map((record) => [record.id, record]));
+  const semanticById = new Map<string, SemanticRecallMatch>();
+  for (const match of input.semantic) {
+    if (!match.id || !Number.isFinite(match.score) || !records.has(match.id)) continue;
+    const existing = semanticById.get(match.id);
+    if (!existing || match.score > existing.score || (match.score === existing.score && match.id < existing.id)) {
+      semanticById.set(match.id, match);
+    }
+  }
+
+  const out: MemoryRecallCandidate[] = [];
+  const seen = new Set<string>();
+  for (const lexical of input.lexical) {
+    if (seen.has(lexical.record.id)) continue;
+    seen.add(lexical.record.id);
+    const semantic = semanticById.get(lexical.record.id);
+    out.push(semantic
+      ? candidateWithSemanticScore(lexical, semantic.score, semantic.modelFingerprint ?? input.semanticModelFingerprint ?? 'unknown')
+      : lexical);
+    if (out.length === limit) return out;
+  }
+
+  const semanticOnly = [...semanticById.values()]
+    .filter((match) => !seen.has(match.id))
+    .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  for (const match of semanticOnly) {
+    const record = records.get(match.id);
+    if (!record) continue;
+    seen.add(record.id);
+    out.push(candidate(record, semanticSource(match.modelFingerprint ?? input.semanticModelFingerprint ?? 'unknown'), match.score));
+    if (out.length === limit) return out;
+  }
+
+  for (const record of input.recency) {
+    if (seen.has(record.id)) continue;
+    seen.add(record.id);
+    out.push(candidate(record, RECENCY_SOURCE, input.recency.length - out.length));
+    if (out.length === limit) break;
+  }
+  return out;
+}
+
+export function recallCandidatesFromIndex(
+  index: MemoryRecallIndex,
+  input: MemoryRecallInput,
+  options: MemoryRecallCandidateOptions = {},
+): MemoryRecallCandidate[] {
+  const query = clampText(input.query, 500);
+  const queryTokens = tokenizeMemoryText(query);
+  const scope = clampText(input.scope, MAX_SCOPE);
+  const limit = parseRecallLimit(input.limit);
+  const bucket = scopedBucket(index, scope);
+  const semanticEnabled = options.semantic !== undefined;
+  // Never dead-end while memories exist (ADR-10): a scope matching nothing falls back to newest candidates
+  // across the whole store; a token-less query falls back to newest within the resolved scope.
+  const fallbackRecords = bucket.records.length ? bucket.records : index.records;
+  if (!queryTokens.length || !bucket.records.length) {
+    if (!semanticEnabled) return recencyCandidates(fallbackRecords, limit);
+    return mergeRecallCandidateBands({
+      lexical: [], semantic: options.semantic ?? [], records: fallbackRecords,
+      recency: newestCandidates(fallbackRecords, limit), limit,
+      semanticModelFingerprint: options.semanticModelFingerprint,
+    });
+  }
+
+  const lexical = lexicalCandidates(bucket, query);
+  if (!semanticEnabled) {
+    return lexical.length ? lexical.slice(0, limit) : recencyCandidates(bucket.records, limit);
+  }
+  return mergeRecallCandidateBands({
+    lexical,
+    semantic: options.semantic ?? [],
+    records: bucket.records,
+    recency: newestCandidates(bucket.records, limit),
+    limit,
+    semanticModelFingerprint: options.semanticModelFingerprint,
+  });
+}
+
+export function recallMemoriesFromIndex(index: MemoryRecallIndex, input: MemoryRecallInput): MemoryRecord[] {
+  return recallCandidatesFromIndex(index, input).map((candidate) => candidate.record);
 }
 
 export function recallMemories(store: MemoryStore, input: MemoryRecallInput): MemoryRecord[] {

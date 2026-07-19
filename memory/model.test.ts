@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   birthMemoryEnvelope,
+  applyDirectSupersession,
   emptyMemoryStore,
   normalizeMemoryFreshness,
   normalizeMemoryStatus,
@@ -11,10 +12,27 @@ import {
   recordMemoryReads,
   recordMemory,
   deriveEvidenceCitationCounts,
+  DEFAULT_MEMORY_SEMANTIC_CONFIG,
+  normalizeMemorySemanticConfig,
   tokenizeMemoryText,
 } from './model';
 
 describe('memory model', () => {
+  it('normalizes missing and malformed semantic config to a frozen lexical default', () => {
+    const expected = { mode: 'off', cache: 'session' };
+    const cases: unknown[] = [undefined, null, 'local-experimental', [],
+      { mode: 'enabled', cache: 'durable', modelFingerprint: 42 },
+      { mode: 'local-experimental', cache: 'invalid', modelFingerprint: '   ' }];
+
+    expect(DEFAULT_MEMORY_SEMANTIC_CONFIG).toEqual(expected);
+    expect(Object.isFrozen(DEFAULT_MEMORY_SEMANTIC_CONFIG)).toBe(true);
+    for (const value of cases) {
+      const normalized = normalizeMemorySemanticConfig(value);
+      expect(normalized).toEqual(expected);
+      expect(Object.isFrozen(normalized)).toBe(true);
+    }
+  });
+
   it('records and updates deterministic memories by title and scope', () => {
     let store = emptyMemoryStore();
 
@@ -268,6 +286,23 @@ describe('memory model', () => {
     });
   });
 
+  it('accepts empty locator content fields but rejects a non-empty locator conclusion', () => {
+    const base = {
+      verb: 'locator' as const,
+      title: 'Pointer only',
+      locator: 'docs/example.md',
+      recallCue: 'When checking locator-only births.',
+      provenance: 'model.test',
+    };
+
+    expect(birthMemoryEnvelope({ ...base, content: undefined })).toMatchObject({ ok: true });
+    expect(birthMemoryEnvelope({ ...base, content: '' })).toMatchObject({ ok: true });
+    expect(birthMemoryEnvelope({ ...base, content: 'A conclusion is not a locator.' })).toMatchObject({
+      ok: false,
+      errors: [{ code: 'locator.conclusion.forbidden' }],
+    });
+  });
+
   it('derives class from verb and rejects free class or type fields', () => {
     const valid = birthMemoryEnvelope({
       verb: 'lesson',
@@ -307,7 +342,7 @@ describe('memory model', () => {
     });
   });
 
-  it('normalizes unknown or missing routing and freshness labels down', () => {
+  it('defaults new memory births to current while invalid labels still normalize down', () => {
     expect(normalizeMemoryStatus(undefined)).toBe('stale');
     expect(normalizeMemoryStatus('trusted')).toBe('stale');
     expect(normalizeMemoryFreshness(undefined)).toBe('unverified');
@@ -324,11 +359,58 @@ describe('memory model', () => {
     expect(record).toMatchObject({
       ok: true,
       record: {
-        status: 'stale',
+        status: 'current',
         freshness: 'unverified',
         lastVerified: undefined,
       },
     });
+
+    const invalid = birthMemoryEnvelope({
+      verb: 'locator',
+      title: 'Invalid routing defaults down',
+      locator: 'docs/example.md',
+      recallCue: 'When an invalid birth status is supplied.',
+      provenance: 'test',
+      status: 'not-a-status',
+    }, '2026-07-07T00:00:00.000Z');
+    expect(invalid).toMatchObject({ ok: true, record: { status: 'stale' } });
+  });
+
+  it('preserves omitted routing status on envelope updates', () => {
+    const first = birthMemoryEnvelope({
+      verb: 'locator', title: 'Preserved routing', locator: 'docs/example.md',
+      recallCue: 'When an envelope update omits status.', provenance: 'test', status: 'disputed',
+    }, '2026-07-07T00:00:00.000Z');
+    const update = birthMemoryEnvelope({
+      verb: 'locator', title: 'Preserved routing', locator: 'docs/example.md',
+      recallCue: 'When an envelope update omits status.', provenance: 'test',
+    }, '2026-07-08T00:00:00.000Z');
+    if (!first.ok || !update.ok) throw new Error('unexpected birth failure');
+
+    const stored = recordMemoryEnvelope(emptyMemoryStore(), first.record).store;
+    const result = recordMemoryEnvelope(stored, update.record);
+    expect(result.record.status).toBe('disputed');
+  });
+
+  it('applies direct supersession purely for self, missing, and successful prior records', () => {
+    const prior = birthMemoryEnvelope({
+      verb: 'locator', title: 'Prior record', locator: 'docs/prior.md',
+      recallCue: 'When testing direct supersession.', provenance: 'model.test',
+    }, '2026-07-07T00:00:00.000Z');
+    if (!prior.ok) throw new Error('unexpected birth failure');
+    const store = recordMemoryEnvelope(emptyMemoryStore(), prior.record).store;
+    const successor = { ...prior.record, id: 'mem-successor', title: 'Successor record', supersedes: `memory:${prior.record.id}` };
+
+    expect(applyDirectSupersession(store, { ...successor, supersedes: 'memory:mem-successor' }))
+      .toMatchObject({ ok: false, error: 'supersedes.self' });
+    expect(applyDirectSupersession(store, { ...successor, supersedes: 'memory:missing-prior' }))
+      .toMatchObject({ ok: false, error: 'supersedes.not_found' });
+
+    const applied = applyDirectSupersession(store, successor);
+    expect(applied).toMatchObject({ ok: true });
+    if (!applied.ok) throw new Error('unexpected supersession failure');
+    expect(applied.store.records.find((record) => record.id === prior.record.id)?.status).toBe('superseded');
+    expect(store.records.find((record) => record.id === prior.record.id)?.status).toBe('current');
   });
 
   it('carries stable identity and optional supersedes reference for artifact versions', () => {

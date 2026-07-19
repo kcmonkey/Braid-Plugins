@@ -42,12 +42,15 @@ A host service and agent-tool plugin for artifact-backed taxonomy-native durable
 - **Record**: The agent uses `memory_record` verbs (`locator`, `snapshot`, `lesson`, `transcript`) so each
   record is born with its corpus class, lifecycle state, provenance, recall cue, and evidence locators.
 - **Recall**: The plugin injects a compact memory catalog into turn context and exposes `memory_recall`
-  for explicit lookup. Record bodies are stored as `memory-record` artifacts and read on demand.
+  for explicit lookup. Record bodies are stored as `memory-record` artifacts and read on demand through
+  canonical `memory:<id>` references.
 - **Inspect**: The workspace panel shows record class, status, freshness, evidence, read counts, and
   citation counts. Usage signals are maintenance hints, not authority.
 
-Records carry routing status (`current` / `stale` / `superseded` / `disputed`) separately from freshness
-(`fresh` / `provisional` / `needs-verification`) so route eligibility does not masquerade as truth.
+Records carry routing status (`current` / `stale` / `superseded` / `disputed`) as the single source of truth
+for routing, separately from freshness (`verified` / `unverified`), so route eligibility does not masquerade
+as truth. A `supersedes: memory:<id>` write atomically records the successor and marks its direct predecessor
+`superseded` in the same artifact-store write; self or missing predecessors reject before anything persists.
 
 ### Plan
 

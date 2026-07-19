@@ -7,21 +7,28 @@ import type {
   HostTurnSettledEvent,
   PluginManifest,
   TurnContextPlugin,
+  WebviewMessagePlugin,
 } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
 import {
+  applyDirectSupersession,
   birthMemoryEnvelope,
+  DEFAULT_MEMORY_SEMANTIC_CONFIG,
   formatMemoryCatalog,
   formatMemoryOverview,
-  recallMemoriesFromIndex,
+  normalizeMemorySemanticConfig,
+  normalizeMemoryRefId,
+  recallCandidatesFromIndex,
   recordMemoryEnvelope,
   recordMemory,
   transitionMemoryStatus,
   type MemoryCorpusClass,
+  type MemoryRecallCandidate,
   type MemoryRoutingStatus,
   type MemoryRecallInput,
   type MemoryRecord,
   type MemoryRecordInput,
+  type MemoryStore,
 } from './model';
 import {
   createMemoryAgentTools,
@@ -31,15 +38,45 @@ import {
   type MemoryRecordToolRequest,
 } from './agentTool';
 import manifestJson from './plugin.json';
-import { readMemoryStore, recordMemoryUsage, writeArtifactMemoryStore } from './storage';
+import {
+  readCanonicalMemorySnapshot,
+  readMemoryStore,
+  recordMemoryUsage,
+  writeArtifactMemoryStore,
+} from './storage';
 import type { Obligation } from '../../../src/obligations';
-import { createMemoryInspectionSnapshot, MEMORY_INSPECTION_STATE_KEY } from './inspection';
+import {
+  createMemoryInspectionSnapshot,
+  errorMemoryInspectionSnapshot,
+  MEMORY_INSPECTION_STATE_KEY,
+  parseMemoryInspectionAction,
+  type MemoryInspectionActionResult,
+  type MemoryInspectionSnapshot,
+} from './inspection';
 import { getMemoryIndexSnapshot } from './indexCache';
+import {
+  DeterministicSessionSemanticCandidateSource,
+  querySemanticCandidates,
+  resolveSemanticRecallExecution,
+  type SemanticCandidateSource,
+  type SemanticCandidateSourceDescription,
+} from './semantic';
 
 const manifest = manifestJson as PluginManifest;
 export const MEMORY_COMPLETE_CATALOG_THRESHOLD = 24;
 const MAX_RESULT_CHARS = 4000;
 const MAX_CONTENT_CHARS = 700;
+
+type CanonicalMutation<T> =
+  | { ok: true; store: MemoryStore; value: T }
+  | { ok: false; error: string };
+
+type RecallCandidatesOutcome = {
+  status: 'ready';
+  candidates: MemoryRecallCandidate[];
+  semantic?: { description: SemanticCandidateSourceDescription; candidates: readonly MemoryRecallCandidate[] };
+  notice?: string;
+};
 
 const compactLine = (value: string, max = MAX_CONTENT_CHARS): string =>
   value.replace(/\s+/g, ' ').trim().slice(0, max).trim();
@@ -47,7 +84,8 @@ const compactLine = (value: string, max = MAX_CONTENT_CHARS): string =>
 function formatRecordResult(record: MemoryRecord, created: boolean): string {
   const classText = record.corpusClass ? ` class=${record.corpusClass}` : '';
   const statusText = record.status ? ` status=${record.status}` : '';
-  return `${created ? 'Recorded' : 'Updated'} Braid memory ${record.id}: ${record.title}.${classText}${statusText} Stored in artifact memory store.`;
+  const supersessionText = record.supersedes ? ' Direct supersession was persisted in the same write.' : '';
+  return `${created ? 'Recorded' : 'Updated'} Braid memory ${record.id}: ${record.title}.${classText}${statusText} Stored in artifact memory store.${supersessionText}`;
 }
 
 function formatBirthErrors(errors: { code: string; message: string }[]): string {
@@ -65,17 +103,37 @@ function memoryProtocolText(): string {
   ].join('\n');
 }
 
-function formatRecallResult(records: MemoryRecord[], input: MemoryRecallInput): string {
+function formatRecallResult(
+  records: MemoryRecord[],
+  input: MemoryRecallInput,
+  staleIds: ReadonlySet<string>,
+  semantic?: { description: SemanticCandidateSourceDescription; candidates: readonly MemoryRecallCandidate[] },
+): string {
   const query = (input.query ?? '').trim();
   if (!records.length) return `No matching Braid memories for query "${query}".`;
   const lines = [
     `Braid memory recall: ${records.length} candidate${records.length === 1 ? '' : 's'} for "${query}".`,
-    'These are ranked lexical candidates; if they look off, use memory_catalog to browse a bounded slice or retry with a narrower query.',
+    semantic
+      ? 'These are ranked recall candidates; inspect source labels before relying on semantic expansion.'
+      : 'These are ranked lexical candidates; if they look off, use memory_catalog to browse a bounded slice or retry with a narrower query.',
   ];
-  for (const record of records) {
+  if (semantic) {
+    lines.push(`Semantic expansion is candidate-not-truth; modelFingerprint=${semantic.description.modelFingerprint}.`);
+  }
+  for (const [index, record] of records.entries()) {
     const tags = record.tags.length ? ` tags=${record.tags.join(',')}` : '';
     const scope = record.scope ? ` [${record.scope}]` : '';
-    lines.push(`- ${record.title}${scope}${tags} updated=${record.updatedAt}`);
+    const status = ` status: ${record.status ?? 'stale'}`;
+    const freshness = ` freshness: ${record.freshness ?? 'unverified'}`;
+    const marks = [
+      record.status && record.status !== 'current' ? '†' : '',
+      staleIds.has(record.id) ? '⚠' : '',
+    ].filter(Boolean).join(' ');
+    const candidate = semantic?.candidates[index];
+    const semanticMetadata = candidate
+      ? ` source=${candidate.source.kind}/${candidate.source.provenance} scoreFamily=${[...new Set(candidate.scores.map((score) => score.source.kind))].join('+')}`
+      : '';
+    lines.push(`- ${record.title}${scope}${tags}${status}${freshness} memory:${record.id}${marks ? ` ${marks}` : ''} updated=${record.updatedAt}${semanticMetadata}`);
     lines.push(`  ${compactLine(record.content)}`);
     if (record.evidence) lines.push(`  evidence: ${compactLine(record.evidence, 240)}`);
     if (lines.join('\n').length >= MAX_RESULT_CHARS) break;
@@ -179,7 +237,13 @@ class MemoryHostService implements HostService {
   label = 'Memory Host Service';
   manifest = manifest;
   private writeQueue: Promise<void> = Promise.resolve();
+  private semanticQueue: Promise<void> = Promise.resolve();
   private readonly memoryWritesByTurn = new Set<string>();
+  private semanticSource?: SemanticCandidateSource;
+  private semanticSourceFingerprint?: string;
+  private semanticGeneration = 0;
+  private readonly semanticAbortController = new AbortController();
+  private disposed = false;
 
   constructor(private readonly host: Parameters<HostServicePlugin['create']>[0]) {}
 
@@ -201,6 +265,40 @@ class MemoryHostService implements HostService {
     }];
   }
 
+  webviewMessages(): WebviewMessagePlugin[] {
+    return [{
+      id: 'memory.inspectionActions',
+      label: 'Memory inspection actions',
+      manifest,
+      handleMessage: async ({ canvasId, message }) => {
+        if (message.type !== 'workspacePluginAction' || message.pluginId !== manifest.id) return null;
+        const request = parseMemoryInspectionAction(message.action, message.payload);
+        if (!request.ok) {
+          this.publishInspectionActionResult(canvasId, message.requestId, { ok: false, error: request.error });
+          return { handled: true };
+        }
+        try {
+          if (request.action === 'refreshInspection') {
+            const snapshot = await this.publishMemoryState(canvasId);
+            this.publishInspectionActionResult(canvasId, message.requestId, snapshot.kind === 'error'
+              ? { ok: false, error: snapshot.error }
+              : { ok: true, action: 'refreshInspection' });
+            return { handled: true };
+          }
+          await this.writeQueue;
+          const snapshot = createMemoryInspectionSnapshot(await readMemoryStore(this.host.cwd()));
+          const record = snapshot.records.find((candidate) => candidate.id === request.id);
+          this.publishInspectionActionResult(canvasId, message.requestId, record
+            ? { ok: true, action: 'inspectDetail', record }
+            : { ok: false, error: 'Memory record is no longer available.' });
+        } catch {
+          this.publishInspectionActionResult(canvasId, message.requestId, { ok: false, error: 'Memory inspection request failed.' });
+        }
+        return { handled: true };
+      },
+    }];
+  }
+
   async onCanvasReady(canvasId: string): Promise<void> {
     await this.publishMemoryState(canvasId);
   }
@@ -211,6 +309,24 @@ class MemoryHostService implements HostService {
       this.host.attachObligation?.(createMemoryRecordingGapObligation(event));
     }
     this.memoryWritesByTurn.delete(key);
+  }
+
+  async dispose(): Promise<void> {
+    if (!this.disposed) {
+      this.disposed = true;
+      this.semanticGeneration += 1;
+      this.semanticAbortController.abort(this.semanticDisposedError());
+    }
+    const source = this.semanticSource;
+    this.semanticSource = undefined;
+    this.semanticSourceFingerprint = undefined;
+    if (source) {
+      await this.enqueueSemantic(() => Promise.resolve(source.dispose()));
+      return;
+    }
+    // A replacement clears the active source before its deferred disposal runs.
+    // Settling this tail keeps service disposal behind that cleanup window.
+    await this.semanticQueue;
   }
 
   private memoryTurnContext(): string | null | Promise<string | null> {
@@ -237,15 +353,18 @@ class MemoryHostService implements HostService {
     if (ctx.signal.aborted) return { ok: false, result: 'Memory record canceled.' };
     const run = this.writeQueue.then(async () => {
       try {
-          const store = await readMemoryStore(this.host.cwd());
           if (req.action === 'status') {
+          const mutation = await this.commitCanonicalMutation(ctx, (store) => {
             const transition = transitionMemoryStatus(store, req.id, req.status);
-            if (!transition.ok) return { ok: false, result: transition.error ?? 'memory status transition failed.' };
-          await writeArtifactMemoryStore(this.host.cwd(), transition.store, memoryProducer(ctx));
+            return transition.ok
+              ? { ok: true, store: transition.store, value: transition }
+              : { ok: false, error: transition.error ?? 'memory status transition failed.' };
+          });
+          if (!mutation.ok) return { ok: false, result: mutation.error };
           await this.publishMemoryState(ctx.canvasId);
           return {
             ok: true,
-            result: `Updated Braid memory ${transition.record!.id} status=${transition.record!.status}.`,
+            result: `Updated Braid memory ${mutation.value.record!.id} status=${mutation.value.record!.status}.`,
           };
         }
         if (!req.verb) {
@@ -254,22 +373,31 @@ class MemoryHostService implements HostService {
               { code: 'verb.required', message: 'New taxonomy-native memories need a class-bound verb.' },
             ]) };
           }
-          const result = recordMemory(store, req as MemoryRecordInput);
-          await writeArtifactMemoryStore(this.host.cwd(), result.store, memoryProducer(ctx));
+          const mutation = await this.commitCanonicalMutation(ctx, (store) => {
+            const result = recordMemory(store, req as MemoryRecordInput);
+            return { ok: true, store: result.store, value: result };
+          });
+          if (!mutation.ok) return { ok: false, result: mutation.error };
           this.markMemoryWrite(ctx);
           await this.publishMemoryState(ctx.canvasId);
-          return { ok: true, result: formatRecordResult(result.record, result.created) };
+          return { ok: true, result: formatRecordResult(mutation.value.record, mutation.value.created) };
         }
         const born = birthMemoryEnvelope({
           ...req,
           evidenceLocators: req.evidenceLocators ?? req.evidence,
         });
         if (!born.ok) return { ok: false, result: formatBirthErrors(born.errors) };
-        const result = recordMemoryEnvelope(store, born.record, req as MemoryRecordInput);
-        await writeArtifactMemoryStore(this.host.cwd(), result.store, memoryProducer(ctx));
+        const mutation = await this.commitCanonicalMutation(ctx, (store) => {
+          const result = recordMemoryEnvelope(store, born.record, req as MemoryRecordInput);
+          const supersession = applyDirectSupersession(result.store, result.record);
+          return supersession.ok
+            ? { ok: true, store: supersession.store, value: result }
+            : { ok: false, error: supersession.error };
+        });
+        if (!mutation.ok) return { ok: false, result: mutation.error };
         this.markMemoryWrite(ctx);
         await this.publishMemoryState(ctx.canvasId);
-        return { ok: true, result: formatRecordResult(result.record, result.created) };
+        return { ok: true, result: formatRecordResult(mutation.value.record, mutation.value.created) };
       } catch (error: any) {
         return { ok: false, result: error?.message ?? 'memory_record failed.' };
       }
@@ -279,21 +407,193 @@ class MemoryHostService implements HostService {
   }
 
   private async handleRecall(ctx: AgentToolContext, req: MemoryRecallToolRequest): Promise<AgentToolResult> {
-    if (ctx.signal.aborted) return { ok: false, result: 'Memory recall canceled.' };
+    this.throwIfCallerAborted(ctx.signal);
     if (!req.query?.trim()) return { ok: false, result: 'memory_recall needs a non-empty query.' };
     await this.writeQueue;
+    this.throwIfCallerAborted(ctx.signal);
     const snapshot = await getMemoryIndexSnapshot(this.host.cwd(), () => readMemoryStore(this.host.cwd()));
-    const records = recallMemoriesFromIndex(snapshot.index, req as MemoryRecallInput);
+    this.throwIfCallerAborted(ctx.signal);
+    const recall = await this.recallCandidates(snapshot.index, req as MemoryRecallInput, ctx.signal);
+    this.throwIfCallerAborted(ctx.signal);
+    const records = recall.candidates.map((candidate) => candidate.record);
     // Recall stays read-only and OFF the O(N) full-store-reload + inspection-rebuild path: read usage is
     // persisted to the lightweight usage store, and inspection refreshes on the next write / status change /
     // canvas-ready. (memory-supply Finding 1)
-    if (records.length) recordMemoryUsage(this.host.cwd(), records);
-    return { ok: true, result: formatRecallResult(records, req) };
+    if (records.length) {
+      this.throwIfCallerAborted(ctx.signal);
+      recordMemoryUsage(this.host.cwd(), records);
+      this.throwIfCallerAborted(ctx.signal);
+    }
+    this.throwIfCallerAborted(ctx.signal);
+    const result = formatRecallResult(records, req, this.staleMemoryIds(records), recall.semantic);
+    this.throwIfCallerAborted(ctx.signal);
+    return { ok: true, result: recall.notice ? `${result}\n${recall.notice}` : result };
+  }
+
+  private async recallCandidates(
+    index: Parameters<typeof recallCandidatesFromIndex>[0],
+    input: MemoryRecallInput,
+    signal: AbortSignal,
+  ): Promise<RecallCandidatesOutcome> {
+    this.throwIfCallerAborted(signal);
+    const generation = this.semanticGeneration;
+    return this.enqueueSemantic(async () => {
+      this.throwIfSemanticActive(generation, signal);
+      const lexical = () => {
+        this.throwIfSemanticActive(generation, signal);
+        const candidates = recallCandidatesFromIndex(index, input);
+        this.throwIfSemanticActive(generation, signal);
+        return candidates;
+      };
+      const execution = resolveSemanticRecallExecution(input, this.readMemorySemanticConfig());
+      if (execution.status === 'unavailable') {
+        return {
+          status: 'ready',
+          candidates: lexical(),
+          notice: `Semantic recall unavailable: ${execution.reason}. Lexical candidates were retained.`,
+        };
+      }
+      if (execution.status !== 'enabled') return { status: 'ready', candidates: lexical() };
+
+      const linkedSignal = this.linkSemanticSignal(signal);
+      try {
+        const source = await this.semanticSourceFor(execution.config.modelFingerprint, generation, signal);
+        this.throwIfSemanticActive(generation, signal);
+        const outcome = await querySemanticCandidates(source, {
+          query: input.query ?? '',
+          records: index.records,
+          signal: linkedSignal.signal,
+        });
+        this.throwIfSemanticActive(generation, signal);
+        if (outcome.status !== 'ready') {
+          return { status: 'ready', candidates: lexical() };
+        }
+        const candidates = recallCandidatesFromIndex(index, input, {
+          semantic: outcome.matches,
+          semanticModelFingerprint: outcome.description.modelFingerprint,
+        });
+        this.throwIfSemanticActive(generation, signal);
+        return { status: 'ready', candidates, semantic: { description: outcome.description, candidates } };
+      } catch (error) {
+        this.throwIfSemanticActive(generation, signal);
+        return { status: 'ready', candidates: lexical() };
+      } finally {
+        linkedSignal.release();
+      }
+    });
+  }
+
+  private readMemorySemanticConfig() {
+    try {
+      return normalizeMemorySemanticConfig(this.host.readPluginConfig?.(manifest.id, DEFAULT_MEMORY_SEMANTIC_CONFIG).config);
+    } catch {
+      return DEFAULT_MEMORY_SEMANTIC_CONFIG;
+    }
+  }
+
+  private async semanticSourceFor(
+    modelFingerprint: string | undefined,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<SemanticCandidateSource> {
+    this.throwIfSemanticActive(generation, signal);
+    const fingerprint = modelFingerprint ?? 'deterministic-session-v1';
+    if (this.semanticSource && this.semanticSourceFingerprint === fingerprint) return this.semanticSource;
+    const previous = this.semanticSource;
+    this.semanticSource = undefined;
+    this.semanticSourceFingerprint = undefined;
+    if (previous) {
+      await previous.dispose();
+      this.throwIfSemanticActive(generation, signal);
+    }
+    const source = new DeterministicSessionSemanticCandidateSource({ modelFingerprint: fingerprint });
+    try {
+      this.throwIfSemanticActive(generation, signal);
+    } catch (error) {
+      await source.dispose();
+      throw error;
+    }
+    this.semanticSource = source;
+    this.semanticSourceFingerprint = fingerprint;
+    return source;
+  }
+
+  private enqueueSemantic<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.semanticQueue.then(operation);
+    this.semanticQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * Re-evaluate a domain operation against one fresh canonical snapshot after
+   * a CAS conflict. The second conflict is returned as a domain conflict, not
+   * a lease/recovery/publish failure, and never falls back to a stale replay.
+   */
+  private async commitCanonicalMutation<T>(
+    ctx: AgentToolContext,
+    evaluate: (store: MemoryStore) => CanonicalMutation<T>,
+  ): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (ctx.signal.aborted) return { ok: false, error: 'Memory record canceled.' };
+      const snapshot = await readCanonicalMemorySnapshot(this.host.cwd());
+      const mutation = evaluate(snapshot.store);
+      if (!mutation.ok) return mutation;
+      const committed = await writeArtifactMemoryStore(this.host.cwd(), snapshot, mutation.store, memoryProducer(ctx));
+      if (committed.status === 'committed') return { ok: true, value: mutation.value };
+      if (attempt === 1) {
+        return {
+          ok: false,
+          error: `Memory record conflicted with a concurrent canonical update (${committed.conflicts.map((conflict) => conflict.id).join(', ')}); retry the operation.`,
+        };
+      }
+    }
+    return { ok: false, error: 'Memory record conflicted with a concurrent canonical update.' };
+  }
+
+  private throwIfCallerAborted(signal: AbortSignal): void {
+    if (!signal.aborted) return;
+    if (signal.reason !== undefined) throw signal.reason;
+    const error = new Error('Memory semantic recall was cancelled.');
+    error.name = 'AbortError';
+    throw error;
+  }
+
+  private semanticDisposedError(): Error {
+    return new Error('Memory semantic service is disposed.');
+  }
+
+  private throwIfSemanticActive(generation: number, callerSignal: AbortSignal): void {
+    this.throwIfCallerAborted(callerSignal);
+    if (!this.disposed && generation === this.semanticGeneration) return;
+    const reason = this.semanticAbortController.signal.reason;
+    if (reason !== undefined) throw reason;
+    throw this.semanticDisposedError();
+  }
+
+  private linkSemanticSignal(callerSignal: AbortSignal): { signal: AbortSignal; release: () => void } {
+    const controller = new AbortController();
+    const abortFrom = (source: AbortSignal) => {
+      if (!controller.signal.aborted) controller.abort(source.reason);
+    };
+    const onCallerAbort = () => abortFrom(callerSignal);
+    const serviceSignal = this.semanticAbortController.signal;
+    const onServiceAbort = () => abortFrom(serviceSignal);
+    if (callerSignal.aborted) onCallerAbort();
+    else callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    if (serviceSignal.aborted) onServiceAbort();
+    else serviceSignal.addEventListener('abort', onServiceAbort, { once: true });
+    return {
+      signal: controller.signal,
+      release: () => {
+        callerSignal.removeEventListener('abort', onCallerAbort);
+        serviceSignal.removeEventListener('abort', onServiceAbort);
+      },
+    };
   }
 
   private async handleGet(ctx: AgentToolContext, req: MemoryGetToolRequest): Promise<AgentToolResult> {
     if (ctx.signal.aborted) return { ok: false, result: 'Memory get canceled.' };
-    const id = req.id?.trim();
+    const id = normalizeMemoryRefId(req.id);
     if (!id) return { ok: false, result: 'memory_get needs a memory id.' };
     await this.writeQueue;
     const snapshot = await getMemoryIndexSnapshot(this.host.cwd(), () => readMemoryStore(this.host.cwd()));
@@ -331,15 +631,37 @@ class MemoryHostService implements HostService {
     return stale;
   }
 
-  private async publishMemoryState(originCanvasId?: string): Promise<void> {
+  private async publishMemoryState(originCanvasId?: string): Promise<MemoryInspectionSnapshot> {
     const canvasIds = [...new Set([...(originCanvasId ? [originCanvasId] : []), ...this.host.openCanvasIds()])];
-    if (!canvasIds.length) return;
-    const snapshot = createMemoryInspectionSnapshot(await readMemoryStore(this.host.cwd()));
+    let snapshot: MemoryInspectionSnapshot;
+    try {
+      snapshot = createMemoryInspectionSnapshot(await readMemoryStore(this.host.cwd()));
+    } catch {
+      snapshot = errorMemoryInspectionSnapshot('Unable to read memory inspection metadata.');
+    }
+    if (!canvasIds.length) return snapshot;
     this.host.publishWorkspaceState({
       pluginId: manifest.id,
       stateKey: MEMORY_INSPECTION_STATE_KEY,
       canvasIds,
       snapshotForCanvas: () => snapshot,
+    });
+    return snapshot;
+  }
+
+  private publishInspectionActionResult(canvasId: string, requestId: string, data: MemoryInspectionActionResult): void {
+    (this.host.publishWorkspaceEvent as (event: {
+      requestId: string;
+      pluginId: string;
+      eventKey: string;
+      canvasId: string;
+      data: MemoryInspectionActionResult;
+    }) => void)({
+      requestId,
+      pluginId: manifest.id,
+      eventKey: 'inspectionAction',
+      canvasId,
+      data,
     });
   }
 }
