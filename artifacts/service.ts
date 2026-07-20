@@ -307,10 +307,14 @@ class ArtifactsHostService implements HostService {
     if (ctx.signal.aborted) return { ok: false, result: 'Artifact expectation canceled.' };
     const dataType = nonEmpty(req.dataType);
     const expectsNothing = req.nothing === true;
-    if (req.invalidNothingFalse) {
+    // F6 (erratum declared-design-doc-mrtaiobk-0nhbxp81@1): a redundant
+    // nothing:false alongside dataType is semantically unambiguous — accept it
+    // instead of scolding. A bare nothing:false lacks the needed dataType, so it
+    // stays an error, but an actionable one (live retry-loop evidence).
+    if (req.invalidNothingFalse && !dataType) {
       return {
         ok: false,
-        result: 'artifact_expect: Never pass nothing:false. Use dataType:"meta" or a more specific dataType for an expected user-facing artifact, or use nothing:true only when no artifact should be produced.',
+        result: 'artifact_expect: nothing:false implies an artifact is expected; pass dataType (for example "report" or "meta") instead, or nothing:true when no artifact should be produced.',
       };
     }
     if (dataType && expectsNothing) return { ok: false, result: 'artifact_expect accepts either dataType or nothing, not both.' };
@@ -341,6 +345,7 @@ class ArtifactsHostService implements HostService {
       result: JSON.stringify({
         dataType: expectedDataType,
         ...(reason ? { reason } : {}),
+        ...(req.invalidNothingFalse ? { normalized: 'ignored-nothing-false' } : {}),
       }, null, 2),
     };
   }

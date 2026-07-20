@@ -110,8 +110,8 @@ export function createArtifactAgentTools(handlers: ArtifactToolHandlers, options
         name: 'artifact_expect',
         description: [
           'Declare the latest expectation for whether the current turn should produce a user-facing artifact; this is not an artifact declaration.',
-          'Call with exactly one valid shape: dataType for an expected user-facing artifact, or nothing:true only after deciding this turn should produce no user-facing artifact.',
-          'Never pass nothing:false; omit nothing unless it is true.',
+          'Pass dataType (for example "report", "mockup", or "meta") to expect a user-facing artifact from this turn, or nothing:true after deciding this turn should produce no user-facing artifact.',
+          'A redundant nothing:false alongside dataType is accepted and ignored; nothing:true together with dataType is contradictory and rejected.',
           'Use dataType when your current agent judgment is that this turn should produce an artifact, then use braid.artifact_declare with attachToTurn:true to actually declare and attach the artifact output.',
           'Use expect nothing (nothing:true) only after deciding this turn should produce no user-facing artifact. Observed output candidates are context for your agent judgment, not automatic proof that an artifact is required.',
           'You may call this multiple times as your judgment changes; Braid audits the latest expectation.',
@@ -119,17 +119,9 @@ export function createArtifactAgentTools(handlers: ArtifactToolHandlers, options
         inputSchema: {
           type: 'object',
           additionalProperties: false,
-          oneOf: [
-            { required: ['dataType'], not: { required: ['nothing'] } },
-            {
-              required: ['nothing'],
-              properties: { nothing: { type: 'boolean', const: true } },
-              not: { required: ['dataType'] },
-            },
-          ],
           properties: {
             dataType: { type: 'string', description: 'Artifact dataType expected from this turn, such as report, mockup, spec, dataset, or meta.' },
-            nothing: { type: 'boolean', description: 'Must be true when used. Never pass false; omit this field when using dataType.' },
+            nothing: { type: 'boolean', description: 'true when this turn should produce no user-facing artifact. false is redundant when dataType is present and is ignored.' },
             reason: { type: 'string', description: 'Optional short reason for the expectation decision.' },
           },
         },

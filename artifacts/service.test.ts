@@ -457,21 +457,22 @@ describe('artifacts host service', () => {
       expect(tool?.tool.description).toContain('expect nothing');
       expect(tool?.tool.description).toContain('latest expectation');
       expect(tool?.tool.description).toContain('agent judgment');
-      expect(tool?.tool.description).toContain('exactly one');
-      expect(tool?.tool.description).toContain('Never pass nothing:false');
+      expect(tool?.tool.description).toContain('accepted and ignored');
+      expect(tool?.tool.description).not.toContain('Never pass nothing:false');
       expect(tool?.tool.description).toContain('attachToTurn:true');
-      expect(tool?.tool.inputSchema).toMatchObject({
-        oneOf: [
-          expect.objectContaining({ required: ['dataType'] }),
-          expect.objectContaining({ required: ['nothing'] }),
-        ],
-      });
-      expect(JSON.stringify(tool?.tool.inputSchema)).toContain('"const":true');
+      // F6: no oneOf/const acrobatics — schema stays shape-only; the handler owns semantics.
+      expect(JSON.stringify(tool?.tool.inputSchema)).not.toContain('"oneOf"');
+      expect(JSON.stringify(tool?.tool.inputSchema)).not.toContain('"const"');
       expect(tool?.tool.description).not.toContain('observed new output files');
       expect(tool?.tool.description).not.toContain('self-check');
 
       await expect(harness.call('artifact_expect', { dataType: 'report' })).resolves.toMatchObject({ ok: true });
       await expect(harness.call('artifact_expect', { nothing: true, reason: 'analysis only' })).resolves.toMatchObject({ ok: true });
+      // F6: a redundant nothing:false alongside dataType is unambiguous — accepted, not scolded.
+      await expect(harness.call('artifact_expect', { dataType: 'report', nothing: false })).resolves.toMatchObject({
+        ok: true,
+        result: expect.stringContaining('ignored-nothing-false'),
+      });
       await expect(harness.call('artifact_expect', { dataType: 'report', nothing: true })).resolves.toMatchObject({
         ok: false,
         result: expect.stringContaining('either dataType or nothing'),
@@ -480,9 +481,10 @@ describe('artifacts host service', () => {
         ok: false,
         result: expect.stringContaining('needs either dataType or nothing'),
       });
+      // F6: bare nothing:false gets an actionable error pointing at dataType.
       await expect(harness.call('artifact_expect', { nothing: false })).resolves.toMatchObject({
         ok: false,
-        result: expect.stringContaining('Never pass nothing:false'),
+        result: expect.stringContaining('pass dataType'),
       });
       expect(harness.produceCalls).toHaveLength(0);
     } finally {
