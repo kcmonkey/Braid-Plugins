@@ -160,6 +160,27 @@ it('keeps effect-none observations from staling a completed identity', async () 
     await expect(opaque.call({ status: 'not-applicable', reason: 'Assumed prose.' })).resolves.toMatchObject({ ok: false });
   });
 
+  it('F2: allows not-applicable when every unresolved receipt is a known non-mutating workspace read', async () => {
+    const h = harness();
+    // Read-only shell discovery without a host structured receipt leaves an
+    // opaque unresolved receipt; the exact tool use is provably a bounded read.
+    await h.use('ro-grep', 'Bash', { command: 'rg -n "value" src' });
+    await h.result('ro-grep', 'src/domain/value.ts:1');
+    await h.use('ro-list', 'Bash', { command: 'git status' });
+    await h.result('ro-list', 'clean');
+    expect(h.evidence.projectionFor({ canvasId: 'c', boardId: 'b', turnIndex: 1 }).finalEvidence.unresolvedReceiptIds).not.toHaveLength(0);
+    await expect(h.call({ status: 'not-applicable', reason: 'Read-only analysis turn.' })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('F2: still blocks not-applicable when any unresolved receipt is not provably non-mutating', async () => {
+    const h = harness();
+    await h.use('ro-grep', 'Bash', { command: 'rg -n "value" src' });
+    await h.result('ro-grep', 'src/domain/value.ts:1');
+    await h.use('mixed', 'Bash', { command: 'npm test' });
+    await h.result('mixed', 'passed');
+    await expect(h.call({ status: 'not-applicable', reason: 'Looked read-only to me.' })).resolves.toMatchObject({ ok: false, result: expect.stringMatching(/opaque or incomplete/i) });
+  });
+
   it('reopens after a new identity and remains completable after explicit not-ready', async () => {
     const h = harness(); let revision = await h.declare(); await h.mutate(); await h.search(); await h.verify(); await h.call({ ...ready, strategyRevision: revision });
     await h.mutate('next'); await h.search('next-search');

@@ -1,6 +1,6 @@
 import * as path from 'path';
 import type { AgentToolContext, HostRunBoardEvent, HostService, HostServicePlugin, ToolMiddlewareContext, ToolMiddlewarePlugin, ToolResultMiddlewareContext } from '../../../src/plugin-api/types';
-import { isDefiniteSourceMutationUse, normalizeToolName } from '../../../src/plugin-api/toolSemantics';
+import { isDefiniteSourceMutationUse, isKnownNonMutatingWorkspaceTool, normalizeToolName } from '../../../src/plugin-api/toolSemantics';
 import type { ChangeEvidenceProjection } from '../../../src/changeEvidence/types';
 import type { ExpectStanceProcessEvidence, ObligationLedgerEvent, ObligationTarget } from '../../../src/obligations';
 import { createEngineeringAgentTools, manifest, type EngineeringApproach, type EngineeringArchitectureSignal, type EngineeringChangeKind, type EngineeringExpectRequest, type EngineeringReassessmentDisposition, type EngineeringReviewKind, type EngineeringRisk } from './agentTool';
@@ -34,6 +34,8 @@ type State = {
   reviewerUnavailable?: Binding; reviewerUnavailableReason?: string; independentReview?: Binding;
   changeReview?: Binding; ready?: Binding; strategy?: Strategy; strategyRevision: number;
   evidence: Map<string, string>; observationOrder: number;
+  /** F2: exact tool uses proven non-mutating at observation time (toolKey). */
+  nonMutatingToolUses: Set<string>;
 };
 
 const text = (value: string | undefined) => value?.trim() || undefined;
@@ -84,7 +86,7 @@ class EngineeringQualityHostService implements HostService {
   onRunError(event: HostRunBoardEvent) { this.states.get(key(event.canvasId, event.boardId))?.pending.clear(); }
   onBoardAbort(event: HostRunBoardEvent) { this.onRunError(event); }
   onCanvasClose(canvasId: string) { for (const stateKey of this.states.keys()) if (stateKey.startsWith(canvasId + '\0')) this.states.delete(stateKey); }
-  private create(ctx: Pick<ToolMiddlewareContext, 'canvasId' | 'boardId' | 'turnIndex'>): State { return { target: { canvasId: ctx.canvasId, boardId: ctx.boardId, turnIndex: ctx.turnIndex! }, ordinal: 1, pending: new Map(), verification: new Map(), reviewerHandles: new Set(), strategyRevision: 0, evidence: new Map(), observationOrder: 0 }; }
+  private create(ctx: Pick<ToolMiddlewareContext, 'canvasId' | 'boardId' | 'turnIndex'>): State { return { target: { canvasId: ctx.canvasId, boardId: ctx.boardId, turnIndex: ctx.turnIndex! }, ordinal: 1, pending: new Map(), verification: new Map(), reviewerHandles: new Set(), strategyRevision: 0, evidence: new Map(), observationOrder: 0, nonMutatingToolUses: new Set() }; }
   private observed(ctx: Pick<ToolMiddlewareContext, 'canvasId' | 'boardId' | 'turnIndex'>): State | undefined { if (typeof ctx.turnIndex !== 'number') return undefined; const stateKey = key(ctx.canvasId, ctx.boardId); const state = this.states.get(stateKey); if (state?.target.turnIndex === ctx.turnIndex) return state; const fresh = this.create(ctx); this.states.set(stateKey, fresh); return fresh; }
   private current(ctx: Pick<AgentToolContext, 'canvasId' | 'boardId' | 'turnIndex'>): State | undefined { const state = this.states.get(key(ctx.canvasId, ctx.boardId)); return state?.target.turnIndex === ctx.turnIndex ? state : undefined; }
   private strategyState(ctx: Pick<AgentToolContext, 'canvasId' | 'boardId' | 'turnIndex'>): State { const state = this.current(ctx); if (state) return state; const fresh = this.create(ctx); this.states.set(key(ctx.canvasId, ctx.boardId), fresh); return fresh; }
@@ -148,6 +150,18 @@ class EngineeringQualityHostService implements HostService {
   private observedBinding(state: State, current: Binding): ObservedBinding { return { ...current, observationOrder: ++state.observationOrder }; }
   private surfaces(state: State) { return (state.projection?.finalEvidence.surfaces ?? []).map((entry) => entry.surfaceId).filter(surfaceIsEngineering).sort(); }
   private potentialMutation(state: State) { return Boolean(state.projection?.receipts.some((receipt) => receipt.effect !== 'none')); }
+  /** F2: an unresolved receipt keeps not-applicable blocked unless its exact tool
+   * use was proven a known non-mutating workspace read. Receipts without a
+   * judgeable tool use (provider-host opaque, foreign invalidation) stay blocking. */
+  private hasUnjudgedUnresolvedReceipts(state: State): boolean {
+    const unresolved = state.projection?.finalEvidence.unresolvedReceiptIds ?? [];
+    if (!unresolved.length) return false;
+    const receipts = new Map((state.projection?.receipts ?? []).map((receipt) => [receipt.receiptId, receipt]));
+    return unresolved.some((receiptId) => {
+      const toolUseId = receipts.get(receiptId)?.toolUseId;
+      return !toolUseId || !state.nonMutatingToolUses.has(toolKey(state.target.turnIndex, toolUseId));
+    });
+  }
   private gate(ctx: ToolMiddlewareContext) {
     const state = this.observed(ctx); if (state) this.sync(state, ctx.changeEvidence);
     if (ctx.source === 'observed' || !isDefiniteSourceMutationUse(ctx.toolName, ctx.input)) return { proceed: true as const };
@@ -167,7 +181,11 @@ class EngineeringQualityHostService implements HostService {
   private openRecheck(state: State) { state.ordinal += 1; state.obligationId = undefined; state.attachError = undefined; this.ensureBinding(state); }
   private observeUse(ctx: ToolMiddlewareContext) {
     const state = this.observed(ctx); if (!state) return; this.sync(state, ctx.changeEvidence);
-    if (ctx.source !== 'observed' || !ctx.toolUseId) return; const current = this.final(state); if (!current) return;
+    if (ctx.source !== 'observed' || !ctx.toolUseId) return;
+    // F2: remember which exact tool uses were provably bounded reads so a later
+    // unresolved opaque receipt for that same use cannot wedge not-applicable.
+    if (isKnownNonMutatingWorkspaceTool(ctx.toolName, ctx.input)) state.nonMutatingToolUses.add(toolKey(state.target.turnIndex, ctx.toolUseId));
+    const current = this.final(state); if (!current) return;
     const pending = this.pendingFor(ctx.toolName, ctx.input, current);
     if (pending) state.pending.set(toolKey(state.target.turnIndex, ctx.toolUseId), pending);
   }
@@ -258,7 +276,7 @@ class EngineeringQualityHostService implements HostService {
     if (ctx.signal.aborted) return { ok: false, result: 'Engineering readiness expectation canceled.' };
     const status = text(req.status)?.toLowerCase(); if (status === 'strategy' || status === 'reassess') return this.strategy(ctx, req, status);
     const state = this.current(ctx);
-    if (status === 'not-applicable') { const reason = text(req.reason); if (!reason) return { ok: false, result: 'engineering_expect status:"not-applicable" requires a non-empty reason.' }; if (state?.projection?.finalEvidence.unresolvedReceiptIds.length) return { ok: false, result: 'engineering_expect cannot be not-applicable while applicability is opaque or incomplete.' }; if (state && this.surfaces(state).length) return { ok: false, result: 'engineering_expect cannot be not-applicable after canonical engineering surfaces were observed.' }; return { ok: true, result: JSON.stringify({ status, reason }) }; }
+    if (status === 'not-applicable') { const reason = text(req.reason); if (!reason) return { ok: false, result: 'engineering_expect status:"not-applicable" requires a non-empty reason.' }; if (state && this.hasUnjudgedUnresolvedReceipts(state)) return { ok: false, result: 'engineering_expect cannot be not-applicable while applicability is opaque or incomplete.' }; if (state && this.surfaces(state).length) return { ok: false, result: 'engineering_expect cannot be not-applicable after canonical engineering surfaces were observed.' }; return { ok: true, result: JSON.stringify({ status, reason }) }; }
     if (status !== 'ready' && status !== 'not-ready') return { ok: false, result: 'engineering_expect requires status:"strategy", status:"reassess", status:"ready", status:"not-ready", or status:"not-applicable".' };
     if (!state || !this.potentialMutation(state) || (!this.surfaces(state).length && !state.projection?.finalEvidence.unresolvedReceiptIds.length)) return { ok: false, result: 'engineering_expect has no observed engineering-relevant source-changing turn to assess.' };
     this.ensureBinding(state); if (state.attachError || !state.obligationId) return { ok: false, result: state.attachError ?? 'Engineering closeout obligation could not be attached.' };
