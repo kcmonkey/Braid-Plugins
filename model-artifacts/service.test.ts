@@ -326,38 +326,6 @@ describe('model artifacts host service', () => {
     }
   });
 
-  it('recovers a pending watcher from aggregate records on canvas ready', async () => {
-    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-model-watch-recover-'));
-    const fake = registerFakeProvider({
-      readTasks: [
-        { providerTaskId: 'task-1', status: 'running' },
-        { providerTaskId: 'task-1', status: 'succeeded', result: { mime: 'model/gltf-binary', format: 'glb', label: 'recovered.glb' } },
-      ],
-    });
-    try {
-      const harness = makeHarness(project, { image: '', 'model-3d': fake.provider.providerId });
-      const first = await harness.call({ requestId: 'watched-recover-1', prompt: 'a recoverable crate' });
-      expect(first.ok).toBe(true);
-      await harness.service.onBoardAbort?.({ canvasId: 'c1', boardId: 'b1', provider: 'codex' });
-
-      const recreated = modelArtifactsHostServicePlugin.create(harness.ctx);
-      await recreated.onCanvasReady?.('c1');
-      await new Promise((resolve) => setTimeout(resolve, 80));
-
-      expect(fake.counts.create).toBe(1);
-      expect(fake.counts.download).toBe(1);
-      expect(harness.produceCalls).toHaveLength(1);
-      expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
-        type: 'artifact-generation-settled',
-        requestId: 'watched-recover-1',
-        status: 'succeeded',
-      }));
-    } finally {
-      fake.unregister();
-      fs.rmSync(project, { recursive: true, force: true });
-    }
-  });
-
   it('does not create duplicate provider tasks for concurrent same-request dispatch', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-model-concurrent-'));
     const fake = registerFakeProvider({

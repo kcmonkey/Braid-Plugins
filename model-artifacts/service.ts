@@ -108,18 +108,6 @@ class ModelArtifactsHostService implements HostService {
     await this.releaseLiveBoardRecords(event, event.message || 'Generation request was interrupted; re-run model_generate with the same requestId to resume the provider task.');
   }
 
-  async onCanvasReady(canvasId: string): Promise<void> {
-    const aggregates = await this.host.listPluginAggregates(manifest.id);
-    for (const id of aggregates.aggregates ?? []) {
-      if (!id.startsWith(AGGREGATE_PREFIX)) continue;
-      const requestKey = id.slice(AGGREGATE_PREFIX.length);
-      const record = await this.readRecord(requestKey);
-      if (!record || record.canvasId !== canvasId || record.status !== 'pending' || !record.providerTaskId) continue;
-      const provider = this.providerById(record.providerId, record.request.kind);
-      if (provider) this.startWatcher(record, provider, 0);
-    }
-  }
-
   async onCanvasClose(canvasId: string): Promise<void> {
     for (const record of [...this.records.values()]) {
       if (record.canvasId === canvasId) this.stopWatcher(record.requestKey);

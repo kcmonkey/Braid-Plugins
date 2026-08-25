@@ -142,11 +142,6 @@ class CoordinatorHostService implements HostService {
     return [createCoordinatorLiveMessages()];
   }
 
-  onCanvasReady(canvasId: string): void {
-    this.syncWorkspaceResources();
-    this.publishCoordination(canvasId);
-  }
-
   onCanvasClose(canvasId: string): void {
     const prefix = canvasId + '::';
     const filePrefix = 'file::' + prefix;
@@ -745,7 +740,6 @@ class CoordinatorHostService implements HostService {
       return { matched: true, paths, conflicts };
     }
     for (const path of paths) {
-      this.ctx.captureFileSnapshot(canvasId, boardId, path);
       const result = claimFile(this.coordination, {
         canvasId,
         boardId,

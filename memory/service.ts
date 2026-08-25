@@ -299,10 +299,6 @@ class MemoryHostService implements HostService {
     }];
   }
 
-  async onCanvasReady(canvasId: string): Promise<void> {
-    await this.publishMemoryState(canvasId);
-  }
-
   async onTurnSettled(event: HostTurnSettledEvent): Promise<void> {
     const key = turnKey(event.canvasId, event.boardId, event.turnIndex);
     if (mentionsMemoryRecording(event.answer) && !this.memoryWritesByTurn.has(key)) {

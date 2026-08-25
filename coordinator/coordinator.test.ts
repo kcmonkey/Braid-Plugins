@@ -539,24 +539,4 @@ describe('coordinator host service', () => {
     }
   });
 
-  it('does not reload resources.json from publish-only lifecycle hooks', async () => {
-    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-coord-service-cache-'));
-    try {
-      writeResources(project, [{ id: 'build', kind: 'exclusive' }]);
-      const { service, call, states } = makeHarness(project);
-      const resourceFile = path.join(project, '.braid', 'resources.json');
-
-      service.onCanvasReady?.('c1');
-      fs.writeFileSync(resourceFile, JSON.stringify({ resources: [{ id: 'editor', kind: 'exclusive' }] }));
-
-      service.onRunSettled?.({ canvasId: 'c1', boardIds: [], provider: 'claude' });
-      const publishedResources = (states.at(-1)?.data as any).resources.map((r: any) => r.id);
-      expect(publishedResources).toEqual(['build']);
-
-      const changed = await call('c1', 'builder', { action: 'status' });
-      expect(changed.result).toContain('editor');
-    } finally {
-      fs.rmSync(project, { recursive: true, force: true });
-    }
-  });
 });
