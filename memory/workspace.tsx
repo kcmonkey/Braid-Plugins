@@ -88,8 +88,9 @@ function InspectionPanel({ snapshot, onClose, requestAction }: {
   const [actionError, setActionError] = React.useState('');
   const [detail, setDetail] = React.useState<MemoryInspectionRecord | null>(null);
   const actionInFlightRef = React.useRef(false);
+  const initialRefreshRequestedRef = React.useRef(false);
 
-  const runAction = (kind: 'detail' | 'refresh', action: 'inspectDetail' | 'refreshInspection', payload?: unknown) => {
+  const runAction = React.useCallback((kind: 'detail' | 'refresh', action: 'inspectDetail' | 'refreshInspection', payload?: unknown) => {
     if (actionInFlightRef.current) return;
     actionInFlightRef.current = true;
     setActionLoading(kind);
@@ -111,11 +112,20 @@ function InspectionPanel({ snapshot, onClose, requestAction }: {
       showActionError(error);
       releaseAction();
     }
-  };
+  }, [requestAction]);
+
+  React.useEffect(() => {
+    if (snapshot !== null || initialRefreshRequestedRef.current) return;
+    initialRefreshRequestedRef.current = true;
+    runAction('refresh', 'refreshInspection');
+  }, [runAction, snapshot]);
 
   if (snapshot === null) {
-    return <PanelShell onClose={onClose} total={0}>
-      <StateMessage title="Loading inspection" detail="Waiting for a list-safe memory metadata snapshot." />
+    return <PanelShell onClose={onClose} total={0} onRefresh={() => runAction('refresh', 'refreshInspection')} refreshing={actionLoading === 'refresh'} refreshDisabled={actionLoading !== null}>
+      <StateMessage
+        title={actionError ? 'Inspection unavailable' : 'Loading inspection'}
+        detail={actionError || 'Reading persisted memory metadata on demand.'}
+      />
     </PanelShell>;
   }
   if (snapshot.kind === 'error') {

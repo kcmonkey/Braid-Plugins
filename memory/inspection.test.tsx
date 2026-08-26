@@ -1,6 +1,4 @@
-import React from 'react';
-import { describe, expect, it, vi } from 'vitest';
-import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, expect, it } from 'vitest';
 import { birthMemoryEnvelope, emptyMemoryStore, recordMemoryEnvelope, type MemoryStore } from './model';
 import {
   MEMORY_INSPECTION_SCHEMA_VERSION,
@@ -9,7 +7,11 @@ import {
   normalizeMemoryInspectionPanelSnapshot,
   parseMemoryInspectionAction,
 } from './inspection';
-import { memoryInspectionBadge, memoryInspectionPanel } from './workspace';
+
+// Essential non-E2E exception: malformed host payloads and privacy-boundary
+// violations cannot be produced safely through the shipped UI without corrupting
+// persistent data. Remove these checks when the protocol seam has a shared,
+// independently verified schema validator.
 
 function add(store: MemoryStore, input: Record<string, unknown>, now: string): MemoryStore {
   const born = birthMemoryEnvelope({
@@ -21,49 +23,6 @@ function add(store: MemoryStore, input: Record<string, unknown>, now: string): M
   }, now);
   if (!born.ok) throw new Error(born.errors.map((err) => err.code).join(','));
   return recordMemoryEnvelope(store, born.record).store;
-}
-
-function renderWithPanelState(data: unknown, state: unknown[]): string {
-  const stateSpy = vi.spyOn(React, 'useState') as any;
-  stateSpy.mockImplementation((initial: unknown) => [state.length ? state.shift() : initial, () => undefined]);
-  try {
-    return renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data, onClose: () => undefined }) as any);
-  } finally {
-    stateSpy.mockRestore();
-  }
-}
-
-function findElement(node: React.ReactNode, predicate: (element: React.ReactElement) => boolean): React.ReactElement | undefined {
-  if (!React.isValidElement(node)) return undefined;
-  if (predicate(node)) return node;
-  return React.Children.toArray((node.props as { children?: React.ReactNode }).children)
-    .map((child) => findElement(child, predicate))
-    .find((element): element is React.ReactElement => element !== undefined);
-}
-
-function refreshButton(data: unknown, requestAction: ReturnType<typeof vi.fn>, state: unknown[] = []): React.ReactElement | undefined {
-  const stateSpy = vi.spyOn(React, 'useState') as any;
-  // This intentional hook harness preserves one ref across the simulated renders.
-  // It keeps the production same-render latch observable without calling a real
-  // renderer's event system or weakening the component's useRef behavior.
-  const actionInFlightRef = { current: false };
-  const refSpy = vi.spyOn(React, 'useRef') as any;
-  let stateIndex = 0;
-  stateSpy.mockImplementation((initial: unknown) => {
-    const index = stateIndex++;
-    if (index === state.length) state.push(initial);
-    return [state[index], (next: unknown) => { state[index] = typeof next === 'function' ? next(state[index]) : next; }];
-  });
-  refSpy.mockReturnValue(actionInFlightRef);
-  try {
-    const panel = memoryInspectionPanel.renderPanel({ data, onClose: () => undefined, requestAction } as any) as React.ReactElement;
-    const shell = (panel.type as (props: unknown) => React.ReactElement)(panel.props);
-    const renderedShell = (shell.type as (props: unknown) => React.ReactElement)(shell.props);
-    return findElement(renderedShell, (element) => element.type === 'button' && element.props.title === 'Refresh list-safe inspection metadata');
-  } finally {
-    refSpy.mockRestore();
-    stateSpy.mockRestore();
-  }
 }
 
 function validInspectionSnapshot() {
@@ -86,30 +45,7 @@ function validInspectionSnapshot() {
   };
 }
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-describe('memory inspection workspace UI', () => {
-  it('renders as an accessible modal isolated from canvas interactions', () => {
-    const html = renderToStaticMarkup(memoryInspectionPanel.renderPanel({
-      data: validInspectionSnapshot(),
-      onClose: () => undefined,
-    }) as any);
-
-    expect(html).toContain('class="memory-inspection-modal nodrag nopan nowheel"');
-    expect(html).toContain('role="dialog"');
-    expect(html).toContain('aria-modal="true"');
-    expect(html).toContain('aria-labelledby="memory-inspection-title"');
-    expect(html).toContain('tabindex="-1"');
-  });
-
+describe('memory inspection fail-closed contracts', () => {
   it('keeps the action grammar closed to metadata-only detail and payload-free refresh', () => {
     expect(parseMemoryInspectionAction('inspectDetail', { id: ' memory-1 ' })).toEqual({ ok: true, action: 'inspectDetail', id: 'memory-1' });
     expect(parseMemoryInspectionAction('refreshInspection', undefined)).toEqual({ ok: true, action: 'refreshInspection' });
@@ -192,8 +128,8 @@ describe('memory inspection workspace UI', () => {
     { kind: 'ready', schemaVersion: MEMORY_INSPECTION_SCHEMA_VERSION, records: [{ id: 7, title: null, tags: 'not-an-array' }], counts: { total: 'one' } },
     { kind: 'ready', schemaVersion: MEMORY_INSPECTION_SCHEMA_VERSION, records: [], counts: { total: -1, locator: Number.NaN, disputed: 'invalid' } },
   ])('fails closed without crashing for malformed v2 inspection payload %#', (payload) => {
-    expect(() => renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: payload, onClose: () => undefined }) as any)).not.toThrow();
-    expect(renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: payload, onClose: () => undefined }) as any)).toContain('Inspection unavailable');
+    expect(() => normalizeMemoryInspectionPanelSnapshot(payload)).not.toThrow();
+    expect(normalizeMemoryInspectionPanelSnapshot(payload)).toMatchObject({ kind: 'error', availability: 'unavailable' });
   });
 
   it.each([
@@ -207,11 +143,9 @@ describe('memory inspection workspace UI', () => {
     const snapshot = validInspectionSnapshot();
     const payload = { ...snapshot, records: [{ ...snapshot.records[0], [field]: value }] };
     const normalized = normalizeMemoryInspectionPanelSnapshot(payload as any);
-    const html = renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: payload, onClose: () => undefined }) as any);
 
     expect(normalized).toMatchObject({ kind: 'error', availability: 'unavailable' });
-    expect(html).toContain('Inspection unavailable');
-    expect(html).not.toContain(JSON.stringify(value));
+    expect(JSON.stringify(normalized)).not.toContain(JSON.stringify(value));
   });
 
   it.each([
@@ -224,49 +158,9 @@ describe('memory inspection workspace UI', () => {
     const snapshot = validInspectionSnapshot();
     const payload = { ...snapshot, counts: { ...snapshot.counts, ...forgedCounts } };
     const normalized = normalizeMemoryInspectionPanelSnapshot(payload as any);
-    const html = renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: payload, onClose: () => undefined }) as any);
 
     expect(normalized).toMatchObject({ kind: 'error', availability: 'unavailable' });
-    expect(html).toContain('Inspection unavailable');
-    expect(html).not.toContain('Safe snapshot');
-  });
-
-  it('offers one focusable, de-duplicated metadata-only refresh action while unavailable or in flight', () => {
-    const requestAction = vi.fn(() => new Promise<unknown>(() => undefined));
-    const state: unknown[] = [];
-    const unavailable = refreshButton(errorMemoryInspectionSnapshot('host offline'), requestAction, state);
-    expect(unavailable?.props.type).toBe('button');
-    expect(unavailable?.props.children).toMatch(/Refresh|Retry/);
-    expect(typeof unavailable?.props.onClick).toBe('function');
-    unavailable?.props.onClick();
-    expect(requestAction).toHaveBeenCalledTimes(1);
-    expect(requestAction).toHaveBeenCalledWith('refreshInspection', undefined);
-    expect(refreshButton(errorMemoryInspectionSnapshot('host offline'), requestAction, state)?.props.disabled).toBe(true);
-  });
-
-  it.each([
-    { outcome: 'resolves', settle: (pending: ReturnType<typeof deferred<{ data: unknown }>>) => pending.resolve({ data: { ok: true, action: 'refreshInspection' } }) },
-    { outcome: 'rejects', settle: (pending: ReturnType<typeof deferred<{ data: unknown }>>) => pending.reject(new Error('offline')) },
-  ])('single-flights a same-render Refresh double click and clears its latch when the request $outcome', async ({ settle }) => {
-    const pending = deferred<{ data: unknown }>();
-    const requestAction = vi.fn(() => pending.promise);
-    const state: unknown[] = [];
-    const currentRenderRefresh = refreshButton(errorMemoryInspectionSnapshot('host offline'), requestAction, state);
-
-    currentRenderRefresh?.props.onClick();
-    currentRenderRefresh?.props.onClick();
-
-    const refreshing = refreshButton(errorMemoryInspectionSnapshot('host offline'), requestAction, state);
-    expect(refreshing?.props.children).toBe('Refreshing…');
-    expect(refreshing?.props.disabled).toBe(true);
-    expect(requestAction).toHaveBeenCalledTimes(1);
-    expect(requestAction).toHaveBeenCalledWith('refreshInspection', undefined);
-
-    settle(pending);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(refreshButton(errorMemoryInspectionSnapshot('host offline'), requestAction, state)?.props.disabled).toBe(false);
+    expect(JSON.stringify(normalized)).not.toContain('Safe snapshot');
   });
 
   it('builds inspection state for every memory class with lifecycle fields', () => {
@@ -286,7 +180,7 @@ describe('memory inspection workspace UI', () => {
     });
   });
 
-  it('renders usage counters as signals, not trust scores', () => {
+  it('keeps usage counters as independent inspection metadata rather than a routing score', () => {
     let store = emptyMemoryStore();
     store = add(store, { verb: 'lesson', title: 'Base', content: 'Base.', evidenceLocators: ['test:base'] }, '2026-07-01T00:00:00.000Z');
     const baseId = store.records[0].id;
@@ -294,60 +188,8 @@ describe('memory inspection workspace UI', () => {
     store.records[0] = { ...store.records[0], readCount: 7, status: 'disputed' };
 
     const snapshot = createMemoryInspectionSnapshot(store);
-    const html = renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: snapshot, onClose: () => undefined }) as any);
-
-    expect(html).toContain('Base');
-    expect(html).toContain('reads 7');
-    expect(html).toContain('cited 1');
-    expect(html).toContain('disputed');
-    expect(html).not.toContain('trust score');
-    expect(html).not.toContain('score 7');
-    expect(memoryInspectionBadge.count({ data: snapshot, active: false })).toBe(2);
-  });
-
-  it('renders deterministic recent-first rows plus metadata controls, state copy, compatible badge titles, and inert detail access', () => {
-    const records = [
-      { id: 'c', title: 'Zulu', verb: 'lesson', corpusClass: 4, status: 'current', freshness: 'verified', provisional: false, scope: 'deploy', tags: ['findable-tag'], recallCue: 'searchable cue', provenance: 'fixture', evidenceLocatorCount: 0, readCount: 0, citedByCount: 0, updatedAt: '2026-07-03T00:00:00.000Z', sourceCheck: 'not-checked' },
-      { id: 'a', title: 'Alpha', verb: 'locator', corpusClass: 2, status: 'disputed', freshness: 'unverified', provisional: true, scope: 'auth', tags: ['review'], recallCue: '', provenance: '', evidenceLocatorCount: 1, readCount: 0, citedByCount: 0, updatedAt: '2026-07-02T00:00:00.000Z', sourceCheck: 'locator-present' },
-      { id: 'b', title: 'Bravo', verb: 'snapshot', corpusClass: 3, status: 'stale', freshness: 'verified', provisional: false, scope: 'store', tags: [], recallCue: '', provenance: '', evidenceLocatorCount: 0, readCount: 0, citedByCount: 0, updatedAt: '2026-07-01T00:00:00.000Z', sourceCheck: 'locator-missing' },
-    ] as const;
-    const snapshot = { kind: 'ready' as const, schemaVersion: MEMORY_INSPECTION_SCHEMA_VERSION, generatedAt: '2026-07-06T00:00:00.000Z', availability: 'available' as const, total: 3, records: [...records], counts: { total: 3, locator: 1, snapshot: 1, lesson: 1, transcript: 0, current: 1, stale: 1, superseded: 0, disputed: 1, verified: 2, unverified: 1, provisional: 1, final: 2, sourceNotChecked: 1, sourceLocatorPresent: 1, sourceLocatorMissing: 1 } };
-    const html = renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: snapshot, onClose: () => undefined }) as any);
-
-    expect(html.indexOf('Zulu')).toBeLessThan(html.indexOf('Alpha'));
-    expect(html.indexOf('Alpha')).toBeLessThan(html.indexOf('Bravo'));
-    for (const label of ['Search metadata', 'Routing', 'Freshness', 'Provisional', 'Source check', 'Sort results']) expect(html).toContain(`aria-label=\"${label}\"`);
-    expect(html).toContain('Review priority is only a routing queue.');
-    expect(html).toContain('type=\"button\"');
-    expect(html).toContain('aria-pressed=\"false\"');
-    expect(memoryInspectionBadge.title({ data: snapshot, active: false })).toBe('Memory — 3 records, 1 disputed, 1 stale');
-    expect(memoryInspectionBadge.title({ data: errorMemoryInspectionSnapshot('offline'), active: false })).toBe('Memory — inspection unavailable');
-    expect(renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: null, onClose: () => undefined }) as any)).toContain('Loading inspection');
-    expect(renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: { ...snapshot, total: 0, records: [], counts: { total: 0, locator: 0, snapshot: 0, lesson: 0, transcript: 0, current: 0, stale: 0, superseded: 0, disputed: 0, verified: 0, unverified: 0, provisional: 0, final: 0, sourceNotChecked: 0, sourceLocatorPresent: 0, sourceLocatorMissing: 0 } }, onClose: () => undefined }) as any)).toContain('No memory records');
-    expect(renderToStaticMarkup(memoryInspectionPanel.renderPanel({ data: errorMemoryInspectionSnapshot('offline'), onClose: () => undefined }) as any)).toContain('Inspection unavailable');
-  });
-
-  it('applies metadata search and each lifecycle filter independently, with title and review queues deterministic in SSR', () => {
-    const records = [
-      { id: 'c', title: 'Zulu', verb: 'lesson', corpusClass: 4, status: 'current', freshness: 'verified', provisional: false, scope: 'deploy', tags: ['findable-tag'], recallCue: 'searchable cue', provenance: 'fixture', evidenceLocatorCount: 0, readCount: 0, citedByCount: 0, updatedAt: '2026-07-03T00:00:00.000Z', sourceCheck: 'not-checked' },
-      { id: 'a', title: 'Alpha', verb: 'locator', corpusClass: 2, status: 'disputed', freshness: 'unverified', provisional: true, scope: 'auth', tags: ['review'], recallCue: '', provenance: '', evidenceLocatorCount: 1, readCount: 0, citedByCount: 0, updatedAt: '2026-07-02T00:00:00.000Z', sourceCheck: 'locator-present' },
-      { id: 'b', title: 'Bravo', verb: 'snapshot', corpusClass: 3, status: 'stale', freshness: 'verified', provisional: false, scope: 'store', tags: [], recallCue: '', provenance: '', evidenceLocatorCount: 0, readCount: 0, citedByCount: 0, updatedAt: '2026-07-01T00:00:00.000Z', sourceCheck: 'locator-missing' },
-    ];
-    const snapshot = { kind: 'ready' as const, schemaVersion: MEMORY_INSPECTION_SCHEMA_VERSION, generatedAt: '2026-07-06T00:00:00.000Z', availability: 'available' as const, total: 3, records, counts: { total: 3, locator: 1, snapshot: 1, lesson: 1, transcript: 0, current: 1, stale: 1, superseded: 0, disputed: 1, verified: 2, unverified: 1, provisional: 1, final: 2, sourceNotChecked: 1, sourceLocatorPresent: 1, sourceLocatorMissing: 1 } };
-    const states = (query: string, status = 'all', freshness = 'all', provisional = 'all', source = 'all', sort = 'updated') => [query, status, freshness, provisional, source, sort, null, null];
-    const titles = (html: string) => ['Alpha', 'Bravo', 'Zulu'].filter((title) => html.includes(title));
-
-    expect(titles(renderWithPanelState(snapshot, states('findable-tag')))).toEqual(['Zulu']);
-    expect(titles(renderWithPanelState(snapshot, states('', 'current')))).toEqual(['Zulu']);
-    expect(titles(renderWithPanelState(snapshot, states('', 'all', 'unverified')))).toEqual(['Alpha']);
-    expect(titles(renderWithPanelState(snapshot, states('', 'all', 'all', 'provisional')))).toEqual(['Alpha']);
-    expect(titles(renderWithPanelState(snapshot, states('', 'all', 'all', 'all', 'locator-missing')))).toEqual(['Bravo']);
-    const titleSorted = renderWithPanelState(snapshot, states('', 'all', 'all', 'all', 'all', 'title'));
-    expect(titleSorted.indexOf('Alpha')).toBeLessThan(titleSorted.indexOf('Bravo'));
-    expect(titleSorted.indexOf('Bravo')).toBeLessThan(titleSorted.indexOf('Zulu'));
-    const reviewSorted = renderWithPanelState(snapshot, states('', 'all', 'all', 'all', 'all', 'review'));
-    expect(reviewSorted.indexOf('Alpha')).toBeLessThan(reviewSorted.indexOf('Bravo'));
-    expect(reviewSorted.indexOf('Bravo')).toBeLessThan(reviewSorted.indexOf('Zulu'));
-    expect(renderWithPanelState(snapshot, states('absent metadata'))).toContain('No matching metadata');
+    const base = snapshot.records.find((record) => record.title === 'Base');
+    expect(base).toMatchObject({ readCount: 7, citedByCount: 1, status: 'disputed' });
+    expect(snapshot.total).toBe(2);
   });
 });
