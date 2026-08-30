@@ -259,6 +259,9 @@ class ArtifactsHostService implements HostService {
 
   private async handleDeclare(ctx: AgentToolContext, req: ArtifactDeclareToolRequest): Promise<AgentToolResult> {
     if (ctx.signal.aborted) return { ok: false, result: 'Artifact declaration canceled.' };
+    if (ctx.agentId && req.attachToTurn) {
+      return { ok: false, result: 'A headless BraidAgent cannot attach an artifact to a Board turn; pass the exact ref to finish instead.' };
+    }
     const dataType = nonEmpty(req.dataType) ?? this.artifactTypes.metaDataType;
     const label = nonEmpty(req.label);
     const hasText = typeof req.text === 'string' && req.text.length > 0;
@@ -279,6 +282,7 @@ class ArtifactsHostService implements HostService {
           label,
           path: sourcePath,
           pluginId: manifest.id,
+          ...(ctx.agentId ? { producerAgentId: ctx.agentId } : {}),
           ...(req.attachToTurn ? { attachTo: { turnIndex: ctx.turnIndex } } : {}),
         })
         : await this.host.produceArtifact(ctx.canvasId, ctx.boardId, {
@@ -288,6 +292,7 @@ class ArtifactsHostService implements HostService {
           label,
           text: req.text!,
           pluginId: manifest.id,
+          ...(ctx.agentId ? { producerAgentId: ctx.agentId } : {}),
           ...(req.attachToTurn ? { attachTo: { turnIndex: ctx.turnIndex } } : {}),
         });
       if (result.error || !result.ref) return { ok: false, result: result.error ?? 'artifact_declare failed.' };

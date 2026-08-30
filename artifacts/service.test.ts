@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { createArtifactsHostServicePlugin, type ArtifactTypeRegistryView } from './service';
-import type { AgentToolPlugin, HostServiceContext, LiveMessageContext } from '../../../src/plugin-api/types';
+import type { AgentToolPlugin, HostServiceContext } from '../../../src/plugin-api/types';
 import type { AgentToolResult } from '../../../src/engine/types';
 import { HostPluginRegistry, META_ARTIFACT_DATA_TYPE } from '../../../src/plugin-runtime/hostRegistry';
 import type { ObligationLedgerEvent } from '../../../src/obligations';
@@ -17,13 +17,10 @@ function artifactTypes(registry: HostPluginRegistry): ArtifactTypeRegistryView {
   };
 }
 
-function makeHarness(project: string, options: { live?: boolean; registry?: HostPluginRegistry } = {}) {
+function makeHarness(project: string, options: { registry?: HostPluginRegistry } = {}) {
   const produceCalls: Array<{ canvasId: string; boardId: string; input: any }> = [];
   const attachedObligations: any[] = [];
-  const delivered: LiveMessageContext[] = [];
   const obligationEvents: ObligationLedgerEvent[] = [];
-  let deliveryAttempts = 0;
-  const targetKey = 'c1::b1';
   const ctx: HostServiceContext = {
     cwd: () => project,
     readSecret: async (pluginId, key) => ({ pluginId, key, stored: false }),
@@ -51,17 +48,8 @@ function makeHarness(project: string, options: { live?: boolean; registry?: Host
       attachedObligations.push(obligation);
       return { obligationId: obligation.id };
     },
-    liveOwnerKeys: () => new Set(),
-    openCanvasIds: () => ['c1'],
-    liveBoardKeys: () => options.live ? [targetKey] : [],
-    hasLiveBoardKey: (key) => Boolean(options.live) && key === targetKey,
-    deliverLiveBoardMessage: (message) => {
-      deliveryAttempts += 1;
-      if (!options.live || message.targetKey !== targetKey) return false;
-      delivered.push(message);
-      return true;
-    },
-    captureFileSnapshot: () => undefined,
+    agentIdForBoard: () => undefined,
+    deliverLiveAgentMessage: async () => false,
     publishWorkspaceState: () => undefined,
     publishWorkspaceEvent: () => undefined,
   } as HostServiceContext;
@@ -91,7 +79,7 @@ function makeHarness(project: string, options: { live?: boolean; registry?: Host
   const settle = async (turnIndex = 2) => {
     await service.onTurnSettled?.({ canvasId: 'c1', boardId: 'b1', turnIndex, provider: 'codex', answer: 'done' });
   };
-  return { call, tools, produceCalls, attachedObligations, obligationEvents, service, registry, delivered, get deliveryAttempts() { return deliveryAttempts; }, observeToolUse, settle };
+  return { call, tools, produceCalls, attachedObligations, obligationEvents, service, registry, observeToolUse, settle };
 }
 
 describe('artifacts host service', () => {
@@ -577,10 +565,10 @@ describe('artifacts host service', () => {
     }
   });
 
-  it('does not self-check nudge when an expected output is declared and attached', async () => {
+  it('does not attach an obligation when an expected output is declared and attached', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-covered-'));
     try {
-      const harness = makeHarness(project, { live: true });
+      const harness = makeHarness(project);
 
       await harness.observeToolUse({ path: 'reports/expected.docx' });
       await harness.call('artifact_expect', { dataType: 'report' });
@@ -595,16 +583,15 @@ describe('artifacts host service', () => {
 
       expect(declared.ok).toBe(true);
       expect(harness.attachedObligations).toHaveLength(0);
-      expect(harness.delivered).toHaveLength(0);
     } finally {
       fs.rmSync(project, { recursive: true, force: true });
     }
   });
 
-  it('does not live-nudge observed output after expect nothing', async () => {
+  it('does not create an artifact obligation after expect nothing', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-expect-nothing-challenge-'));
     try {
-      const harness = makeHarness(project, { live: true });
+      const harness = makeHarness(project);
 
       await harness.observeToolUse({ path: 'reports/ignored.docx' });
       const result = await harness.call('artifact_expect', { nothing: true, reason: 'Only scratch work.' });
@@ -612,7 +599,6 @@ describe('artifacts host service', () => {
 
       expect(result.ok).toBe(true);
       expect(harness.attachedObligations).toHaveLength(0);
-      expect(harness.delivered).toHaveLength(0);
       expect(harness.obligationEvents).toEqual([
         {
           type: 'artifact-output-candidate-observed',
@@ -634,7 +620,7 @@ describe('artifacts host service', () => {
   it('records host-obligation candidates for undeclared new output files without a positive deliverable-type list', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-'));
     try {
-      const harness = makeHarness(project, { live: true });
+      const harness = makeHarness(project);
 
       await harness.observeToolUse({ path: 'report.docx' });
       await harness.observeToolUse({ path: 'deck.pptx' });
@@ -644,7 +630,6 @@ describe('artifacts host service', () => {
       await harness.settle();
       await harness.settle();
 
-      expect(harness.delivered).toHaveLength(0);
       expect(harness.attachedObligations).toHaveLength(0);
       expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
         type: 'artifact-output-candidate-observed',
@@ -674,12 +659,11 @@ describe('artifacts host service', () => {
   it('records a host-obligation candidate for a new nested source-looking file because the agent judges deliverable intent', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-html-'));
     try {
-      const harness = makeHarness(project, { live: true });
+      const harness = makeHarness(project);
 
       await harness.observeToolUse({ path: 'src/generated-report.html' }, 'Write');
       await harness.settle();
 
-      expect(harness.delivered).toHaveLength(0);
       expect(harness.attachedObligations).toHaveLength(0);
       expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
         type: 'artifact-output-candidate-observed',
@@ -693,7 +677,7 @@ describe('artifacts host service', () => {
   it('records artifact-output intent for artifact-producing agent tools without declaring expectations', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-producer-tool-'));
     try {
-      const harness = makeHarness(project, { live: true });
+      const harness = makeHarness(project);
       const tools = [
         'agent__braid__image_generate',
         'agent__braid__video_generate',
@@ -730,7 +714,7 @@ describe('artifacts host service', () => {
   it('does not arm artifact-output obligations for canceled artifact-producing agent tools', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-producer-tool-cancel-'));
     try {
-      const harness = makeHarness(project, { live: true });
+      const harness = makeHarness(project);
 
       await harness.observeToolUse({ requestId: 'video-1', cancel: true }, 'agent__braid__video_generate');
 
@@ -741,107 +725,15 @@ describe('artifacts host service', () => {
     }
   });
 
-  it('does not nudge for ordinary source edits or infra and scratch outputs', async () => {
-    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-excluded-'));
-    try {
-      const harness = makeHarness(project, { live: true });
-
-      await harness.observeToolUse({ file_path: 'src/App.html' }, 'Edit');
-      await harness.observeToolUse({ path: '.braid/live-refs/note.md' }, 'Write');
-      await harness.observeToolUse({ path: 'node_modules/pkg/index.js' }, 'Write');
-      await harness.observeToolUse({ path: 'tmp-report/out.md' }, 'Write');
-      await harness.observeToolUse({ path: 'probe-run/out.md' }, 'Write');
-      await harness.observeToolUse({ path: 'dist/app.js' }, 'Write');
-      await harness.settle();
-
-      expect(harness.deliveryAttempts).toBe(0);
-      expect(harness.delivered).toHaveLength(0);
-    } finally {
-      fs.rmSync(project, { recursive: true, force: true });
-    }
-  });
-
-  it('does not nudge when the candidate was manually declared and attached', async () => {
-    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-covered-'));
-    try {
-      const harness = makeHarness(project, { live: true });
-
-      const files = ['reports/attached.docx', 'reports/attached.pptx', 'reports/attached.xlsx', 'reports/attached.pdf'];
-      for (const file of files) {
-        await harness.observeToolUse({ file_path: file });
-        const result = await harness.call('artifact_declare', {
-          dataType: 'report',
-          label: `Attached ${path.basename(file)}`,
-          path: file,
-          storageMode: 'external-ref',
-          attachToTurn: true,
-        });
-        expect(result.ok).toBe(true);
-      }
-      await harness.settle();
-
-      expect(harness.delivered).toHaveLength(0);
-    } finally {
-      fs.rmSync(project, { recursive: true, force: true });
-    }
-  });
-
-  it('does not nudge on error, abort, or unavailable live-board delivery', async () => {
-    const erroredProject = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-error-'));
-    const abortedProject = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-abort-'));
-    const unavailableProject = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-unavailable-'));
-    try {
-      const errored = makeHarness(erroredProject, { live: true });
-      await errored.observeToolUse({ path: 'reports/error.docx' });
-      await errored.service.onRunError?.({ canvasId: 'c1', boardId: 'b1', provider: 'codex', message: 'failed' });
-      await errored.settle();
-      expect(errored.delivered).toHaveLength(0);
-
-      const aborted = makeHarness(abortedProject, { live: true });
-      await aborted.observeToolUse({ path: 'reports/abort.docx' });
-      await aborted.service.onBoardAbort?.({ canvasId: 'c1', boardId: 'b1', message: 'aborted' });
-      await aborted.settle();
-      expect(aborted.delivered).toHaveLength(0);
-
-      const unavailable = makeHarness(unavailableProject, { live: false });
-      await unavailable.observeToolUse({ path: 'reports/cold.docx' });
-      await unavailable.settle();
-      expect(unavailable.deliveryAttempts).toBe(0);
-      expect(unavailable.delivered).toHaveLength(0);
-    } finally {
-      fs.rmSync(erroredProject, { recursive: true, force: true });
-      fs.rmSync(abortedProject, { recursive: true, force: true });
-      fs.rmSync(unavailableProject, { recursive: true, force: true });
-    }
-  });
-
-  it('retires pending deliverable candidates when the owning canvas closes', async () => {
-    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-close-'));
-    try {
-      const harness = makeHarness(project, { live: true });
-
-      await harness.observeToolUse({ path: 'reports/closed.docx' });
-      await harness.service.onCanvasClose?.('c1');
-      await harness.settle();
-
-      // The candidate was retired on canvas close, so a late turn-settle finds nothing to nudge —
-      // the in-memory candidate/covered maps do not outlive their owning canvas. (code-review LOW-1)
-      expect(harness.delivered).toHaveLength(0);
-    } finally {
-      fs.rmSync(project, { recursive: true, force: true });
-    }
-  });
-
   it('leaves another canvas\'s pending candidates intact when a different canvas closes', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-artifacts-nudge-close-scope-'));
     try {
-      const harness = makeHarness(project, { live: true });
+      const harness = makeHarness(project);
 
       await harness.observeToolUse({ path: 'reports/other.docx' });
       await harness.service.onCanvasClose?.('c2'); // unrelated canvas — must not sweep c1's candidate
       await harness.settle();
 
-      expect(harness.delivered).toHaveLength(0);
       expect(harness.attachedObligations).toHaveLength(0);
       expect(harness.obligationEvents).toContainEqual(expect.objectContaining({
         type: 'artifact-output-candidate-observed',

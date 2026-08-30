@@ -69,12 +69,8 @@ function makeHarness(project: string, readPluginConfig?: NonNullable<HostService
     readSecret: async (pluginId, key) => ({ pluginId, key, stored: false }),
     writeSecret: async (pluginId, key) => ({ pluginId, key, stored: true }),
     clearSecret: async (pluginId, key) => ({ pluginId, key, cleared: true }),
-    liveOwnerKeys: () => new Set(),
-    openCanvasIds: () => ['c1'],
-    liveBoardKeys: () => [],
-    hasLiveBoardKey: () => false,
-    deliverLiveBoardMessage: () => false,
-    captureFileSnapshot: () => undefined,
+    agentIdForBoard: () => undefined,
+    deliverLiveAgentMessage: async () => false,
     publishWorkspaceState: ({ canvasIds, snapshotForCanvas }) => {
       publishes += 1;
       for (const canvasId of canvasIds) snapshots.set(canvasId, snapshotForCanvas(canvasId));

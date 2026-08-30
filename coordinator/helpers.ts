@@ -1,5 +1,4 @@
 import * as nodePath from 'path';
-import type { HostServiceContext } from '../../../src/plugin-api/types';
 import { normalizeWorkspacePath, ownerKey } from './model';
 
 const hasWindowsPathSyntax = (p: string): boolean => /^[a-z]:[\\/]/i.test(p) || /^\\\\/.test(p) || p.includes('\\');
@@ -10,8 +9,8 @@ const pathOpsFor = (cwd: string, filePath: string): typeof nodePath.win32 | type
 const isInsideRelative = (ops: typeof nodePath.win32 | typeof nodePath.posix, rel: string): boolean =>
   !!rel && rel !== '..' && !rel.startsWith(`..${ops.sep}`) && !ops.isAbsolute(rel);
 
-// Same board-identity key shape as the host's live-owner / live-board sets — delegated to the model `ownerKey`
-// chokepoint so the `${canvasId}::${boardId}` format has exactly one definition.
+// Coordination-record identity is delegated to the model `ownerKey` so the
+// `${canvasId}::${boardId}` format has exactly one definition.
 export function actorKey(canvasId: string, boardId: string): string {
   return ownerKey({ canvasId, boardId });
 }
@@ -41,14 +40,4 @@ export function coordinationPathList(cwd: string, paths: string[] | undefined): 
     out.push(p);
   }
   return out;
-}
-
-export function sameCanvasLiveBoardKeys(ctx: HostServiceContext, canvasId: string, boardId: string): string[] {
-  const key = actorKey(canvasId, boardId);
-  return ctx.liveBoardKeys().filter((k) => k === key);
-}
-
-export function workspaceStateTargetCanvases(ctx: HostServiceContext, fallbackCanvasId?: string): string[] {
-  const open = ctx.openCanvasIds();
-  return open.length ? open : (fallbackCanvasId ? [fallbackCanvasId] : []);
 }

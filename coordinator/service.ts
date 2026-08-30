@@ -21,10 +21,8 @@ import {
   emptyCoordinationState,
   findClaimConflict,
   findResourceClaimConflict,
-  isLiveOwner,
   markStaleClaims,
   matchResourceTriggers,
-  negotiationOriginatorBoardId,
   projectSnapshot,
   pruneRetiredCoordination,
   releaseBoardClaims,
@@ -42,7 +40,7 @@ import {
   type ResourceClaimRequest,
 } from './model';
 import { createCoordinatorAgentTool, type CoordinateToolRequest } from './agentTool';
-import { actorKey, coordinationPathList, sameCanvasLiveBoardKeys, workspaceStateTargetCanvases } from './helpers';
+import { actorKey, coordinationPathList } from './helpers';
 import { createCoordinatorLiveMessages, createCoordinatorProjectState, createCoordinatorTurnContext } from './hostHooks';
 import manifestJson from './plugin.json';
 import { loadWorkspaceResourceCatalog } from './resources';
@@ -65,6 +63,11 @@ type FileClaimAttempt = {
   matched: boolean;
   paths: string[];
   conflicts: ClaimConflict[];
+};
+
+type BoardTarget = {
+  canvasId: string;
+  boardId: string;
 };
 
 type ResourceWaiter = {
@@ -210,21 +213,41 @@ class CoordinatorHostService implements HostService {
   }
 
   private claimResources(reqs: ResourceClaimRequest[]): ReturnType<typeof claimResourceSet> {
-    return claimResourceSet(this.coordination, reqs, this.ctx.liveOwnerKeys());
+    return claimResourceSet(this.coordination, reqs);
+  }
+
+  private coordinationCanvasIds(originCanvasId?: string): string[] {
+    const canvasIds = new Set<string>();
+    if (originCanvasId) canvasIds.add(originCanvasId);
+    for (const claim of this.coordination.claims) canvasIds.add(claim.canvasId);
+    for (const claim of this.coordination.resourceClaims) canvasIds.add(claim.canvasId);
+    for (const intent of this.coordination.intents) canvasIds.add(intent.canvasId);
+    for (const message of this.coordination.messages) canvasIds.add(message.canvasId);
+    for (const negotiation of this.coordination.negotiations) canvasIds.add(negotiation.canvasId);
+    for (const waiter of this.resourceWaiters.values()) canvasIds.add(waiter.canvasId);
+    for (const waiter of this.fileWaiters.values()) canvasIds.add(waiter.canvasId);
+    return [...canvasIds];
+  }
+
+  private boardTargets(entries: readonly { canvasId: string; boardId: string }[]): BoardTarget[] {
+    const targets = new Map<string, BoardTarget>();
+    for (const entry of entries) {
+      targets.set(`${entry.canvasId}::${entry.boardId}`, { canvasId: entry.canvasId, boardId: entry.boardId });
+    }
+    return [...targets.values()];
   }
 
   private publishCoordination(originCanvasId?: string) {
     const now = Date.now();
-    const liveOwners = this.ctx.liveOwnerKeys();
-    this.coordination = markStaleClaims(this.coordination, now, liveOwners);
+    this.coordination = markStaleClaims(this.coordination, now);
     this.coordination = pruneRetiredCoordination(this.coordination, now); // drop long-dead tombstones (memory-footprint P4)
     this.tryResolveWaiters();
-    const canvasIds = workspaceStateTargetCanvases(this.ctx, originCanvasId);
+    const canvasIds = this.coordinationCanvasIds(originCanvasId);
     this.ctx.publishWorkspaceState({
       pluginId: 'coordinator',
       stateKey: 'coordination',
       canvasIds,
-      snapshotForCanvas: (canvasId) => projectSnapshot(this.coordination, canvasId, now, liveOwners),
+      snapshotForCanvas: (canvasId) => projectSnapshot(this.coordination, canvasId, now),
     });
   }
 
@@ -240,15 +263,14 @@ class CoordinatorHostService implements HostService {
   }
 
   private tryResolveFileWaiters(): boolean {
-    const liveOwners = this.ctx.liveOwnerKeys();
     let changed = false;
     for (const [key, w] of [...this.fileWaiters]) {
-      if (w.signal?.aborted || !isLiveOwner(w.req, liveOwners)) {
-        this.resolveFileWaiter(key, { ok: false, result: 'File wait canceled because the waiting board is no longer live.' });
+      if (w.signal?.aborted) {
+        this.resolveFileWaiter(key, { ok: false, result: 'File wait canceled because the waiting board was stopped.' });
         changed = true;
         continue;
       }
-      const r = claimFile(this.coordination, w.req, liveOwners);
+      const r = claimFile(this.coordination, w.req);
       if (!r.conflict) {
         this.coordination = r.state;
         this.resolveFileWaiter(key, { ok: true, result: `${w.req.path} is now free - you now HOLD its file claim (ACTIVE). Retry only the write gated on this path; this grants no other file or declared resource.` });
@@ -311,12 +333,12 @@ class CoordinatorHostService implements HostService {
   }
 
   private waitBlockerBoardKeys(req: ResourceClaimRequest): string[] {
-    const conflict = findResourceClaimConflict(this.coordination, req, this.ctx.liveOwnerKeys());
+    const conflict = findResourceClaimConflict(this.coordination, req);
     return conflict ? [...new Set(conflict.blocking.map((c) => this.aKey(c.canvasId, c.boardId)))] : [];
   }
 
   private fileWaitBlockerBoardKeys(req: ClaimRequest): string[] {
-    const conflict = findClaimConflict(this.coordination, req, this.ctx.liveOwnerKeys());
+    const conflict = findClaimConflict(this.coordination, req);
     return conflict ? [...new Set(conflict.blocking.map((c) => this.aKey(c.canvasId, c.boardId)))] : [];
   }
 
@@ -324,7 +346,7 @@ class CoordinatorHostService implements HostService {
     const conflict = findResourceClaimConflict(this.coordination, {
       canvasId: claim.canvasId, boardId: claim.boardId, actor: claim.actor, resource: claim.resource,
       mode: claim.mode, desiredState: claim.desiredState, priority: claim.priority,
-    }, this.ctx.liveOwnerKeys());
+    });
     if (!conflict) return [];
     return [...new Set(conflict.blocking.map((c) => c.boardId).filter((id) => id !== claim.boardId))];
   }
@@ -386,7 +408,7 @@ class CoordinatorHostService implements HostService {
 
   private releaseBoard(canvasId: string, boardId: string, summary?: string, transientOnly = false) {
     this.cancelFileWaitersForBoard(canvasId, boardId, 'File wait canceled because the waiting board finished or stopped.');
-    const beforeSnap = snapshotForCanvas(this.coordination, canvasId, Date.now(), this.ctx.liveOwnerKeys());
+    const beforeSnap = snapshotForCanvas(this.coordination, canvasId, Date.now());
     const beforeFiles = beforeSnap.claims.filter((c) => c.boardId === boardId && c.status !== 'released');
     const beforeResources = beforeSnap.resourceClaims.filter((c) =>
       c.boardId === boardId &&
@@ -447,13 +469,13 @@ class CoordinatorHostService implements HostService {
     const paths = [...new Set(conflicts.map((conflict) => conflict.path))];
     const blockingClaims = conflicts.flatMap((conflict) => conflict.blocking);
     const blockers = [...new Set(blockingClaims.map((claim) => claim.boardId))];
-    const blockerKeys = [...new Set(blockingClaims.map((claim) => this.aKey(claim.canvasId, claim.boardId)))];
+    const blockerTargets = this.boardTargets(blockingClaims);
     const pathText = paths.join(', ');
     const orderText = 'Another board needs to edit a file your board claims. A holding board should checkpoint/save and call coordinate release at its next safe tool step if it is done with the file, or reply with an ETA if it needs to keep editing.';
     const negId = `neg-file-${canvasId}-${paths.slice().sort().join('|')}`;
     const conflictKey = `file::${canvasId}::${boardId}::${paths.slice().sort().join('|')}::${blockers.slice().sort().join('|')}`;
     if (this.coordinationConflictKeys.has(conflictKey)) {
-      this.queueLiveFileConflictNotices(canvasId, boardId, blockerKeys, paths, orderText);
+      this.queueLiveFileConflictNotices(canvasId, boardId, blockerTargets, paths, orderText);
       return;
     }
     this.coordinationConflictKeys.add(conflictKey);
@@ -475,7 +497,7 @@ class CoordinatorHostService implements HostService {
       text: `${boardId} attempted to edit ${pathText}. Blocking boards: ${blockers.join(', ')}. ${orderText}`,
       relatedPaths: paths,
     }).state;
-    this.queueLiveFileConflictNotices(canvasId, boardId, blockerKeys, paths, orderText);
+    this.queueLiveFileConflictNotices(canvasId, boardId, blockerTargets, paths, orderText);
   }
 
   private recordResourceConflicts(
@@ -489,7 +511,7 @@ class CoordinatorHostService implements HostService {
     if (!conflicts.length) return;
     const blockingClaims = conflicts.flatMap((conflict) => conflict.blocking);
     const blockers = [...new Set(blockingClaims.map((c) => c.boardId))];
-    const blockerKeys = [...new Set(blockingClaims.map((c) => this.aKey(c.canvasId, c.boardId)))];
+    const blockerTargets = this.boardTargets(blockingClaims);
     const relatedResources = [...new Set([...claims.map((c) => c.resource), ...conflicts.map((c) => c.resource)])];
     const claimText = claims.map((claim) => this.describeResourceClaim(claim)).join(', ');
     const highPriority = claims.some((claim) => claim.priority === 'high');
@@ -500,7 +522,7 @@ class CoordinatorHostService implements HostService {
     const negId = `neg-res-${canvasId}-${relatedResources.slice().sort().join('|')}`;
     const conflictKey = `${canvasId}::${relatedResources.slice().sort().join('|')}::${blockers.slice().sort().join('|')}`;
     if (this.coordinationConflictKeys.has(conflictKey)) {
-      this.queueLiveResourceConflictNotices(canvasId, boardId, blockerKeys, claims, relatedResources, highPriority, orderText);
+      this.queueLiveResourceConflictNotices(canvasId, boardId, blockerTargets, claims, relatedResources, highPriority, orderText);
       return;
     }
     this.coordinationConflictKeys.add(conflictKey);
@@ -522,32 +544,36 @@ class CoordinatorHostService implements HostService {
       text: `${summary ?? requestText}. Blocking boards: ${blockers.join(', ')}. ${orderText}`,
       relatedResources,
     }).state;
-    this.queueLiveResourceConflictNotices(canvasId, boardId, blockerKeys, claims, relatedResources, highPriority, orderText);
+    this.queueLiveResourceConflictNotices(canvasId, boardId, blockerTargets, claims, relatedResources, highPriority, orderText);
   }
 
   private queueLiveResourceConflictNotices(
     canvasId: string,
     requestingBoardId: string,
-    targetKeys: string[],
+    targets: readonly BoardTarget[],
     claims: ResourceClaim[],
     relatedResources: string[],
     highPriority: boolean,
     orderText: string,
   ) {
-    if (!targetKeys.length) return;
-    const requestingKey = this.aKey(canvasId, requestingBoardId);
+    if (!targets.length) return;
     const claimText = claims.map((claim) => this.describeResourceClaim(claim)).join(', ');
     const resourcesText = relatedResources.join(', ');
     const guidance = highPriority
       ? 'This is a high-priority resource request. Checkpoint the conflicting work, release the resource when safe, let the high-priority work run, then resume.'
       : orderText;
-    for (const targetKey of targetKeys) {
-      if (targetKey === requestingKey || !this.ctx.hasLiveBoardKey(targetKey)) continue;
-      const noticeKeys = relatedResources.map((r) => `${targetKey}::res::${r}::${highPriority ? 'hi' : 'lo'}`);
+    for (const target of targets) {
+      if (target.canvasId === canvasId && target.boardId === requestingBoardId) continue;
+      const agentId = this.ctx.agentIdForBoard(target.canvasId, target.boardId);
+      if (!agentId) continue;
+      const noticeKeys = relatedResources.map((r) => (
+        `${target.canvasId}::${target.boardId}::res::${r}::${highPriority ? 'hi' : 'lo'}`
+      ));
       if (noticeKeys.length && noticeKeys.every((k) => this.coordinationNoticeKeys.has(k))) continue;
-      const delivered = this.ctx.deliverLiveBoardMessage({
-        canvasId,
-        targetKey,
+      const delivered = this.ctx.deliverLiveAgentMessage({
+        agentId,
+        canvasId: target.canvasId,
+        boardId: target.boardId,
         fromBoardId: requestingBoardId,
         kind: 'coordination.notice',
         injected: true,
@@ -566,21 +592,23 @@ class CoordinatorHostService implements HostService {
   private queueLiveFileConflictNotices(
     canvasId: string,
     requestingBoardId: string,
-    targetKeys: string[],
+    targets: readonly BoardTarget[],
     paths: string[],
     guidance: string,
   ) {
-    if (!targetKeys.length) return;
-    const requestingKey = this.aKey(canvasId, requestingBoardId);
+    if (!targets.length) return;
     const pathText = paths.join(', ');
     const pathKey = paths.slice().sort().join('|');
-    for (const targetKey of targetKeys) {
-      if (targetKey === requestingKey || !this.ctx.hasLiveBoardKey(targetKey)) continue;
-      const noticeKey = `file::${targetKey}::${requestingKey}::${pathKey}`;
+    for (const target of targets) {
+      if (target.canvasId === canvasId && target.boardId === requestingBoardId) continue;
+      const agentId = this.ctx.agentIdForBoard(target.canvasId, target.boardId);
+      if (!agentId) continue;
+      const noticeKey = `file::${target.canvasId}::${target.boardId}::${canvasId}::${requestingBoardId}::${pathKey}`;
       if (this.coordinationNoticeKeys.has(noticeKey)) continue;
-      const delivered = this.ctx.deliverLiveBoardMessage({
-        canvasId,
-        targetKey,
+      const delivered = this.ctx.deliverLiveAgentMessage({
+        agentId,
+        canvasId: target.canvasId,
+        boardId: target.boardId,
         fromBoardId: requestingBoardId,
         kind: 'coordination.notice',
         injected: true,
@@ -601,28 +629,18 @@ class CoordinatorHostService implements HostService {
 
   private coordinationContextForBoard(canvasId: string, boardId: string): string {
     this.syncWorkspaceResources();
-    const liveOwners = this.ctx.liveOwnerKeys();
-    const snapshot = projectSnapshot(this.coordination, canvasId, Date.now(), liveOwners);
-    // Part B (liveness backstop): only INJECT a request/negotiation while its ORIGINATING board is a live owner.
-    // Once that board's session is gone (settled/released, not live), its request is a leftover that must not be
-    // narrated to other boards as an active contender. Applied here (agent-facing context) only — the published
-    // snapshot stays the full ledger; Part A keeps it truthful. Claims have their own liveness (markStaleClaims).
-    const ownerLive = (cid: string, bid: string | undefined): boolean => !!bid && isLiveOwner({ canvasId: cid, boardId: bid }, liveOwners);
+    const snapshot = projectSnapshot(this.coordination, canvasId, Date.now());
     const isOwn = (c: { canvasId: string; boardId: string }) => c.canvasId === canvasId && c.boardId === boardId;
-    // D21 (file-claim liveness parity): drop OTHER boards' file locks from the agent-facing context once their
-    // owning board is no longer a live owner — a settled board's leftover edit-lock must not be narrated as held
-    // (it self-heals at run-end / TTL). Keep the recipient's OWN claims. Mirrors the Part B gate on messages/negs.
-    const activeFiles = snapshot.claims.filter((claim) =>
-      claim.status !== 'released' && (isOwn(claim) || ownerLive(claim.canvasId, claim.boardId)));
+    // Plugin context is not allowed to query Board execution presence. TTL and explicit release are the only
+    // coordination-state liveness signals; delivery itself resolves an exact Runtime Agent separately.
+    const activeFiles = snapshot.claims.filter((claim) => claim.status !== 'released');
     const ownFiles = activeFiles.filter(isOwn);
     const otherFiles = activeFiles
       .filter((claim) => !isOwn(claim))
       .sort((a, b) => a.boardId.localeCompare(b.boardId) || a.path.localeCompare(b.path))
       .slice(0, 4);
-    // Liveness divergence (ADR-8/ADR-10, deliberate): resource context injection is intentionally NOT gated by
-    // `ownerLive` (unlike the file filter above). Non-live + expired resource claims are already downgraded to
-    // `stale` by `markStaleClaims` inside `projectSnapshot`; a non-live owner's still-within-TTL resource claim is
-    // left visible here on purpose ("保留现语义 / 不收紧资源"). Closing this asymmetry = add `&& ownerLive(...)` here.
+    // Expired resource claims become `stale` through `markStaleClaims`; within-TTL records remain visible as
+    // coordination facts without consulting a Board execution-presence hint.
     const activeResources = snapshot.resourceClaims.filter((claim) => claim.status !== 'released');
     const ownResources = activeResources.filter(isOwn);
     const ownPending = ownResources.filter((claim) => claim.status === 'pending');
@@ -643,16 +661,12 @@ class CoordinatorHostService implements HostService {
       .filter((message) =>
         !(message.canvasId === canvasId && message.fromBoardId === boardId) &&
         !releaseSuperseded(message) &&
-        // Part B: a conflict(note)/request(question) message from a board that is no longer live is a leftover.
-        ((message.kind !== 'note' && message.kind !== 'question') || ownerLive(message.canvasId, message.fromBoardId)) &&
         (!message.toBoardId || message.toBoardId === boardId || message.relatedResources.some((resource) => resourcesInView.has(resource))))
       .slice(-2);
     const negotiations = snapshot.negotiations
       .filter((thread) =>
         thread.status !== 'resolved' &&
         thread.status !== 'rejected' &&
-        // Part B: only surface a negotiation while its originating (requesting) board is still a live owner.
-        ownerLive(thread.canvasId, negotiationOriginatorBoardId(thread)) &&
         (thread.boardIds.includes(boardId) ||
           thread.relatedResources.some((resource) => resourcesInView.has(resource)) ||
           thread.relatedPaths.some((path) => ownFiles.some((claim) => claim.path === path) || otherFiles.some((claim) => claim.path === path))))
@@ -716,12 +730,10 @@ class CoordinatorHostService implements HostService {
     if (!rawPaths.length) return { matched: false, paths: [], conflicts: [] };
     const paths = this.coordinationPathList(rawPaths);
     if (!paths.length) return { matched: false, paths: [], conflicts: [] };
-    // A liveness-only holder disappearance has no lifecycle event of its own. Drain the
-    // already-queued file waiters before a newcomer can claim the newly free path.
+    // Drain queued file waiters before a newcomer can claim the newly free path.
     this.tryResolveFileWaiters();
     const actor = this.topLevelActor(boardId, provider);
     const now = Date.now();
-    const liveOwners = this.ctx.liveOwnerKeys();
     const requests = paths.map((path) => ({
       canvasId,
       boardId,
@@ -732,7 +744,7 @@ class CoordinatorHostService implements HostService {
       now,
     }));
     const conflicts = requests
-      .map((req) => findClaimConflict(this.coordination, req, liveOwners))
+      .map((req) => findClaimConflict(this.coordination, req))
       .filter((conflict): conflict is ClaimConflict => !!conflict);
     if (conflicts.length) {
       this.recordFileConflicts(canvasId, boardId, actor, conflicts);
@@ -748,7 +760,7 @@ class CoordinatorHostService implements HostService {
         access: 'edit',
         summary: `${toolName} write`,
         now,
-      }, liveOwners);
+      });
       this.coordination = result.state;
       if (result.conflict) {
         this.recordFileConflicts(canvasId, boardId, actor, [result.conflict]);
@@ -873,15 +885,17 @@ class CoordinatorHostService implements HostService {
       }).state;
       let delivered = false;
       if (req.toBoardId) {
-        for (const key of sameCanvasLiveBoardKeys(this.ctx, canvasId, req.toBoardId)) {
-          delivered = await this.ctx.deliverLiveBoardMessage({
+        const agentId = this.ctx.agentIdForBoard(canvasId, req.toBoardId);
+        if (agentId) {
+          delivered = await this.ctx.deliverLiveAgentMessage({
+            agentId,
             canvasId,
-            targetKey: key,
+            boardId: req.toBoardId,
             fromBoardId: rb,
             kind: 'coordination.request',
             injected: true,
             text: `[Braid coordination request]\nBoard ${rb} asks: ${text}${req.resource ? ` (re: ${req.resource})` : ''}\nIf you can, SAVE then call coordinate release at your NEXT safe tool step (you need not finish your turn). If you still need it afterwards, call coordinate wait on it right after releasing to auto-resume when it frees, then reopen/reload and continue. Otherwise reply with your own coordinate request (e.g. an ETA).`,
-          }) || delivered;
+          });
         }
       }
       this.publishCoordination(canvasId);
@@ -908,10 +922,9 @@ class CoordinatorHostService implements HostService {
         access: 'edit',
         summary: req.summary ?? 'Agent-requested file wait.',
       };
-      // Preserve waiter FIFO when holder liveness changed without a lifecycle edge:
-      // queued waiters get first chance before this newcomer attempts the same path.
+      // Preserve waiter FIFO: queued waiters get first chance before this newcomer attempts the same path.
       this.tryResolveFileWaiters();
-      const initial = claimFile(this.coordination, claimReq, this.ctx.liveOwnerKeys());
+      const initial = claimFile(this.coordination, claimReq);
       if (!initial.conflict) {
         this.coordination = initial.state;
         this.publishCoordination(canvasId);

@@ -207,7 +207,7 @@ describe('plan parse', () => {
       'Phase 1: Plugin aggregate and event-state primitive (host-owned; append/order/replay).',
       'Phase 2: Board-to-board message envelope and correlation lifecycle.',
       'Phase 3: Atomic visible board materialization transaction.',
-      'Phase 4: Aggregate-level run controller and lifecycle fan-in.',
+      'Phase 4: Aggregate-level run controller and typed settlement handoff.',
       'Phase 5: Scoped context substrate for aggregate-owned intel and status.',
       'Phase 6: Plugin semantic graph projection for non-lineage edges.',
       'Phase 7: Orchestration cutover + negative proof old ownership is gone.',

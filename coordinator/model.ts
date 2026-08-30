@@ -469,29 +469,15 @@ const activeAt = (claim: { status: ClaimStatus; expiresAt?: number }, now: numbe
 const liveAt = (claim: { status: ClaimStatus; expiresAt?: number }, now: number): boolean =>
   (claim.status === 'active' || claim.status === 'pending') && (claim.expiresAt == null || claim.expiresAt > now);
 
-// Liveness chokepoint (SSOT). `ownerKey` builds the host's `${canvasId}::${boardId}` owner key; `isLiveOwner` tests
-// membership in the host-supplied live-owner set. EVERY read path that gates on owner-liveness — file/resource
-// enforcement, the `markStaleClaims` TTL backstop, and the agent-context filters in service.ts — MUST go through
-// these, so a new claim type / read path can't silently omit the gate or re-derive the key with the wrong field
-// shape (e.g. `fromBoardId`, negotiation originator) — the failure mode behind every recurring zombie-lock bug
-// (D12/D14/D15/D21). `liveOwners` is optional: when the caller doesn't track liveness (legacy / direct unit callers)
-// `isLiveOwner` is false, so each path falls back to its old TTL-only behavior unchanged.
+/** Stable coordination-record key; never an execution selector. */
 export function ownerKey(entry: { canvasId: string; boardId: string }): string {
   return `${entry.canvasId}::${entry.boardId}`;
-}
-export function isLiveOwner(entry: { canvasId: string; boardId: string }, liveOwners?: ReadonlySet<string>): boolean {
-  return !!liveOwners && liveOwners.has(ownerKey(entry));
 }
 
 const touchesSamePath = (a: string, b: string): boolean => normalizeWorkspacePath(a) === normalizeWorkspacePath(b);
 
-export function compatibleClaims(existing: FileClaim, req: ClaimRequest, now: number, liveOwners?: ReadonlySet<string>): boolean {
+export function compatibleClaims(existing: FileClaim, req: ClaimRequest, now: number): boolean {
   if (!activeAt(existing, now)) return true;
-  // D21 (file-claim liveness parity): a file edit-lock is only honored while its OWNING board is a live owner (the
-  // host supplies `liveOwners`). A settled board's leftover lock must NOT block a live board — it is released on
-  // run-end (D15); this is the self-healing backstop for a missed/late release, mirroring resource liveness (D14).
-  // When `liveOwners` is omitted (legacy / direct unit callers) the old TTL-only behavior is kept.
-  if (liveOwners && !isLiveOwner(existing, liveOwners)) return true;
   if (!touchesSamePath(existing.path, req.path)) return true;
   // Cross-canvas: a board only "re-enters" its OWN claim. Board ids are per-canvas (the webview mints `b${n}`
   // from a per-canvas counter, so ids collide across canvases) → the owner is the (canvasId, boardId) pair. (cross-canvas)
@@ -499,12 +485,12 @@ export function compatibleClaims(existing: FileClaim, req: ClaimRequest, now: nu
   return existing.access === 'read' && req.access === 'read';
 }
 
-export function findClaimConflict(state: CoordinationState, req: ClaimRequest, liveOwners?: ReadonlySet<string>): ClaimConflict | null {
+export function findClaimConflict(state: CoordinationState, req: ClaimRequest): ClaimConflict | null {
   const now = req.now ?? Date.now();
   const path = normalizeWorkspacePath(req.path);
   // Cross-canvas: file conflicts span every canvas in the project (shared filesystem). `compatibleClaims`
   // scopes "own board" by the (canvasId, boardId) pair, so a different board in another canvas still conflicts.
-  const blocking = state.claims.filter((claim) => !compatibleClaims(claim, { ...req, path }, now, liveOwners));
+  const blocking = state.claims.filter((claim) => !compatibleClaims(claim, { ...req, path }, now));
   if (!blocking.length) return null;
   return {
     path,
@@ -514,10 +500,10 @@ export function findClaimConflict(state: CoordinationState, req: ClaimRequest, l
   };
 }
 
-export function claimFile(state: CoordinationState, req: ClaimRequest, liveOwners?: ReadonlySet<string>): { state: CoordinationState; claim?: FileClaim; conflict?: ClaimConflict } {
+export function claimFile(state: CoordinationState, req: ClaimRequest): { state: CoordinationState; claim?: FileClaim; conflict?: ClaimConflict } {
   const now = req.now ?? Date.now();
   const path = normalizeWorkspacePath(req.path);
-  const conflict = findClaimConflict(state, { ...req, path, now }, liveOwners);
+  const conflict = findClaimConflict(state, { ...req, path, now });
   if (conflict) return { state, conflict };
 
   const existing = state.claims.find((claim) =>
@@ -605,23 +591,18 @@ function normalizeResourceClaimRequest(
   };
 }
 
-function resourceClaimBlocks(existing: ResourceClaim, reqPriority: ResourcePriority, now: number, liveOwners?: ReadonlySet<string>): boolean {
-  // D14 (liveness-true claims): a claim whose OWNING board's run is LIVE (streaming / async-waiting — the host
-  // supplies the set) never expires via the 10-min TTL while live; a claim whose owner is NOT live falls back to
-  // the TTL (orphan backstop for host-restart / crash leftovers). Without a liveOwners set this is the old
-  // TTL-only behavior (callers that don't track liveness, e.g. tests).
-  const ownerLive = isLiveOwner(existing, liveOwners);
-  const stillActive = existing.status === 'active' && (ownerLive || existing.expiresAt == null || existing.expiresAt > now);
+function resourceClaimBlocks(existing: ResourceClaim, reqPriority: ResourcePriority, now: number): boolean {
+  const stillActive = existing.status === 'active' && (existing.expiresAt == null || existing.expiresAt > now);
   if (stillActive) return true;
-  const stillPending = existing.status === 'pending' && (ownerLive || existing.expiresAt == null || existing.expiresAt > now);
+  const stillPending = existing.status === 'pending' && (existing.expiresAt == null || existing.expiresAt > now);
   if (!stillPending) return false;
   return resourcePriorityValue(existing.priority) > resourcePriorityValue('normal') &&
     resourcePriorityValue(existing.priority) >= resourcePriorityValue(reqPriority);
 }
 
-export function compatibleResourceClaims(existing: ResourceClaim, req: ResourceClaimRequest, now: number, liveOwners?: ReadonlySet<string>): boolean {
+export function compatibleResourceClaims(existing: ResourceClaim, req: ResourceClaimRequest, now: number): boolean {
   const reqPriority = req.priority ?? 'normal';
-  if (!resourceClaimBlocks(existing, reqPriority, now, liveOwners)) return true;
+  if (!resourceClaimBlocks(existing, reqPriority, now)) return true;
   if (existing.resource !== normalizeResourceKey(req.resource)) return true;
   if (existing.canvasId === req.canvasId && existing.boardId === req.boardId) return true; // own (canvasId,boardId) re-entry — board ids collide across canvases
   const mode = req.mode ?? 'shared';
@@ -629,12 +610,12 @@ export function compatibleResourceClaims(existing: ResourceClaim, req: ResourceC
   return !resourceStateConflict(existing.desiredState, normalizeResourceState(req.desiredState));
 }
 
-export function findResourceClaimConflict(state: CoordinationState, req: ResourceClaimRequest, liveOwners?: ReadonlySet<string>): ResourceClaimConflict | null {
+export function findResourceClaimConflict(state: CoordinationState, req: ResourceClaimRequest): ResourceClaimConflict | null {
   const now = req.now ?? Date.now();
   const normalizedReq = normalizeResourceClaimRequest(state, req, now);
   const { resource, mode } = normalizedReq;
   // Cross-canvas: resource conflicts span every canvas in the project (shared editor/build/etc.).
-  const blocking = state.resourceClaims.filter((claim) => !compatibleResourceClaims(claim, normalizedReq, now, liveOwners));
+  const blocking = state.resourceClaims.filter((claim) => !compatibleResourceClaims(claim, normalizedReq, now));
   if (!blocking.length) return null;
   return {
     resource,
@@ -740,12 +721,11 @@ function upsertResourceClaim(
 export function claimResourceSet(
   state: CoordinationState,
   reqs: ResourceClaimRequest[],
-  liveOwners?: ReadonlySet<string>,
 ): { state: CoordinationState; claims: ResourceClaim[]; conflicts: ResourceClaimConflict[] } {
   const expanded = expandResourceClaimRequests(state, reqs);
   if (!expanded.length) return { state, claims: [], conflicts: [] };
   const conflicts = expanded
-    .map((req) => findResourceClaimConflict(state, req, liveOwners))
+    .map((req) => findResourceClaimConflict(state, req))
     .filter((conflict): conflict is ResourceClaimConflict => !!conflict);
   const status: 'active' | 'pending' = conflicts.length ? 'pending' : 'active';
   let next = state;
@@ -761,9 +741,8 @@ export function claimResourceSet(
 export function claimResource(
   state: CoordinationState,
   req: ResourceClaimRequest,
-  liveOwners?: ReadonlySet<string>,
 ): { state: CoordinationState; claim?: ResourceClaim; conflict?: ResourceClaimConflict } {
-  const result = claimResourceSet(state, [req], liveOwners);
+  const result = claimResourceSet(state, [req]);
   return { state: result.state, claim: result.claims[0], conflict: result.conflicts[0] };
 }
 
@@ -810,19 +789,16 @@ export function cleanupCanvas(state: CoordinationState, canvasId: string): Coord
   };
 }
 
-export function markStaleClaims(state: CoordinationState, now = Date.now(), liveOwners?: ReadonlySet<string>): CoordinationState {
-  // D14/D21: a LIVE owner's claim must NOT be staled by the 10-min TTL while the board is running — otherwise it
-  // leaves `active`/`pending` and the liveness override (which only applies to active/pending) can never fire,
-  // silently defeating liveness-true blocking. The TTL stays an ORPHAN backstop: a non-live owner's expired claim
-  // still goes stale. D21 brings FILE claims to the same parity (was TTL-only): a live owner keeps its edit-lock
-  // past the TTL, and a non-live owner's expired lock goes stale.
+export function markStaleClaims(state: CoordinationState, now = Date.now()): CoordinationState {
+  // TTL is the only coordination-record expiry authority. Runtime Agent identity is used only at live-message
+  // delivery ingress and must not be inferred from a Board claim.
   // memory-footprint Phase 4: this runs on EVERY publishCoordination (per coordination change / matched tool),
   // so SHORT-CIRCUIT when nothing actually transitions — `.some()` allocates nothing, and returning the same
   // `state` ref avoids cloning both full arrays + every claim object on the hot path. Behavior-preserving.
   const fileStale = (claim: FileClaim) =>
-    claim.status === 'active' && claim.expiresAt != null && claim.expiresAt <= now && !isLiveOwner(claim, liveOwners);
+    claim.status === 'active' && claim.expiresAt != null && claim.expiresAt <= now;
   const resStale = (claim: ResourceClaim) =>
-    (claim.status === 'active' || claim.status === 'pending') && claim.expiresAt != null && claim.expiresAt <= now && !isLiveOwner(claim, liveOwners);
+    (claim.status === 'active' || claim.status === 'pending') && claim.expiresAt != null && claim.expiresAt <= now;
   const anyFile = state.claims.some(fileStale);
   const anyRes = state.resourceClaims.some(resStale);
   if (!anyFile && !anyRes) return state; // nothing expired → no allocation
@@ -996,9 +972,8 @@ export function snapshotForCanvas(
   state: CoordinationState,
   canvasId: string,
   now = Date.now(),
-  liveOwners?: ReadonlySet<string>,
 ): CoordinationSnapshot {
-  const marked = markStaleClaims(state, now, liveOwners);
+  const marked = markStaleClaims(state, now);
   return {
     canvasId,
     claims: marked.claims.filter((claim) => claim.canvasId === canvasId && claim.status !== 'released'),
@@ -1019,9 +994,8 @@ export function projectSnapshot(
   state: CoordinationState,
   canvasId: string,
   now = Date.now(),
-  liveOwners?: ReadonlySet<string>,
 ): CoordinationSnapshot {
-  const marked = markStaleClaims(state, now, liveOwners);
+  const marked = markStaleClaims(state, now);
   return {
     canvasId,
     claims: marked.claims.filter((claim) => claim.status !== 'released'),
