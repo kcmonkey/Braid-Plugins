@@ -71,6 +71,12 @@ export interface ResourceClaim {
   summary?: string;
 }
 
+/** Task-owned claims live in the same foundation ledger, without Board/Canvas attribution or TTL. */
+export interface TaskResourceClaim extends Omit<ResourceClaim, 'canvasId' | 'boardId' | 'actor' | 'expiresAt'> {
+  taskId: string;
+  label: string;
+}
+
 export interface ResourceClaimConflict {
   resource: string;
   requestedBy: CoordinationActor;
@@ -78,6 +84,7 @@ export interface ResourceClaimConflict {
   requestedState?: string;
   requestedPriority: ResourcePriority;
   blocking: ResourceClaim[];
+  taskBlocking?: TaskResourceClaim[];
 }
 
 export interface WorkspaceResourceRequirement {
@@ -172,6 +179,7 @@ export interface CoordinationSnapshot {
   canvasId: string;
   claims: FileClaim[];
   resourceClaims: ResourceClaim[];
+  taskResourceClaims: TaskResourceClaim[];
   resources: WorkspaceResource[];
   intents: WorkIntent[];
   messages: BoardMessage[];
@@ -183,6 +191,7 @@ export interface CoordinationSnapshot {
 export interface CoordinationState {
   claims: FileClaim[];
   resourceClaims: ResourceClaim[];
+  taskResourceClaims: TaskResourceClaim[];
   resources: WorkspaceResource[];
   intents: WorkIntent[];
   messages: BoardMessage[];
@@ -202,10 +211,7 @@ export interface ClaimRequest {
   summary?: string;
 }
 
-export interface ResourceClaimRequest {
-  canvasId: string;
-  boardId: string;
-  actor?: CoordinationActor;
+export interface ResourceRequirementRequest {
   resource: string;
   mode?: ResourceClaimMode;
   desiredState?: string;
@@ -213,7 +219,20 @@ export interface ResourceClaimRequest {
   requiredBy?: string;
   now?: number;
   ttlMs?: number;
+  /** Stable arrival time used to order equal-priority pending claims. */
+  queuedAt?: number;
   summary?: string;
+}
+
+export interface ResourceClaimRequest extends ResourceRequirementRequest {
+  canvasId: string;
+  boardId: string;
+  actor?: CoordinationActor;
+}
+
+export interface TaskResourceClaimRequest extends ResourceRequirementRequest {
+  taskId: string;
+  label: string;
 }
 
 export interface WorkIntentInput {
@@ -264,6 +283,7 @@ const DEFAULT_TTL_MS = 10 * 60_000;
 export const emptyCoordinationState = (): CoordinationState => ({
   claims: [],
   resourceClaims: [],
+  taskResourceClaims: [],
   resources: [],
   intents: [],
   messages: [],
@@ -571,12 +591,12 @@ function resourcePriorityFor(
     'normal';
 }
 
-function normalizeResourceClaimRequest(
+function normalizeResourceClaimRequest<T extends ResourceRequirementRequest>(
   state: CoordinationState,
-  req: ResourceClaimRequest,
+  req: T,
   now = req.now ?? Date.now(),
   inheritedPriority?: ResourcePriority,
-): ResourceClaimRequest & { mode: ResourceClaimMode; priority: ResourcePriority; now: number } {
+): T & { mode: ResourceClaimMode; priority: ResourcePriority; now: number } {
   const resource = normalizeResourceKey(req.resource);
   const desiredState = normalizeResourceState(req.desiredState);
   const priority = resourcePriorityFor(state, resource, req.priority, inheritedPriority);
@@ -591,7 +611,7 @@ function normalizeResourceClaimRequest(
   };
 }
 
-function resourceClaimBlocks(existing: ResourceClaim, reqPriority: ResourcePriority, now: number): boolean {
+function resourceClaimBlocks(existing: Pick<ResourceClaim, 'status' | 'expiresAt' | 'priority'>, reqPriority: ResourcePriority, now: number): boolean {
   const stillActive = existing.status === 'active' && (existing.expiresAt == null || existing.expiresAt > now);
   if (stillActive) return true;
   const stillPending = existing.status === 'pending' && (existing.expiresAt == null || existing.expiresAt > now);
@@ -600,23 +620,31 @@ function resourceClaimBlocks(existing: ResourceClaim, reqPriority: ResourcePrior
     resourcePriorityValue(existing.priority) >= resourcePriorityValue(reqPriority);
 }
 
-export function compatibleResourceClaims(existing: ResourceClaim, req: ResourceClaimRequest, now: number): boolean {
+function resourceModesCompatible(existing: Pick<ResourceClaim, 'resource' | 'mode' | 'desiredState' | 'status' | 'expiresAt' | 'priority' | 'createdAt'>, req: ResourceRequirementRequest, now: number): boolean {
   const reqPriority = req.priority ?? 'normal';
   if (!resourceClaimBlocks(existing, reqPriority, now)) return true;
+  // Equal timestamps are admitted in synchronous claim-update order, avoiding mutual pending reservations.
+  if (existing.status === 'pending' && existing.priority === reqPriority && existing.createdAt >= (req.queuedAt ?? now)) return true;
   if (existing.resource !== normalizeResourceKey(req.resource)) return true;
-  if (existing.canvasId === req.canvasId && existing.boardId === req.boardId) return true; // own (canvasId,boardId) re-entry — board ids collide across canvases
   const mode = req.mode ?? 'shared';
   if (existing.mode === 'exclusive' || mode === 'exclusive') return false;
   return !resourceStateConflict(existing.desiredState, normalizeResourceState(req.desiredState));
 }
 
+export function compatibleResourceClaims(existing: ResourceClaim, req: ResourceClaimRequest, now: number): boolean {
+  if (existing.canvasId === req.canvasId && existing.boardId === req.boardId) return true;
+  return resourceModesCompatible(existing, req, now);
+}
+
 export function findResourceClaimConflict(state: CoordinationState, req: ResourceClaimRequest): ResourceClaimConflict | null {
   const now = req.now ?? Date.now();
-  const normalizedReq = normalizeResourceClaimRequest(state, req, now);
+  const own = state.resourceClaims.find((claim) => claim.canvasId === req.canvasId && claim.boardId === req.boardId && claim.resource === normalizeResourceKey(req.resource) && claim.status !== 'released');
+  const normalizedReq = normalizeResourceClaimRequest(state, { ...req, queuedAt: own?.createdAt ?? req.queuedAt ?? now }, now);
   const { resource, mode } = normalizedReq;
   // Cross-canvas: resource conflicts span every canvas in the project (shared editor/build/etc.).
   const blocking = state.resourceClaims.filter((claim) => !compatibleResourceClaims(claim, normalizedReq, now));
-  if (!blocking.length) return null;
+  const taskBlocking = (state.taskResourceClaims ?? []).filter((claim) => !resourceModesCompatible(claim, normalizedReq, now));
+  if (!blocking.length && !taskBlocking.length) return null;
   return {
     resource,
     requestedBy: req.actor ?? { boardId: req.boardId, kind: 'topLevel' },
@@ -624,13 +652,14 @@ export function findResourceClaimConflict(state: CoordinationState, req: Resourc
     requestedState: normalizedReq.desiredState,
     requestedPriority: normalizedReq.priority,
     blocking,
+    ...(taskBlocking.length ? { taskBlocking } : {}),
   };
 }
 
-function expandResourceClaimRequests(state: CoordinationState, reqs: ResourceClaimRequest[]): ResourceClaimRequest[] {
-  const out: ResourceClaimRequest[] = [];
+function expandResourceClaimRequests<T extends ResourceRequirementRequest>(state: CoordinationState, reqs: T[]): T[] {
+  const out: T[] = [];
   const seen = new Set<string>();
-  const visit = (req: ResourceClaimRequest, inheritedPriority?: ResourcePriority, requiredBy?: string, expandRequirements = true) => {
+  const visit = (req: T, inheritedPriority?: ResourcePriority, requiredBy?: string, expandRequirements = true) => {
     const now = req.now ?? Date.now();
     const normalized = normalizeResourceClaimRequest(
       state,
@@ -639,7 +668,8 @@ function expandResourceClaimRequests(state: CoordinationState, reqs: ResourceCla
       inheritedPriority,
     );
     if (!normalized.resource) return;
-    const key = `${normalized.canvasId}:${normalized.boardId}:${normalized.resource}:${normalized.mode}:${normalized.desiredState ?? ''}:${normalized.requiredBy ?? ''}`;
+    const owner = 'taskId' in normalized ? normalized.taskId : 'boardId' in normalized ? `${'canvasId' in normalized ? normalized.canvasId : ''}:${normalized.boardId}` : '';
+    const key = `${owner}:${normalized.resource}:${normalized.mode}:${normalized.desiredState ?? ''}:${normalized.requiredBy ?? ''}`;
     if (!seen.has(key)) {
       seen.add(key);
       out.push(normalized);
@@ -647,9 +677,7 @@ function expandResourceClaimRequests(state: CoordinationState, reqs: ResourceCla
     const descriptor = expandRequirements ? workspaceResourceFor(state, normalized.resource) : undefined;
     for (const requirement of descriptor?.requires ?? []) {
       visit({
-        canvasId: normalized.canvasId,
-        boardId: normalized.boardId,
-        actor: normalized.actor,
+        ...normalized,
         resource: requirement.resource,
         mode: requirement.mode,
         desiredState: requirement.desiredState,
@@ -662,6 +690,72 @@ function expandResourceClaimRequests(state: CoordinationState, reqs: ResourceCla
   };
   for (const req of reqs) visit(req);
   return out;
+}
+
+export function claimTaskResourceSet(state: CoordinationState, reqs: TaskResourceClaimRequest[]): {
+  state: CoordinationState;
+  claims: TaskResourceClaim[];
+  blocking: ResourceClaim[];
+  taskBlocking: TaskResourceClaim[];
+} {
+  const requestsByResource = new Map<string, TaskResourceClaimRequest>();
+  for (const req of expandResourceClaimRequests(state, reqs)) {
+    const key = `${req.taskId}:${req.resource}`;
+    const existing = requestsByResource.get(key);
+    if (existing && resourceStateConflict(existing.desiredState, req.desiredState)) {
+      throw new Error(`Conflicting states requested for ${req.resource}.`);
+    }
+    requestsByResource.set(key, existing ? {
+      ...existing,
+      mode: existing.mode === 'exclusive' || req.mode === 'exclusive' ? 'exclusive' : req.mode,
+      desiredState: req.desiredState ?? existing.desiredState,
+      priority: resourcePriorityValue(req.priority) > resourcePriorityValue(existing.priority) ? req.priority : existing.priority,
+    } : req);
+  }
+  const expanded = [...requestsByResource.values()];
+  const blocking: ResourceClaim[] = [];
+  const taskBlocking: TaskResourceClaim[] = [];
+  for (const req of expanded) {
+    if (!workspaceResourceFor(state, req.resource)) throw new Error(`Undeclared workspace resource: ${req.resource}`);
+    const own = (state.taskResourceClaims ?? []).find((claim) => claim.taskId === req.taskId && claim.resource === normalizeResourceKey(req.resource));
+    const normalized = normalizeResourceClaimRequest(state, { ...req, queuedAt: own?.createdAt ?? req.queuedAt ?? Date.now() });
+    blocking.push(...state.resourceClaims.filter((claim) => !resourceModesCompatible(claim, normalized, normalized.now)));
+    taskBlocking.push(...(state.taskResourceClaims ?? []).filter((claim) =>
+      claim.taskId !== req.taskId && !resourceModesCompatible(claim, normalized, normalized.now)));
+  }
+  const status = blocking.length || taskBlocking.length ? 'pending' as const : 'active' as const;
+  let seq = state.seq;
+  const claims = expanded.map((req): TaskResourceClaim => {
+    const normalized = normalizeResourceClaimRequest(state, req);
+    const existing = (state.taskResourceClaims ?? []).find((claim) => claim.taskId === req.taskId && claim.resource === normalized.resource);
+    return {
+      id: existing?.id ?? `task-res-${++seq}`,
+      taskId: req.taskId,
+      label: req.label,
+      resource: normalized.resource,
+      mode: normalized.mode,
+      desiredState: normalized.desiredState,
+      priority: normalized.priority,
+      requiredBy: normalized.requiredBy,
+      status,
+      createdAt: existing?.createdAt ?? normalized.now,
+      updatedAt: normalized.now,
+      summary: normalized.summary,
+    };
+  });
+  const taskIds = new Set(reqs.map((req) => req.taskId));
+  return {
+    state: {
+      ...state,
+      seq,
+      taskResourceClaims: [...(state.taskResourceClaims ?? []).filter((claim) => !taskIds.has(claim.taskId)), ...claims],
+    },
+    claims, blocking, taskBlocking,
+  };
+}
+
+export function releaseTaskResourceClaims(state: CoordinationState, taskId: string): CoordinationState {
+  return { ...state, taskResourceClaims: (state.taskResourceClaims ?? []).filter((claim) => claim.taskId !== taskId) };
 }
 
 function upsertResourceClaim(
@@ -978,6 +1072,7 @@ export function snapshotForCanvas(
     canvasId,
     claims: marked.claims.filter((claim) => claim.canvasId === canvasId && claim.status !== 'released'),
     resourceClaims: marked.resourceClaims.filter((claim) => claim.canvasId === canvasId && claim.status !== 'released'),
+    taskResourceClaims: marked.taskResourceClaims ?? [],
     resources: marked.resources,
     intents: marked.intents.filter((intent) => intent.canvasId === canvasId),
     messages: marked.messages.filter((message) => message.canvasId === canvasId),
@@ -1000,6 +1095,7 @@ export function projectSnapshot(
     canvasId,
     claims: marked.claims.filter((claim) => claim.status !== 'released'),
     resourceClaims: marked.resourceClaims.filter((claim) => claim.status !== 'released'),
+    taskResourceClaims: marked.taskResourceClaims ?? [],
     resources: marked.resources,
     intents: marked.intents,
     messages: marked.messages,

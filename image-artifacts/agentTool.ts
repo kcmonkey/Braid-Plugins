@@ -8,6 +8,7 @@ export interface ImageGenerateToolRequest {
   optionsJson?: string;
   confirmCost?: boolean;
   attachToTurn?: boolean;
+  cancel?: boolean;
 }
 
 export interface ImageGenerateToolHandlers {
@@ -41,6 +42,7 @@ export function normalizeImageGenerateArgs(input: Record<string, unknown>): Imag
     optionsJson,
     confirmCost: input.confirmCost === true,
     attachToTurn: input.attachToTurn !== false,
+    cancel: input.cancel === true,
   };
 }
 
@@ -57,17 +59,18 @@ export function createImageGenerateAgentTool(_host: HostServiceContext, handlers
         'The image service is selected by the user in Braid Settings, not by tool arguments.',
         'The result is stored as a born image artifact and attached to the current turn by default.',
         'Service API keys are configured outside chat and stored in host secure storage.',
-        'Paid providers require confirmCost true before dispatch; retry the same requestId to avoid duplicate provider jobs.',
+        'Paid providers require confirmCost true before dispatch; reuse the same requestId for a persisted terminal result, and never redispatch an interrupted one-shot request.',
       ].join(' '),
       inputSchema: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          requestId: { type: 'string', description: 'Stable logical request id. Reuse it when retrying the same image request.' },
+          requestId: { type: 'string', description: 'Stable logical request id. Reuse it only from the same Canvas and Board; a scope mismatch fails closed.' },
           prompt: { type: 'string', description: 'Image generation prompt.' },
           optionsJson: { type: 'string', description: 'JSON object with provider-neutral image options when supported.' },
           confirmCost: { type: 'boolean', description: 'Must be true before dispatching providers that may consume paid credits.' },
           attachToTurn: { type: 'boolean', description: 'Attach the generated image artifact to this turn. Defaults to true.' },
+          cancel: { type: 'boolean', description: 'Cancel the existing requestId instead of dispatching or replaying a request.' },
         },
       },
     },

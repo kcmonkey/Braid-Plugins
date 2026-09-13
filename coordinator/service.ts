@@ -7,6 +7,8 @@ import type {
   HostServiceContext,
   HostServicePlugin,
   PluginManifest,
+  ResourceCoordinatorPort,
+  ResourceLeaseRequest,
   ToolMiddlewareContext,
   ToolMiddlewareResult,
 } from '../../../src/plugin-api/types';
@@ -17,6 +19,7 @@ import {
   addBoardMessage,
   claimFile,
   claimResourceSet,
+  claimTaskResourceSet,
   cleanupCanvas,
   emptyCoordinationState,
   findClaimConflict,
@@ -27,6 +30,7 @@ import {
   pruneRetiredCoordination,
   releaseBoardClaims,
   releaseBoardTransientClaims,
+  releaseTaskResourceClaims,
   retireBoardCoordination,
   setProviderCapabilities,
   setWorkspaceResources,
@@ -38,6 +42,7 @@ import {
   type FileClaim,
   type ResourceClaim,
   type ResourceClaimRequest,
+  type TaskResourceClaimRequest,
 } from './model';
 import { createCoordinatorAgentTool, type CoordinateToolRequest } from './agentTool';
 import { actorKey, coordinationPathList } from './helpers';
@@ -107,12 +112,110 @@ class CoordinatorHostService implements HostService {
   private readonly coordinationConflictKeys = new Set<string>();
   private resourceCatalogFile: string | undefined;
   private resourceCatalogSignature: string | null | undefined;
+  private taskAdmissionClosed = false;
+  private readonly taskWaiters = new Map<string, {
+    requests: TaskResourceClaimRequest[];
+    resolve(): void;
+    reject(error: unknown): void;
+  }>();
+  private readonly taskDrainWaiters = new Set<() => void>();
+  private taskExpiryTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly ctx: HostServiceContext) {}
 
+  resourceCoordinator(): ResourceCoordinatorPort {
+    return { withLease: (request, work) => this.withTaskLease(request, work) };
+  }
+
+  hasActiveWork(): boolean {
+    return this.coordination.taskResourceClaims.length > 0;
+  }
+
+  async drain(): Promise<void> {
+    this.taskAdmissionClosed = true;
+    if (this.hasActiveWork()) await new Promise<void>((resolve) => this.taskDrainWaiters.add(resolve));
+  }
+
+  private async withTaskLease<T>(request: ResourceLeaseRequest, work: () => Promise<T>): Promise<T> {
+    if (this.disposed || this.taskAdmissionClosed) throw new Error('Resource Coordinator is closing.');
+    if (!request.taskId?.trim() || !request.label?.trim() || !Array.isArray(request.resources) || !request.resources.length
+      || request.resources.some((entry) => !entry || typeof entry.resource !== 'string' || !entry.resource.trim())) {
+      throw new Error('A resource task requires taskId, label, and declared resources.');
+    }
+    if (this.coordination.taskResourceClaims.some((claim) => claim.taskId === request.taskId)) {
+      throw new Error(`Resource task already exists: ${request.taskId}`);
+    }
+    this.syncWorkspaceResources();
+    const now = Date.now();
+    const requests = request.resources.map((resource) => ({
+      ...resource, taskId: request.taskId, label: request.label, summary: request.label, now,
+    }));
+    try {
+      const claimed = claimTaskResourceSet(this.coordination, requests);
+      this.coordination = claimed.state;
+      if (claimed.blocking.length || claimed.taskBlocking.length) {
+        const ready = new Promise<void>((resolve, reject) => {
+          this.taskWaiters.set(request.taskId, { requests, resolve, reject });
+        });
+        this.publishCoordination();
+        for (const target of this.boardTargets(claimed.blocking)) {
+          const agentId = this.ctx.agentIdForBoard(target.canvasId, target.boardId);
+          if (agentId) void this.ctx.deliverLiveAgentMessage({
+            agentId, ...target, kind: 'coordination-conflict',
+            text: `[Braid coordination] Background task ${request.label} (${request.taskId}) is waiting for ${claimed.claims.map((claim) => claim.resource).join(', ')}. Release your conflicting resource claims when the work is safe to hand off. The task will acquire them before executing.`,
+          }).catch(() => {});
+        }
+        await ready;
+      } else {
+        this.publishCoordination();
+      }
+      return await work();
+    } finally {
+      this.taskWaiters.delete(request.taskId);
+      this.coordination = releaseTaskResourceClaims(this.coordination, request.taskId);
+      try {
+        this.publishCoordination();
+      } finally {
+        if (!this.hasActiveWork()) {
+          for (const resolve of this.taskDrainWaiters) resolve();
+          this.taskDrainWaiters.clear();
+        }
+      }
+    }
+  }
+
+  private tryResolveTaskWaiters(): void {
+    for (const [taskId, waiter] of this.taskWaiters) {
+      try {
+        const now = Date.now();
+        const claimed = claimTaskResourceSet(this.coordination, waiter.requests.map((request) => ({ ...request, now })));
+        this.coordination = claimed.state;
+        if (!claimed.blocking.length && !claimed.taskBlocking.length) {
+          this.taskWaiters.delete(taskId);
+          waiter.resolve();
+        }
+      } catch (error) {
+        this.taskWaiters.delete(taskId);
+        waiter.reject(error);
+      }
+    }
+    if (this.taskExpiryTimer) clearTimeout(this.taskExpiryTimer);
+    this.taskExpiryTimer = undefined;
+    // A declaration's existing TTL is a precise expiry event, not a polling/retry loop.
+    if (this.taskWaiters.size) {
+      const deadlines = this.coordination.resourceClaims
+        .filter((claim) => (claim.status === 'active' || claim.status === 'pending') && claim.expiresAt != null)
+        .map((claim) => claim.expiresAt!);
+      if (deadlines.length) this.taskExpiryTimer = setTimeout(() => this.publishCoordination(), Math.max(1, Math.min(...deadlines) - Date.now()));
+    }
+  }
+
   dispose(): void {
     if (this.disposed) return;
+    if (this.hasActiveWork()) throw new Error('Resource Coordinator cannot dispose while background tasks hold or await leases.');
     this.disposed = true;
+    if (this.taskExpiryTimer) clearTimeout(this.taskExpiryTimer);
+    this.taskExpiryTimer = undefined;
     if (this.fileWaitRecheckTimer) {
       clearTimeout(this.fileWaitRecheckTimer);
       this.fileWaitRecheckTimer = undefined;
@@ -217,7 +320,7 @@ class CoordinatorHostService implements HostService {
   }
 
   private coordinationCanvasIds(originCanvasId?: string): string[] {
-    const canvasIds = new Set<string>();
+    const canvasIds = new Set<string>(this.ctx.openCanvasIds());
     if (originCanvasId) canvasIds.add(originCanvasId);
     for (const claim of this.coordination.claims) canvasIds.add(claim.canvasId);
     for (const claim of this.coordination.resourceClaims) canvasIds.add(claim.canvasId);
@@ -252,6 +355,7 @@ class CoordinatorHostService implements HostService {
   }
 
   private tryResolveWaiters() {
+    this.tryResolveTaskWaiters();
     for (const [key, w] of [...this.resourceWaiters]) {
       const r = this.claimResources([w.req]);
       if (!r.conflicts.length) {
@@ -511,6 +615,10 @@ class CoordinatorHostService implements HostService {
     if (!conflicts.length) return;
     const blockingClaims = conflicts.flatMap((conflict) => conflict.blocking);
     const blockers = [...new Set(blockingClaims.map((c) => c.boardId))];
+    const blockerLabels = [...new Set([
+      ...blockers,
+      ...conflicts.flatMap((conflict) => (conflict.taskBlocking ?? []).map((claim) => `task ${claim.label} (${claim.taskId})`)),
+    ])];
     const blockerTargets = this.boardTargets(blockingClaims);
     const relatedResources = [...new Set([...claims.map((c) => c.resource), ...conflicts.map((c) => c.resource)])];
     const claimText = claims.map((claim) => this.describeResourceClaim(claim)).join(', ');
@@ -520,7 +628,7 @@ class CoordinatorHostService implements HostService {
       ? 'This is a high-priority pending resource request. A blocking board should SAVE, then call coordinate release at its NEXT safe tool step (it need not finish its whole turn) - or report an ETA if it truly cannot release yet. If you will still NEED this resource after the high-priority work, call coordinate wait on it right after releasing to AUTO-RESUME when it frees, then reopen/reload (e.g. relaunch the editor) and continue.'
       : 'The request is pending. A blocking board should SAVE then release the resource at its next safe tool step; if you still need it afterwards, call coordinate wait on it right after releasing to auto-resume when it frees, then reopen/reload and continue.';
     const negId = `neg-res-${canvasId}-${relatedResources.slice().sort().join('|')}`;
-    const conflictKey = `${canvasId}::${relatedResources.slice().sort().join('|')}::${blockers.slice().sort().join('|')}`;
+    const conflictKey = `${canvasId}::${relatedResources.slice().sort().join('|')}::${blockerLabels.slice().sort().join('|')}`;
     if (this.coordinationConflictKeys.has(conflictKey)) {
       this.queueLiveResourceConflictNotices(canvasId, boardId, blockerTargets, claims, relatedResources, highPriority, orderText);
       return;
@@ -530,7 +638,7 @@ class CoordinatorHostService implements HostService {
       canvasId,
       fromBoardId: boardId,
       kind: 'note',
-      text: `Potential resource conflict: ${requestText}, currently claimed by ${blockers.join(', ')}.`,
+      text: `Potential resource conflict: ${requestText}, currently claimed by ${blockerLabels.join(', ')}.`,
       relatedResources,
     });
     this.coordination = added.state;
@@ -541,7 +649,7 @@ class CoordinatorHostService implements HostService {
       boardIds: [boardId, ...blockers],
       actor,
       action: 'propose',
-      text: `${summary ?? requestText}. Blocking boards: ${blockers.join(', ')}. ${orderText}`,
+      text: `${summary ?? requestText}. Blocked by: ${blockerLabels.join(', ')}. ${orderText}`,
       relatedResources,
     }).state;
     this.queueLiveResourceConflictNotices(canvasId, boardId, blockerTargets, claims, relatedResources, highPriority, orderText);
@@ -671,8 +779,12 @@ class CoordinatorHostService implements HostService {
           thread.relatedResources.some((resource) => resourcesInView.has(resource)) ||
           thread.relatedPaths.some((path) => ownFiles.some((claim) => claim.path === path) || otherFiles.some((claim) => claim.path === path))))
       .slice(-2);
-    if (!ownFiles.length && !otherFiles.length && !ownPending.length && !otherResources.length && !messages.length && !negotiations.length) return '';
+    if (!ownFiles.length && !otherFiles.length && !ownPending.length && !otherResources.length && !snapshot.taskResourceClaims.length && !messages.length && !negotiations.length) return '';
     const lines: string[] = ['[Braid coordination]'];
+    if (snapshot.taskResourceClaims.length) {
+      lines.push('Background task resource claims (owned until the operation finishes):');
+      for (const claim of snapshot.taskResourceClaims.slice(0, 12)) lines.push(`- Task ${claim.label} (${claim.taskId}): ${claim.resource} (${claim.mode}, ${claim.status})`);
+    }
     if (ownFiles.length) {
       lines.push('Your file claims:');
       for (const claim of ownFiles.slice(0, 3)) lines.push(`- ${this.fileClaimContextLine(claim)}`);
@@ -801,7 +913,10 @@ class CoordinatorHostService implements HostService {
       ...attempt.conflicts.map((conflict) => conflict.resource),
     ])];
     const blockers = [...new Set(attempt.conflicts.flatMap((conflict) =>
-      conflict.blocking.map((claim) => claim.canvasId ? `${claim.boardId} on ${claim.canvasId}` : claim.boardId)))];
+      [
+        ...conflict.blocking.map((claim) => claim.canvasId ? `${claim.boardId} on ${claim.canvasId}` : claim.boardId),
+        ...(conflict.taskBlocking ?? []).map((claim) => `task ${claim.label} (${claim.taskId})`),
+      ]))];
     const claimText = attempt.claims.map((claim) => this.describeResourceClaim(claim)).join(', ') || resources.join(', ');
     const resourceText = resources.join(', ') || 'the requested resource';
     const blockerText = blockers.join(', ') || 'another board';
@@ -983,9 +1098,12 @@ class CoordinatorHostService implements HostService {
     if (!result.conflicts.length) {
       return { ok: true, result: `Claimed ${claimed} - you now HOLD it (ACTIVE). Held for this board until you release it (action:"release") or the board finishes. This grants ONLY what is listed here; do not assume you hold any other resource.` };
     }
-    const blockers = [...new Set(result.conflicts.flatMap((c) => c.blocking.map((b) => b.boardId)))].join(', ');
+    const blockers = [...new Set(result.conflicts.flatMap((conflict) => [
+      ...conflict.blocking.map((claim) => claim.boardId),
+      ...(conflict.taskBlocking ?? []).map((claim) => `task ${claim.label} (${claim.taskId})`),
+    ]))].join(', ');
     if (req.action === 'claim') {
-      return { ok: true, result: `Claimed ${claimed} - but it is BLOCKED by board(s) ${blockers}, so your claim is PENDING (NOT granted). You do NOT hold this resource: do NOT run any action gated on it (build, closing the editor) and do NOT report it as yielded/granted. They were notified. Use action:"wait" to block until it actually becomes ACTIVE, action:"request" to ask them, or coordinate before forcing a conflicting action.` };
+      return { ok: true, result: `Claimed ${claimed} - but it is BLOCKED by ${blockers}, so your claim is PENDING (NOT granted). You do NOT hold this resource: do NOT run any action gated on it (build, closing the editor) and do NOT report it as yielded/granted. Blocking boards were notified; background tasks release when their operations finish. Use action:"wait" to block until it becomes ACTIVE.` };
     }
     const waiterKey = `${canvasId}::${rb}::${resource}`;
     const thisBoardKey = this.aKey(canvasId, rb);

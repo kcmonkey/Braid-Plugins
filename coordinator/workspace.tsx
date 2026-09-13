@@ -270,6 +270,7 @@ export function coordinationBadgeCount(snapshot: CoordinationSnapshot | null): n
   return snapshot
     ? snapshot.claims.length +
       snapshot.resourceClaims.length +
+      (snapshot.taskResourceClaims?.length ?? 0) +
       snapshot.intents.filter((i) => i.status === 'active').length +
       snapshot.negotiations.filter((n) => n.status !== 'resolved' && n.status !== 'rejected').length
     : 0;
@@ -590,6 +591,7 @@ function CoordinatorResourcesConfigPanel({ api }: { api: BoardPluginApi }) {
 function CoordinationWorkspacePanel({ snapshot, onClose }: { snapshot: CoordinationSnapshot | null; onClose: () => void }) {
   const claims = snapshot?.claims ?? [];
   const resourceClaims = snapshot?.resourceClaims ?? [];
+  const taskResourceClaims = snapshot?.taskResourceClaims ?? [];
   const intents = snapshot?.intents ?? [];
   const messages = snapshot?.messages ?? [];
   const negotiations = snapshot?.negotiations ?? [];
@@ -604,12 +606,12 @@ function CoordinationWorkspacePanel({ snapshot, onClose }: { snapshot: Coordinat
       <div className="coord__backdrop" onClick={onClose} />
       <div className="coord-panel nodrag nopan" role="dialog" aria-label="Coordination" onClick={(e) => e.stopPropagation()}>
         <div className="coord-panel__head">
-          <h2>Coordination <span className="coord-panel__sub">{activeClaims.length + activeResourceClaims.length} claims, {openNegotiations.length} open</span></h2>
+          <h2>Coordination <span className="coord-panel__sub">{activeClaims.length + activeResourceClaims.length + taskResourceClaims.length} claims, {openNegotiations.length} open</span></h2>
           <button className="coord-panel__x" onClick={onClose} title="Close">x</button>
         </div>
         <div className="coord-panel__body">
           {!snapshot && <div className="coord-panel__empty">No coordination snapshot yet.</div>}
-          {snapshot && activeClaims.length === 0 && activeResourceClaims.length === 0 && resources.length === 0 && intents.length === 0 && messages.length === 0 && negotiations.length === 0 && (
+          {snapshot && activeClaims.length === 0 && activeResourceClaims.length === 0 && taskResourceClaims.length === 0 && resources.length === 0 && intents.length === 0 && messages.length === 0 && negotiations.length === 0 && (
             <div className="coord-panel__empty">No active coordination state.</div>
           )}
           {resources.length > 0 && (
@@ -666,6 +668,20 @@ function CoordinationWorkspacePanel({ snapshot, onClose }: { snapshot: Coordinat
                       ].filter(Boolean).join(' / ')}
                     </div>
                   )}
+                </div>
+              ))}
+            </section>
+          )}
+          {taskResourceClaims.length > 0 && (
+            <section className="coord-section">
+              <div className="coord-section__head">Background Tasks</div>
+              {taskResourceClaims.map((claim) => (
+                <div className={`coord-row coord-row--${claim.status}`} key={claim.id}>
+                  <div className="coord-row__main">
+                    <span className="coord-row__path">{claim.resource}</span>
+                    <span className="coord-row__meta">{claim.mode} / {claim.status}</span>
+                  </div>
+                  <div className="coord-row__actor" title={claim.taskId}>{claim.label}{claim.requiredBy ? ` / required by ${claim.requiredBy}` : ''}</div>
                 </div>
               ))}
             </section>
