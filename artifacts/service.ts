@@ -259,7 +259,7 @@ class ArtifactsHostService implements HostService {
 
   private async handleDeclare(ctx: AgentToolContext, req: ArtifactDeclareToolRequest): Promise<AgentToolResult> {
     if (ctx.signal.aborted) return { ok: false, result: 'Artifact declaration canceled.' };
-    if (ctx.agentId && req.attachToTurn) {
+    if (ctx.presentation === 'headless' && req.attachToTurn) {
       return { ok: false, result: 'A headless BraidAgent cannot attach an artifact to a Board turn; pass the exact ref to finish instead.' };
     }
     const dataType = nonEmpty(req.dataType) ?? this.artifactTypes.metaDataType;
