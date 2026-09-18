@@ -141,7 +141,7 @@ Every plugin declares a `plugin.json` at its root:
 | `boardElements` | webview | Render a read-only element inside each board card (e.g. tags, plan chip). |
 | `boardForms` | webview | Register a custom board creation form with its own composer UI. |
 | `boardActions` | webview | Add action buttons to settled boards (e.g. prompt macros). |
-| `boardPins` | webview | Contribute typed input/output pins for cross-board data flow. |
+| `boardPins` | host + webview | Host authorizes typed input/output connections; webview renders the handles and gathers inputs. |
 | `contextProviders` | webview | Inject text into every turn's system context. |
 | `agentTools` | host | Register an agent-callable tool (in-process MCP / dynamic tools). |
 | `toolMiddleware` | host | Intercept and observe tool calls before execution. |
@@ -155,6 +155,16 @@ Every plugin declares a `plugin.json` at its root:
 | `runPolicies` | host | Declare a named run policy for autonomous plan execution. |
 
 ## Developing a Plugin
+
+Pin plugins register both contributions under the same id. The Host exports
+`boardPin` (or calls `registerBoardPin`) with a `HostBoardPinPlugin`: its
+`pins({boardId, kind, formId, state})` resolver returns the currently permitted
+pins from persisted plugin state. The webview contribution renders those pins
+and can narrow their availability for interaction. Connection commands contain
+only Board/plugin/pin ids; the Host derives types, multiplicity, handles and
+the durable edge. A webview-only pin registration cannot authorize a write.
+Existing links can still be removed after their plugin is disabled. Omit
+`offsetPct` to get default positions clear of execution and artifact handles.
 
 1. **Create a directory** with your plugin id as the name.
 2. **Add a `plugin.json`** manifest declaring `id`, `name`, `version`, `description`, and `contributes`.

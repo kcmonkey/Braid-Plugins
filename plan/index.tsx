@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginManifest, SeedBraidFile } from '../../../src/plugin-api/types';
+import type { BoardElementPlugin, BoardMenuItem, BoardPluginApi, ContextProviderPlugin, PluginCanvasJsonRecord, PluginCanvasJsonValue, PluginManifest, SeedBraidFile } from '../../../src/plugin-api/types';
 import { boardTurns, type BoardLike as BoardData } from '../shared/board';
 import { MAX_CONTINUES, type RunState } from '../../../src/run/lifecycle';
 import { detectCreatedPlan, latestCreatedPlan, planWriteSignal } from './detect';
@@ -9,6 +9,7 @@ import { firstHeading, parseGates, parsePlanSnapshot, type PlanSnapshot } from '
 // SSOT; `seedBraidFiles` drops a copy at `.braid/plans/_authoring.md` so the agent can Read it on demand. (方向O)
 import PLAN_AUTHORING from './plan-authoring.md';
 import manifestJson from './plugin.json';
+import { inheritPlanStateOnFork } from './forkState';
 
 // Where the plugin seeds its authoring doc, and the exact bytes it writes (a managed-file header + the doc).
 // The compact methodology (methodology.ts) points the agent here; the agent reads it lazily.
@@ -52,6 +53,24 @@ function planIdOf(board: BoardData): string {
 function runOf(state: PlanState | undefined): RunState | undefined {
   const r = (state as { run?: RunState } | undefined)?.run;
   return r && (r.status === 'running' || r.status === 'paused') && typeof r.continues === 'number' ? r : undefined;
+}
+
+function planElementState(planId: string, run?: RunState, open = false): PluginCanvasJsonRecord {
+  const state: Record<string, PluginCanvasJsonValue> = { planId };
+  if (run) {
+    const persistedRun: Record<string, PluginCanvasJsonValue> = {
+      status: run.status,
+      continues: run.continues,
+    };
+    if (run.lastSig !== undefined) persistedRun.lastSig = run.lastSig;
+    if (run.seenTurns !== undefined) persistedRun.seenTurns = run.seenTurns;
+    if (run.note !== undefined) persistedRun.note = run.note;
+    if (run.summaryRepairSent !== undefined) persistedRun.summaryRepairSent = run.summaryRepairSent;
+    if (run.userPrompt !== undefined) persistedRun.userPrompt = run.userPrompt;
+    state.run = persistedRun;
+  }
+  if (open) state.open = true;
+  return state;
 }
 // Refetch plan files when the board settles, and while live only when this board writes the bound plan files. That
 // keeps normal token streaming from causing read storms while still reflecting an agent that advances current-phase
@@ -302,11 +321,19 @@ function PlanBind({ boardId, board, planId, api }: { boardId: string; board: Boa
     const id = safePlanId(value);
     if (!id) return;
     const prev = asPlanState(board.elements?.plan);
-    api.patchBoard(boardId, { elements: { ...(board.elements ?? {}), plan: { planId: id, ...(prev?.run ? { run: prev.run } : {}) } } });
+    void api.patchBoard(boardId, {
+      kind: 'replace-element-state',
+      pluginId: 'plan',
+      state: planElementState(id, prev?.run),
+    });
   };
   const close = () => {
     const prev = asPlanState(board.elements?.plan);
-    api.patchBoard(boardId, { elements: { ...(board.elements ?? {}), plan: { planId: prev?.planId ?? '', ...(prev?.run ? { run: prev.run } : {}) } } });
+    void api.patchBoard(boardId, {
+      kind: 'replace-element-state',
+      pluginId: 'plan',
+      state: planElementState(prev?.planId ?? '', prev?.run),
+    });
   };
   return (
     <div className="plugin-config plugin-config--plan" style={{ padding: '6px 0', display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -347,10 +374,11 @@ export const planElementPlugin: BoardElementPlugin<PlanConfig> = {
   // Manual bind lives in the right-click menu, so it's a deliberate action instead of a control on every card.
   boardMenu({ boardId, board, api }) {
     const planId = planIdOf(board);
-    const elements = board.elements ?? {};
     const prev = asPlanState(board.elements?.plan);
-    const openBinder = () => api.patchBoard(boardId, {
-      elements: { ...elements, plan: { planId: prev?.planId ?? '', ...(prev?.run ? { run: prev.run } : {}), open: true } },
+    const openBinder = () => void api.patchBoard(boardId, {
+      kind: 'replace-element-state',
+      pluginId: 'plan',
+      state: planElementState(prev?.planId ?? '', prev?.run, true),
     });
     const items: BoardMenuItem[] = [{
       key: 'plan-bind',
@@ -362,16 +390,13 @@ export const planElementPlugin: BoardElementPlugin<PlanConfig> = {
         key: 'plan-unbind',
         label: '◆ Unbind plan',
         title: "Remove this board's plan binding",
-        onClick: () => { const { plan: _drop, ...rest } = elements; api.patchBoard(boardId, { elements: rest }); },
+        onClick: () => { void api.patchBoard(boardId, { kind: 'clear-element-state', pluginId: 'plan' }); },
       });
     }
     return items;
   },
   // A forked child inherits the parent's plan binding (id only — run/open state is NOT carried).
-  inheritOnFork(parentState) {
-    const ps = asPlanState(parentState);
-    return ps?.planId ? { planId: ps.planId } : undefined;
-  },
+  inheritOnFork: inheritPlanStateOnFork,
   searchText(state) {
     const planId = asPlanState(state)?.planId;
     return planId ? `plan ${planId}` : undefined;

@@ -58,7 +58,11 @@ function SkillsLoader({ boardId, board, api }: { boardId: string; board: BoardDa
       if (!alive) return;
       // Equality-guarded so the write converges (no render loop, no persistence churn for a stable vault).
       if (!sameEntries(ss, cachedSkillEntries(board.elements?.skills))) {
-        api.patchBoard(boardId, { elements: { ...(board.elements ?? {}), skills: { index: ss } } });
+        void api.patchBoard(boardId, {
+          kind: 'replace-element-state',
+          pluginId: 'skills',
+          state: { index: ss.map(({ name, description, path }) => ({ name, description, path })) },
+        });
       }
     })();
     return () => {
