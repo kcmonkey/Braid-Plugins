@@ -12,7 +12,7 @@ const manifest = manifestJson as PluginManifest;
 
 // The formatted result carries a metadata header + the SKILL.md body + a bundled-resource list. The host caps a
 // tool result at ~30k chars for the packed session (the SESSION_TOOL_RESULT_CAP in src/webview/merge, applied by
-// capSessionToolResult). Builtin plugins may NOT import that core module (plugin-boundary test), so we mirror the
+// capSessionToolResult). Builtin plugins do not import that webview module, so we mirror the
 // value here and keep the body cap conservative: it MUST leave headroom for the header + resource list, otherwise a
 // near-max body pushes the total past the host cap and the resource pointers at the tail are silently dropped on the
 // next tool round (OpenAI-compatible providers). If the host session cap changes materially, update this mirror.

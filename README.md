@@ -85,7 +85,7 @@ The `shared/` directory contains utilities consumed by multiple plugins:
 
 | File | Purpose |
 |---|---|
-| `ProviderModelPicker.tsx` | Reusable provider-aware model picker component with capability filtering. |
+| `ProviderModelPicker.tsx` | Provider selection with the host's live model picker, including loading and retry. |
 | `board.ts` | Shared board-data helpers (latest answer, turn utilities). |
 
 ## Installation
@@ -169,16 +169,14 @@ Existing links can still be removed after their plugin is disabled. Omit
 1. **Create a directory** with your plugin id as the name.
 2. **Add a `plugin.json`** manifest declaring `id`, `name`, `version`, `description`, and `contributes`.
 3. **Implement the contributed slots** as exported functions/components matching the plugin API contracts.
-4. **Add tests** — plugins can import their own pure helpers and test with vitest. Shared test utilities
-   live in the `shared/` directory.
-5. **Run the boundary test**: `npx vitest run plugin-boundary.test.ts`. This enforces that plugins never
-   import core Braid internals (webview merge, coordination model, extension host, VS Code API).
+4. **Verify the real plugin behavior** through its host and UI entrypoints, following
+   [test-engineering](../../.braid/skills/test-engineering/SKILL.md).
 
 ### Boundary Rules
 
-Plugins are **isolated from Braid core**. The boundary test enforces:
+Plugins use the public contracts in `src/plugin-api` and `src/protocol`:
 
-- **No imports** from `src/webview/merge`, `src/coordination`, `src/plugin-api`, `src/plugin-runtime`,
+- **No imports** from `src/webview/merge`, `src/coordination`, `src/plugin-runtime`,
   `src/webview/main`, `src/extension`, `src/app`, or `src/host`.
 - **No references** to `vscode`, `acquireVsCodeApi`, `window.BraidPluginRuntime`, or `BraidCore`.
 
@@ -188,18 +186,8 @@ Chrome targets.
 
 ## Testing
 
-```bash
-# Run plugin boundary checks
-npx vitest run plugin-boundary.test.ts
-
-# Run all plugin tests
-npx vitest run
-
-# Run tests for a specific plugin
-npx vitest run coordinator/coordinator.test.ts
-npx vitest run memory/model.test.ts
-npx vitest run plan/detect.test.ts
-```
+Use the focused real E2E for the changed plugin behavior. Non-E2E exceptions and their rationale follow
+the project's [test-engineering skill](../../.braid/skills/test-engineering/SKILL.md).
 
 ## License
 

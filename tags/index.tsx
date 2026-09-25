@@ -21,11 +21,11 @@ export { defaultTagConfig, tagDeriveKey } from './derivation';
 
 export const manifest = manifestJson as PluginManifest;
 
-function TagConfigPanel({ config, onChange, activeProvider, providerCaps }: {
+function TagConfigPanel({ config, onChange, activeProvider, ModelSelect }: {
   config: TagConfig;
   onChange(config: TagConfig): void;
   activeProvider: string;
-  providerCaps: ProviderModelPickerProps['providerCaps'];
+  ModelSelect: ProviderModelPickerProps['ModelSelect'];
 }) {
   const updateTag = (idx: number, patch: Partial<TagDef>) => {
     const tags = tagDefs(config).map((t, i) => (i === idx ? { ...t, ...patch, name: patch.name != null ? normalizeTagName(patch.name) : t.name } : t));
@@ -37,7 +37,7 @@ function TagConfigPanel({ config, onChange, activeProvider, providerCaps }: {
         engine={config.engine}
         model={config.model}
         activeProvider={activeProvider}
-        providerCaps={providerCaps}
+        ModelSelect={ModelSelect}
         onChange={(next) => onChange({ ...config, ...next })}
       />
       <div className="plugin-tag-list">
@@ -110,7 +110,7 @@ export const tagPlugin: BoardElementPlugin<TagConfig> = {
     const tags = asTagState(state)?.tags;
     return tags && tags.length ? tags.join(' ') : undefined;
   },
-  renderConfig({ config, onChange, activeProvider, providerCaps }) {
-    return <TagConfigPanel config={config} onChange={onChange} activeProvider={activeProvider} providerCaps={providerCaps} />;
+  renderConfig({ config, onChange, activeProvider, ModelSelect }) {
+    return <TagConfigPanel config={config} onChange={onChange} activeProvider={activeProvider} ModelSelect={ModelSelect} />;
   },
 };
