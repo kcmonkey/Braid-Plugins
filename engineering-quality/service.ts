@@ -47,6 +47,12 @@ const command = (value: unknown) => {
 };
 const surfaceIsEngineering = (surface: string) => Boolean(surface && !surface.endsWith('/') && !NON_ENGINEERING.has(path.extname(surface).toLowerCase()));
 const key = (canvasId: string, boardId: string) => canvasId + '\0' + boardId;
+type ExecutionScope = Pick<ToolMiddlewareContext, 'canvasId' | 'boardId' | 'turnIndex' | 'agentId'>;
+const scopeKey = (ctx: ExecutionScope): string => {
+  if (ctx.canvasId && ctx.boardId) return key(ctx.canvasId, ctx.boardId);
+  if (ctx.agentId) return '\0agent\0' + ctx.agentId;
+  throw new Error('Engineering evidence needs an exact Agent or Board-turn target.');
+};
 const toolKey = (turnIndex: number, toolUseId: string) => String(turnIndex) + '\0' + toolUseId;
 const binding = (projection?: ChangeEvidenceProjection): Binding | undefined => projection ? { finalEvidenceId: projection.finalEvidence.finalEvidenceId, currentnessToken: projection.finalEvidence.currentnessToken } : undefined;
 const same = (left?: Binding, right?: Binding) => Boolean(left && right && left.finalEvidenceId === right.finalEvidenceId && left.currentnessToken === right.currentnessToken);
@@ -86,10 +92,10 @@ class EngineeringQualityHostService implements HostService {
   onRunError(event: HostRunBoardEvent) { this.states.get(key(event.canvasId, event.boardId))?.pending.clear(); }
   onBoardAbort(event: HostRunBoardEvent) { this.onRunError(event); }
   onCanvasClose(canvasId: string) { for (const stateKey of this.states.keys()) if (stateKey.startsWith(canvasId + '\0')) this.states.delete(stateKey); }
-  private create(ctx: Pick<ToolMiddlewareContext, 'canvasId' | 'boardId' | 'turnIndex'>): State { return { target: { canvasId: ctx.canvasId, boardId: ctx.boardId, turnIndex: ctx.turnIndex! }, ordinal: 1, pending: new Map(), verification: new Map(), reviewerHandles: new Set(), strategyRevision: 0, evidence: new Map(), observationOrder: 0, nonMutatingToolUses: new Set() }; }
-  private observed(ctx: Pick<ToolMiddlewareContext, 'canvasId' | 'boardId' | 'turnIndex'>): State | undefined { if (typeof ctx.turnIndex !== 'number') return undefined; const stateKey = key(ctx.canvasId, ctx.boardId); const state = this.states.get(stateKey); if (state?.target.turnIndex === ctx.turnIndex) return state; const fresh = this.create(ctx); this.states.set(stateKey, fresh); return fresh; }
-  private current(ctx: Pick<AgentToolContext, 'canvasId' | 'boardId' | 'turnIndex'>): State | undefined { const state = this.states.get(key(ctx.canvasId, ctx.boardId)); return state?.target.turnIndex === ctx.turnIndex ? state : undefined; }
-  private strategyState(ctx: Pick<AgentToolContext, 'canvasId' | 'boardId' | 'turnIndex'>): State { const state = this.current(ctx); if (state) return state; const fresh = this.create(ctx); this.states.set(key(ctx.canvasId, ctx.boardId), fresh); return fresh; }
+  private create(ctx: ExecutionScope): State { return { target: ctx.canvasId && ctx.boardId ? { canvasId: ctx.canvasId, boardId: ctx.boardId, turnIndex: ctx.turnIndex! } : { agentId: ctx.agentId, turnIndex: ctx.turnIndex! }, ordinal: 1, pending: new Map(), verification: new Map(), reviewerHandles: new Set(), strategyRevision: 0, evidence: new Map(), observationOrder: 0, nonMutatingToolUses: new Set() }; }
+  private observed(ctx: ExecutionScope): State | undefined { if (typeof ctx.turnIndex !== 'number' || (!ctx.agentId && (!ctx.canvasId || !ctx.boardId))) return undefined; const stateKey = scopeKey(ctx); const state = this.states.get(stateKey); if (state?.target.turnIndex === ctx.turnIndex) return state; const fresh = this.create(ctx); this.states.set(stateKey, fresh); return fresh; }
+  private current(ctx: ExecutionScope): State | undefined { const state = this.states.get(scopeKey(ctx)); return state?.target.turnIndex === ctx.turnIndex ? state : undefined; }
+  private strategyState(ctx: ExecutionScope): State { const state = this.current(ctx); if (state) return state; const fresh = this.create(ctx); this.states.set(scopeKey(ctx), fresh); return fresh; }
   /** Projection is the only fact/currentness authority; every observation begins here. */
   private sync(state: State, projection?: ChangeEvidenceProjection) {
     if (!projection) return;

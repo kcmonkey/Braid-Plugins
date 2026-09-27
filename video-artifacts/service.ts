@@ -1,6 +1,5 @@
 import type {
   AgentToolContext,
-  HostRunBoardEvent,
   HostService,
   HostServiceContext,
   HostServicePlugin,
@@ -31,8 +30,10 @@ type DriverStatus = 'pending' | 'succeeded' | 'failed' | 'canceled' | 'expired';
 
 interface DriverRecord {
   requestKey: string;
-  canvasId: string;
-  boardId: string;
+  /** Absent only in persisted pre-Agent records. */
+  agentId?: string;
+  canvasId?: string;
+  boardId?: string;
   turnIndex: number;
   providerId: string;
   request: VideoGenerationRequest;
@@ -103,7 +104,7 @@ class VideoArtifactsHostService implements HostService {
   label = 'Video Artifacts Host Service';
   manifest = manifest;
   private readonly records = new Map<string, DriverRecord>();
-  private readonly inFlight = new Map<string, Promise<AgentToolResult>>();
+  private readonly inFlight = new Map<string, { agentId: string; promise: Promise<AgentToolResult> }>();
   private readonly watchers = new Map<string, { abort: AbortController; timer?: ReturnType<typeof setTimeout>; polls: number }>();
   private readonly terminalSettlements = new Map<string, Promise<TaskSnapshotOutcome>>();
 
@@ -116,23 +117,13 @@ class VideoArtifactsHostService implements HostService {
     return [createVideoGenerateAgentTool(this.host, { generate: (ctx, req) => this.handleGenerate(ctx, req) })];
   }
 
-  async onBoardAbort(event: HostRunBoardEvent): Promise<void> {
-    await this.releaseLiveBoardRecords(event, 'Generation request was interrupted; re-run video_generate with the same requestId to resume the provider task.');
-  }
-
-  async onRunError(event: HostRunBoardEvent): Promise<void> {
-    await this.releaseLiveBoardRecords(event, event.message || 'Generation request was interrupted; re-run video_generate with the same requestId to resume the provider task.');
-  }
-
-  async onCanvasClose(canvasId: string): Promise<void> {
-    for (const record of [...this.records.values()]) {
-      if (record.canvasId === canvasId) this.stopWatcher(record.requestKey);
-    }
+  dispose(): void {
+    for (const requestKey of [...this.watchers.keys()]) this.stopWatcher(requestKey);
   }
 
   private requestKey(ctx: AgentToolContext, providerId: string, req: VideoGenerateToolRequest, kind: VideoGenerationRequestKind): string {
     if (req.requestId) return req.requestId;
-    return `${ctx.canvasId}:${ctx.boardId}:${ctx.turnIndex}:${shortHash(stableJson({
+    return `agent:${ctx.agentId}:${ctx.turnIndex}:${shortHash(stableJson({
       providerId,
       kind,
       prompt: req.prompt ?? '',
@@ -166,14 +157,20 @@ class VideoArtifactsHostService implements HostService {
   }
 
   private obligationId(record: DriverRecord): string {
-    return artifactOutputObligationId({ canvasId: record.canvasId, boardId: record.boardId, turnIndex: record.turnIndex });
+    return artifactOutputObligationId(this.obligationTarget(record));
+  }
+
+  private obligationTarget(record: DriverRecord) {
+    return record.canvasId && record.boardId
+      ? { canvasId: record.canvasId, boardId: record.boardId, turnIndex: record.turnIndex }
+      : { agentId: record.agentId, turnIndex: record.turnIndex };
   }
 
   private recordPendingGeneration(record: DriverRecord, latest: VideoGenerationTaskSnapshot): void {
     this.host.recordObligationEvent?.({
       type: 'artifact-generation-pending',
       obligationId: this.obligationId(record),
-      target: { canvasId: record.canvasId, boardId: record.boardId, turnIndex: record.turnIndex },
+      target: this.obligationTarget(record),
       dataType: VIDEO_DATA_TYPE,
       requestId: record.requestKey,
       providerTaskId: latest.providerTaskId,
@@ -185,7 +182,7 @@ class VideoArtifactsHostService implements HostService {
     this.host.recordObligationEvent?.({
       type: 'artifact-generation-settled',
       obligationId: this.obligationId(record),
-      target: { canvasId: record.canvasId, boardId: record.boardId, turnIndex: record.turnIndex },
+      target: this.obligationTarget(record),
       dataType: VIDEO_DATA_TYPE,
       requestId: record.requestKey,
       providerTaskId: providerTaskId ?? record.providerTaskId,
@@ -337,11 +334,16 @@ class VideoArtifactsHostService implements HostService {
   }
 
   private async handleGenerate(ctx: AgentToolContext, req: VideoGenerateToolRequest): Promise<AgentToolResult> {
+    if (!ctx.agentId) return this.result(false, { error: 'Video generation requires an exact executing Agent identity.' });
     const kind: VideoGenerationRequestKind = req.kind === 'image-to-video' ? 'image-to-video' : 'text-to-video';
     if (kind === 'text-to-video' && !req.prompt?.trim()) {
       return this.result(false, { error: 'A prompt is required for text-to-video generation.' });
     }
     const existingById = req.requestId ? await this.readRecord(req.requestId) : undefined;
+    if (existingById && (existingById.agentId ? existingById.agentId !== ctx.agentId
+      : ctx.presentation === 'headless' || !ctx.canvasId || !ctx.boardId || existingById.canvasId !== ctx.canvasId || existingById.boardId !== ctx.boardId)) {
+      return this.result(false, { requestId: req.requestId, error: 'This generation request belongs to another Agent or legacy presentation.' });
+    }
     const configured = existingById ? undefined : this.configuredProvider(ctx, kind);
     const target = existingById ? this.targetForRecord(existingById) : configured?.target;
     if (!target) {
@@ -357,10 +359,11 @@ class VideoArtifactsHostService implements HostService {
       return this.cancelRequest(provider, existing, requestKey);
     }
     const alreadyRunning = this.inFlight.get(requestKey);
-    if (alreadyRunning) return alreadyRunning;
+    if (alreadyRunning) return alreadyRunning.agentId === ctx.agentId ? alreadyRunning.promise
+      : this.result(false, { requestId: requestKey, error: 'This generation request belongs to another Agent.' });
     const running = this.dispatchGenerate(ctx, req, kind, target, requestKey, existingById)
       .finally(() => this.inFlight.delete(requestKey));
-    this.inFlight.set(requestKey, running);
+    this.inFlight.set(requestKey, { agentId: ctx.agentId, promise: running });
     return running;
   }
 
@@ -399,8 +402,9 @@ class VideoArtifactsHostService implements HostService {
       const created = await provider.createTask(request, ctx.signal);
       record = {
         requestKey,
-        canvasId: ctx.canvasId,
-        boardId: ctx.boardId,
+        agentId: ctx.agentId,
+        canvasId: ctx.presentation === 'headless' ? undefined : ctx.canvasId,
+        boardId: ctx.presentation === 'headless' ? undefined : ctx.boardId,
         turnIndex: ctx.turnIndex,
         providerId: target.providerId,
         request,
@@ -476,6 +480,7 @@ class VideoArtifactsHostService implements HostService {
 
     const downloaded = await provider.downloadResult(latest.result, signal);
     const produced = await this.host.produceArtifact(record.canvasId, record.boardId, {
+      producerAgentId: record.agentId,
       source: 'born',
       dataType: VIDEO_DATA_TYPE,
       label: downloaded.label || latest.result.label || `${VIDEO_DATA_TYPE}.mp4`,
@@ -483,7 +488,7 @@ class VideoArtifactsHostService implements HostService {
       pluginId: manifest.id,
       ...(downloaded.metadata ? { metadata: downloaded.metadata } : {}),
       bytes: downloaded.bytes,
-      ...(record.attachToTurn !== false ? { attachTo: { turnIndex: record.turnIndex } } : {}),
+      ...(record.attachToTurn !== false && record.canvasId && record.boardId ? { attachTo: { turnIndex: record.turnIndex } } : {}),
     });
     if (produced.error || !produced.ref) {
       const failed = { ...record, status: 'failed' as DriverStatus, providerTaskId: latest.providerTaskId, error: produced.error || 'Artifact production failed.' };
@@ -518,15 +523,6 @@ class VideoArtifactsHostService implements HostService {
     return 'pending';
   }
 
-  private async releaseLiveBoardRecords(event: HostRunBoardEvent, message: string): Promise<void> {
-    const updates = [...this.records.values()]
-      .filter((record) => record.canvasId === event.canvasId && record.boardId === event.boardId && record.status === 'pending');
-    for (const record of updates) {
-      this.stopWatcher(record.requestKey);
-      await this.writeRecord({ ...record, status: 'pending', error: message }, 'video-generation-released');
-      this.records.delete(record.requestKey);
-    }
-  }
 }
 
 export function createVideoArtifactsHostServicePlugin(

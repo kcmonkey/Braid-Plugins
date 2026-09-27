@@ -642,7 +642,7 @@ function CoordinationWorkspacePanel({ snapshot, onClose }: { snapshot: Coordinat
                 <div className={`coord-row coord-row--${claim.status}`} key={claim.id}>
                   <div className="coord-row__main">
                     <span className="coord-row__path" title={claim.path}>{claim.path}</span>
-                    <span className="coord-row__meta">Board {claim.boardId} / {claim.access}</span>
+                    <span className="coord-row__meta" title={claim.agentId}>Agent {claim.agentId}{claim.boardId ? ` / Board ${claim.boardId}` : ''} / {claim.access}</span>
                   </div>
                   {claim.actor && <div className="coord-row__actor">{claim.actor.label ?? claim.actor.kind}{claim.actor.provider ? ` / ${claim.actor.provider}` : ''}</div>}
                 </div>
@@ -657,7 +657,7 @@ function CoordinationWorkspacePanel({ snapshot, onClose }: { snapshot: Coordinat
                   <div className="coord-row__main">
                     <span className="coord-row__path" title={claim.resource}>{claim.resource}</span>
                     <span className="coord-row__meta">
-                      Board {claim.boardId} / {claim.mode}{claim.desiredState ? `=${claim.desiredState}` : ''} / {claim.status}{claim.priority !== 'normal' ? ` / ${claim.priority}` : ''}
+                      Agent {claim.agentId}{claim.boardId ? ` / Board ${claim.boardId}` : ''} / {claim.mode}{claim.desiredState ? `=${claim.desiredState}` : ''} / {claim.status}{claim.priority !== 'normal' ? ` / ${claim.priority}` : ''}
                     </span>
                   </div>
                   {(claim.summary || claim.actor || claim.requiredBy) && (
@@ -721,7 +721,7 @@ function CoordinationWorkspacePanel({ snapshot, onClose }: { snapshot: Coordinat
                 <div className="coord-row" key={message.id}>
                   <div className="coord-row__main">
                     <span className="coord-row__path" title={message.text}>{message.text}</span>
-                    <span className="coord-row__meta">{message.kind} / {message.fromBoardId}{message.toBoardId ? ` -> ${message.toBoardId}` : ''}</span>
+                    <span className="coord-row__meta">{message.kind} / {message.actor?.agentId ?? message.fromBoardId ?? 'Coordinator'}{message.toAgentId ? ` -> ${message.toAgentId}` : message.toBoardId ? ` -> Board ${message.toBoardId}` : ''}</span>
                   </div>
                 </div>
               ))}

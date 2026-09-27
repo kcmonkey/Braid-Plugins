@@ -1,7 +1,6 @@
 import type {
   AgentToolContext,
   AudioGenerationRequest,
-  HostRunBoardEvent,
   HostService,
   HostServiceContext,
   HostServicePlugin,
@@ -29,8 +28,10 @@ type DriverStatus = 'pending' | 'succeeded' | 'failed' | 'canceled';
 
 interface AudioDriverRecord {
   requestKey: string;
-  canvasId: string;
-  boardId: string;
+  /** Absent only in persisted pre-Agent records. */
+  agentId?: string;
+  canvasId?: string;
+  boardId?: string;
   turnIndex: number;
   providerId: string;
   request: AudioGenerationRequest;
@@ -111,20 +112,12 @@ class AudioArtifactsHostService implements HostService {
   label = 'Audio Artifacts Host Service';
   manifest = manifest;
   private readonly records = new Map<string, AudioDriverRecord>();
-  private readonly inFlight = new Map<string, { kind: AudioGenerationKind; promise: Promise<AgentToolResult> }>();
+  private readonly inFlight = new Map<string, { agentId: string; kind: AudioGenerationKind; promise: Promise<AgentToolResult> }>();
 
   constructor(private readonly host: HostServiceContext) {}
 
   agentTools() {
     return createAudioGenerateAgentTools(this.host, { generate: (ctx, req) => this.handleGenerate(ctx, req) });
-  }
-
-  async onBoardAbort(event: HostRunBoardEvent): Promise<void> {
-    await this.releaseLiveBoardRecords(event, 'Audio generation request was interrupted; re-run the same producer tool with the same requestId to resume.');
-  }
-
-  async onRunError(event: HostRunBoardEvent): Promise<void> {
-    await this.releaseLiveBoardRecords(event, event.message || 'Audio generation request was interrupted; re-run the same producer tool with the same requestId to resume.');
   }
 
   private async configuredService(ctx: AgentToolContext, kind: AudioGenerationKind): Promise<{ target?: AudioServiceTarget; error?: string }> {
@@ -155,7 +148,7 @@ class AudioArtifactsHostService implements HostService {
 
   private requestKey(ctx: AgentToolContext, providerId: string, req: AudioGenerateToolRequest): string {
     if (req.requestId) return req.requestId;
-    return `${ctx.canvasId}:${ctx.boardId}:${ctx.turnIndex}:${shortHash(stableJson({
+    return `agent:${ctx.agentId}:${ctx.turnIndex}:${shortHash(stableJson({
       providerId,
       kind: req.kind,
       content: req.kind === 'speech' ? req.input ?? '' : req.prompt ?? '',
@@ -244,6 +237,7 @@ class AudioArtifactsHostService implements HostService {
   }
 
   private async handleGenerate(ctx: AgentToolContext, req: AudioGenerateToolRequest): Promise<AgentToolResult> {
+    if (!ctx.agentId) return this.result(false, { error: 'Audio generation requires an exact executing Agent identity.' });
     if (req.optionsJson && !req.options) {
       return this.result(false, { error: 'optionsJson must be a valid JSON object.' });
     }
@@ -256,6 +250,10 @@ class AudioArtifactsHostService implements HostService {
       });
     }
     const existingById = req.requestId ? await this.readRecord(req.requestId) : undefined;
+    if (existingById && (existingById.agentId ? existingById.agentId !== ctx.agentId
+      : ctx.presentation === 'headless' || !ctx.canvasId || !ctx.boardId || existingById.canvasId !== ctx.canvasId || existingById.boardId !== ctx.boardId)) {
+      return this.result(false, { requestId: req.requestId, error: 'This generation request belongs to another Agent or legacy presentation.' });
+    }
     if (existingById && existingById.request.kind !== req.kind) {
       return this.result(false, {
         requestId: req.requestId,
@@ -281,6 +279,7 @@ class AudioArtifactsHostService implements HostService {
     const requestKey = existingById?.requestKey ?? this.requestKey(ctx, target.providerId, req);
     const alreadyRunning = this.inFlight.get(requestKey);
     if (alreadyRunning) {
+      if (alreadyRunning.agentId !== ctx.agentId) return this.result(false, { requestId: requestKey, error: 'This generation request belongs to another Agent.' });
       if (alreadyRunning.kind !== req.kind) {
         return this.result(false, {
           requestId: requestKey,
@@ -291,7 +290,7 @@ class AudioArtifactsHostService implements HostService {
     }
     const running = this.dispatchGenerate(ctx, req, target, requestKey, existingById)
       .finally(() => this.inFlight.delete(requestKey));
-    this.inFlight.set(requestKey, { kind: req.kind, promise: running });
+    this.inFlight.set(requestKey, { agentId: ctx.agentId, kind: req.kind, promise: running });
     return running;
   }
 
@@ -327,8 +326,9 @@ class AudioArtifactsHostService implements HostService {
     if (!record) {
       record = {
         requestKey,
-        canvasId: ctx.canvasId,
-        boardId: ctx.boardId,
+        agentId: ctx.agentId,
+        canvasId: ctx.presentation === 'headless' ? undefined : ctx.canvasId,
+        boardId: ctx.presentation === 'headless' ? undefined : ctx.boardId,
         turnIndex: ctx.turnIndex,
         providerId: target.providerId,
         request,
@@ -338,7 +338,8 @@ class AudioArtifactsHostService implements HostService {
     }
     try {
       const audio = await this.host.generateAudioWithEngine!(target.engine, record.request, ctx.signal);
-      const produced = await this.host.produceArtifact(ctx.canvasId, ctx.boardId, {
+      const produced = await this.host.produceArtifact(record.canvasId, record.boardId, {
+        producerAgentId: ctx.agentId,
         source: 'born',
         dataType: AUDIO_DATA_TYPE,
         label: audio.label || `${requestKey}.mp3`,
@@ -346,7 +347,7 @@ class AudioArtifactsHostService implements HostService {
         metadata: { ...(audio.metadata ?? {}), generationKind: record.request.kind },
         pluginId: manifest.id,
         bytes: audio.bytes,
-        ...(req.attachToTurn !== false ? { attachTo: { turnIndex: ctx.turnIndex } } : {}),
+        ...(req.attachToTurn !== false && ctx.presentation !== 'headless' && ctx.canvasId && ctx.boardId ? { attachTo: { turnIndex: ctx.turnIndex } } : {}),
       });
       if (produced.error || !produced.ref) {
         record = { ...record, status: 'failed', error: produced.error || 'Artifact production failed.' };
@@ -363,14 +364,6 @@ class AudioArtifactsHostService implements HostService {
     }
   }
 
-  private async releaseLiveBoardRecords(event: HostRunBoardEvent, message: string): Promise<void> {
-    const updates = [...this.records.values()]
-      .filter((record) => record.canvasId === event.canvasId && record.boardId === event.boardId && record.status === 'pending');
-    for (const record of updates) {
-      await this.writeRecord({ ...record, error: message }, 'audio-generation-released');
-      this.records.delete(record.requestKey);
-    }
-  }
 }
 
 export const audioArtifactsHostServicePlugin: HostServicePlugin = {

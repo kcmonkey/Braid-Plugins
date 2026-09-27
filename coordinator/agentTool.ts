@@ -18,6 +18,7 @@ export interface CoordinateToolRequest {
   mode?: CoordinateMode;
   priority?: CoordinatePriority;
   toBoardId?: string;
+  toAgentId?: string;
   text?: string;
   summary?: string;
 }
@@ -41,6 +42,7 @@ export function normalizeCoordinateArgs(input: Record<string, unknown>): Coordin
     mode: isOneOf(MODES, input.mode) ? input.mode : undefined,
     priority: isOneOf(PRIORITIES, input.priority) ? input.priority : undefined,
     toBoardId: typeof input.toBoardId === 'string' ? input.toBoardId : undefined,
+    toAgentId: typeof input.toAgentId === 'string' ? input.toAgentId : undefined,
     text: typeof input.text === 'string' ? input.text : undefined,
     summary: typeof input.summary === 'string' ? input.summary : undefined,
   };
@@ -54,7 +56,7 @@ export function createCoordinatorAgentTool(handle: CoordinateToolHandler): Agent
     tool: {
       namespace: 'braid',
       name: 'coordinate',
-      description: 'Coordinate shared workspace resources and file write claims with OTHER Braid boards in the same project. action="status": list declared resources + who holds/wants what. action="claim": claim a declared resource BEFORE an editor/build lifecycle action. action="wait": claim AND block until a declared resource frees. action="wait-file": block on an existing file claim using `path`; call it ONCE after a write is denied instead of polling or ending the turn merely because that file is busy. Files remain file claims and do not need entries in .braid/resources.json. action="release": release your claims when done. action="request": ask a specific board (toBoardId) to release/coordinate, passing `text`. IMPORTANT: only an ACTIVE claim grants a resource or file. A PENDING/BLOCKED result grants NOTHING. Stop only the gated conflicting action, then use the matching wait action once; never claim progress until the wait result says you HOLD it / ACTIVE.',
+      description: 'Coordinate shared workspace resources and file write claims between exact Braid Agents in the same project, with or without a Board. action="status": list resources and exact Agent owners. action="claim": claim a declared resource BEFORE an editor/build lifecycle action. action="wait": claim AND block until the resource is available. action="wait-file": wait on one file path after a write conflict; do not poll. Files need no resource declaration. action="release": release this Agent\'s claims. action="request": ask toAgentId to release/coordinate; toBoardId is optional explicit presentation addressing and cannot be combined with toAgentId. Only ACTIVE claims grant permission to the exact claimant. A parent\'s claim or message grants no resource to another Agent. Claims last until explicit release or this Agent\'s execution ends. A PENDING/BLOCKED result grants nothing; stop only the conflicting action and use its matching wait.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
@@ -66,9 +68,10 @@ export function createCoordinatorAgentTool(handle: CoordinateToolHandler): Agent
           desiredState: { type: 'string', description: 'For state resources, the state you need (e.g. "open"/"closed").' },
           mode: { type: 'string', enum: MODES, description: "Claim mode (defaults to the resource's declared kind)." },
           priority: { type: 'string', enum: PRIORITIES, description: 'Claim priority.' },
-          toBoardId: { type: 'string', description: 'For action="request": the board id to ask (from status / context).' },
-          text: { type: 'string', description: 'For action="request": what you are asking the other board.' },
-          summary: { type: 'string', description: 'Short reason, shown to other boards.' },
+          toBoardId: { type: 'string', description: 'For action="request": an explicit displayed Board in the current Canvas. Resolved to its exact Agent; cannot be combined with toAgentId.' },
+          toAgentId: { type: 'string', description: 'For action="request": the exact Agent id to ask (from status / context), including headless Agents. Cannot be combined with toBoardId.' },
+          text: { type: 'string', description: 'For action="request": what you are asking the other Agent.' },
+          summary: { type: 'string', description: 'Short reason, shown to other Agents.' },
         },
       },
     },

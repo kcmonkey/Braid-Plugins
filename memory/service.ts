@@ -606,6 +606,9 @@ class MemoryHostService implements HostService {
   }
 
   private markMemoryWrite(ctx: AgentToolContext): void {
+    // This set only supports the Board-turn presentation audit in onTurnSettled.
+    // Autonomous writes retain their exact Agent producer and never satisfy a parent's turn.
+    if (!ctx.canvasId || !ctx.boardId) return;
     this.memoryWritesByTurn.add(turnKey(ctx.canvasId, ctx.boardId, ctx.turnIndex));
   }
 
@@ -672,7 +675,12 @@ export const memoryHostServicePlugin: HostServicePlugin = {
 };
 
 function memoryProducer(ctx: AgentToolContext) {
-  return { canvasId: ctx.canvasId, boardId: ctx.boardId, pluginId: 'memory' };
+  return {
+    canvasId: ctx.canvasId,
+    boardId: ctx.boardId,
+    ...(ctx.agentId ? { agentId: ctx.agentId } : {}),
+    pluginId: 'memory',
+  };
 }
 
 function turnKey(canvasId: string, boardId: string, turnIndex: number): string {

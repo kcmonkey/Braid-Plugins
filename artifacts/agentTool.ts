@@ -109,10 +109,10 @@ export function createArtifactAgentTools(handlers: ArtifactToolHandlers, options
         namespace: 'braid',
         name: 'artifact_expect',
         description: [
-          'Declare the latest expectation for whether the current turn should produce a user-facing artifact; this is not an artifact declaration.',
-          'Pass dataType (for example "report", "mockup", or "meta") to expect a user-facing artifact from this turn, or nothing:true after deciding this turn should produce no user-facing artifact.',
+          'Declare the latest artifact expectation for this exact Agent turn; this is not an artifact declaration.',
+          'Pass dataType (for example "report", "mockup", or "meta") to expect a deliverable artifact from this turn, or nothing:true after deciding this turn should produce no artifact.',
           'A redundant nothing:false alongside dataType is accepted and ignored; nothing:true together with dataType is contradictory and rejected.',
-          'Use dataType when your current agent judgment is that this turn should produce an artifact, then use braid.artifact_declare with attachToTurn:true to actually declare and attach the artifact output.',
+          'Use dataType when your current judgment is that this turn should produce an artifact, then use braid.artifact_declare to publish its exact ref. Use attachToTurn:true only with a current Board-turn presentation; otherwise include the ref in the assigned delivery.',
           'Use expect nothing (nothing:true) only after deciding this turn should produce no user-facing artifact. Observed output candidates are context for your agent judgment, not automatic proof that an artifact is required.',
           'You may call this multiple times as your judgment changes; Braid audits the latest expectation.',
         ].join(' '),

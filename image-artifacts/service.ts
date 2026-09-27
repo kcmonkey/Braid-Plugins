@@ -30,15 +30,17 @@ const IMAGE_DATA_TYPE = 'image';
 const IMAGE_JOB_PREFIX = 'image-job:';
 const RECOVERED_PENDING_ERROR = 'Image generation was already dispatched but has no terminal provider result; replay is disabled to prevent duplicate provider dispatch.';
 const IMAGE_RECORD_KEYS = new Set([
-  'requestKey', 'canvasId', 'boardId', 'turnIndex', 'providerId', 'request', 'providerTaskId',
+  'requestKey', 'agentId', 'canvasId', 'boardId', 'turnIndex', 'providerId', 'request', 'providerTaskId',
   'status', 'obligationPendingRecorded', 'obligationSettledRecorded', 'artifactId', 'error',
 ]);
 const IMAGE_REQUEST_KEYS = new Set(['requestId', 'prompt', 'options']);
 
 interface ImageDriverRecord {
   requestKey: string;
-  canvasId: string;
-  boardId: string;
+  /** Absent only in persisted pre-Agent records. */
+  agentId?: string;
+  canvasId?: string;
+  boardId?: string;
   turnIndex: number;
   providerId: string;
   request: ImageGenerationRequest;
@@ -70,8 +72,7 @@ interface ArtifactCommitResult {
 }
 
 interface InFlightGeneration {
-  canvasId: string;
-  boardId: string;
+  agentId: string;
   promise: Promise<AgentToolResult>;
 }
 
@@ -127,8 +128,11 @@ function asRecord(value: unknown, expectedRequestKey?: string): ImageDriverRecor
   if (Object.keys(candidate).some((key) => !IMAGE_RECORD_KEYS.has(key))) return undefined;
   if (!strictString(candidate.requestKey)
     || (expectedRequestKey !== undefined && candidate.requestKey !== expectedRequestKey)
-    || !strictString(candidate.canvasId)
-    || !strictString(candidate.boardId)
+    || (candidate.agentId !== undefined && !strictString(candidate.agentId))
+    || (candidate.canvasId !== undefined && !strictString(candidate.canvasId))
+    || (candidate.boardId !== undefined && !strictString(candidate.boardId))
+    || ((candidate.canvasId === undefined) !== (candidate.boardId === undefined))
+    || (!candidate.agentId && (!candidate.canvasId || !candidate.boardId))
     || !Number.isSafeInteger(candidate.turnIndex)
     || candidate.turnIndex < 0
     || !strictString(candidate.providerId)
@@ -184,28 +188,12 @@ class ImageArtifactsHostService implements HostService {
     return [createImageGenerateAgentTool(this.host, { generate: (ctx, req) => this.handleGenerate(ctx, req) })];
   }
 
-  async onBoardAbort(event: HostRunBoardEvent): Promise<void> {
-    await this.settleLiveBoardRecords(event, 'canceled', 'Image generation request was canceled because the board run was interrupted.');
-  }
-
-  async onRunError(event: HostRunBoardEvent): Promise<void> {
-    await this.settleLiveBoardRecords(event, 'failed', event.message || 'Image generation request failed before a terminal provider result was recorded.');
-  }
-
   async onBoardAsyncIdle(event: HostRunBoardEvent): Promise<void> {
     await this.hydrateBoardRecords(event.canvasId, event.boardId);
   }
 
   async onRunSettled(event: HostRunLifecycleEvent): Promise<void> {
     for (const boardId of event.boardIds) await this.hydrateBoardRecords(event.canvasId, boardId);
-  }
-
-  async onCanvasClose(canvasId: string): Promise<void> {
-    for (const [requestKey, record] of this.records) {
-      if (record.canvasId !== canvasId) continue;
-      this.emittedPending.delete(requestKey);
-      this.emittedSettled.delete(requestKey);
-    }
   }
 
   private providerContext(plugin: ImageGenerationProviderPlugin) {
@@ -249,7 +237,7 @@ class ImageArtifactsHostService implements HostService {
 
   private requestKey(ctx: AgentToolContext, providerId: string, req: ImageGenerateToolRequest): string {
     if (req.requestId) return req.requestId;
-    return `${ctx.canvasId}:${ctx.boardId}:${ctx.turnIndex}:${shortHash(stableJson({
+    return `agent:${ctx.agentId}:${ctx.turnIndex}:${shortHash(stableJson({
       providerId,
       prompt: req.prompt ?? '',
       options: req.options ?? {},
@@ -353,11 +341,13 @@ class ImageArtifactsHostService implements HostService {
   }
 
   private obligationId(record: ImageDriverRecord): string {
-    return artifactOutputObligationId({ canvasId: record.canvasId, boardId: record.boardId, turnIndex: record.turnIndex });
+    return artifactOutputObligationId(this.obligationTarget(record));
   }
 
   private obligationTarget(record: ImageDriverRecord) {
-    return { canvasId: record.canvasId, boardId: record.boardId, turnIndex: record.turnIndex };
+    return record.canvasId && record.boardId
+      ? { canvasId: record.canvasId, boardId: record.boardId, turnIndex: record.turnIndex }
+      : { agentId: record.agentId, turnIndex: record.turnIndex };
   }
 
   private async ensureProviderIdentity(record: ImageDriverRecord): Promise<ImageDriverRecord> {
@@ -505,10 +495,10 @@ class ImageArtifactsHostService implements HostService {
       if (record?.canvasId !== canvasId || record.boardId !== boardId) continue;
       this.projectRecord(record);
       if (record.status !== 'succeeded' || !record.artifactId || !this.host.reconcileArtifactRoot) continue;
-      const reconciled = await this.host.reconcileArtifactRoot(canvasId, boardId, {
+      const reconciled = await this.host.reconcileArtifactRoot(record.canvasId, record.boardId, {
         id: record.artifactId,
         version: 1,
-      });
+      }, record.agentId);
       if (reconciled.error) {
         throw new Error(`Failed to reconcile image artifact root for '${record.requestKey}': ${reconciled.error}`);
       }
@@ -583,6 +573,7 @@ class ImageArtifactsHostService implements HostService {
   }
 
   private async handleGenerate(ctx: AgentToolContext, req: ImageGenerateToolRequest): Promise<AgentToolResult> {
+    if (!ctx.agentId) return this.result(false, { error: 'Image generation requires an exact executing Agent identity.' });
     if (req.cancel && !req.requestId && !req.prompt?.trim()) {
       return this.result(false, { error: 'requestId or prompt is required to cancel an image generation request.' });
     }
@@ -593,10 +584,10 @@ class ImageArtifactsHostService implements HostService {
       return this.result(false, { requestId: req.requestId, error: String(error?.message ?? error) });
     }
     if (existingById) {
-      if (existingById.canvasId !== ctx.canvasId || existingById.boardId !== ctx.boardId) {
+      if (!this.requestOwnedBy(existingById, ctx)) {
         return this.result(false, {
           requestId: existingById.requestKey,
-          error: `Request '${existingById.requestKey}' is bound to a different Canvas/Board and cannot be reused here.`,
+          error: `Request '${existingById.requestKey}' belongs to another Agent or legacy presentation.`,
         });
       }
       if (req.cancel) return this.cancelRecord(existingById);
@@ -606,8 +597,8 @@ class ImageArtifactsHostService implements HostService {
       }
       const alreadyRunning = this.inFlight.get(existingById.requestKey);
       if (alreadyRunning) {
-        if (alreadyRunning.canvasId !== ctx.canvasId || alreadyRunning.boardId !== ctx.boardId) {
-          return this.result(false, { requestId: existingById.requestKey, error: 'Request is bound to a different Canvas/Board and cannot be reused here.' });
+        if (alreadyRunning.agentId !== ctx.agentId) {
+          return this.result(false, { requestId: existingById.requestKey, error: 'Request belongs to another Agent.' });
         }
         return alreadyRunning.promise;
       }
@@ -628,8 +619,8 @@ class ImageArtifactsHostService implements HostService {
     const requestKey = this.requestKey(ctx, target.providerId, req);
     const alreadyRunning = this.inFlight.get(requestKey);
     if (alreadyRunning) {
-      if (alreadyRunning.canvasId !== ctx.canvasId || alreadyRunning.boardId !== ctx.boardId) {
-        return this.result(false, { requestId: requestKey, error: 'Request is bound to a different Canvas/Board and cannot be reused here.' });
+      if (alreadyRunning.agentId !== ctx.agentId) {
+        return this.result(false, { requestId: requestKey, error: 'Request belongs to another Agent.' });
       }
       const current = await this.readRecord(requestKey);
       if (current && isTerminalStatus(current.status)) return this.terminalResult(await this.ensureTerminalSettlement(current));
@@ -639,7 +630,7 @@ class ImageArtifactsHostService implements HostService {
       .finally(() => {
         if (this.inFlight.get(requestKey)?.promise === running) this.inFlight.delete(requestKey);
       });
-    this.inFlight.set(requestKey, { canvasId: ctx.canvasId, boardId: ctx.boardId, promise: running });
+    this.inFlight.set(requestKey, { agentId: ctx.agentId, promise: running });
     return running;
   }
 
@@ -657,8 +648,8 @@ class ImageArtifactsHostService implements HostService {
       return this.result(false, { requestId: requestKey, error: String(error?.message ?? error) });
     }
     if (existing) {
-      if (existing.canvasId !== ctx.canvasId || existing.boardId !== ctx.boardId) {
-        return this.result(false, { requestId: existing.requestKey, error: 'Request is bound to a different Canvas/Board and cannot be reused here.' });
+      if (!this.requestOwnedBy(existing, ctx)) {
+        return this.result(false, { requestId: existing.requestKey, error: 'Request belongs to another Agent or legacy presentation.' });
       }
       const identified = await this.ensureProviderIdentity(existing);
       if (req.cancel) return this.cancelRecord(identified);
@@ -686,8 +677,9 @@ class ImageArtifactsHostService implements HostService {
     try {
       record = {
         requestKey,
-        canvasId: ctx.canvasId,
-        boardId: ctx.boardId,
+        agentId: ctx.agentId,
+        canvasId: ctx.presentation === 'headless' ? undefined : ctx.canvasId,
+        boardId: ctx.presentation === 'headless' ? undefined : ctx.boardId,
         turnIndex: ctx.turnIndex,
         providerId: target.providerId,
         request,
@@ -761,13 +753,11 @@ class ImageArtifactsHostService implements HostService {
     }
   }
 
-  private async settleLiveBoardRecords(event: HostRunBoardEvent, status: 'failed' | 'canceled', message: string): Promise<void> {
-    await this.hydrateBoardRecords(event.canvasId, event.boardId);
-    const updates = [...this.records.values()]
-      .filter((record) => record.canvasId === event.canvasId && record.boardId === event.boardId && record.status === 'pending');
-    for (const record of updates) {
-      await this.settleGeneration(record, status, message, `image-generation-${status}`);
-    }
+  private requestOwnedBy(record: ImageDriverRecord, ctx: AgentToolContext): boolean {
+    if (record.agentId) return record.agentId === ctx.agentId;
+    // Retain exact replay of durable pre-Agent requests without adopting them into a Worker.
+    return ctx.presentation !== 'headless' && !!ctx.canvasId && !!ctx.boardId
+      && record.canvasId === ctx.canvasId && record.boardId === ctx.boardId;
   }
 
   private async commitArtifact(
@@ -802,9 +792,10 @@ class ImageArtifactsHostService implements HostService {
     let produced: ProducedArtifact;
     try {
       produced = await atomicCommit(
-        ctx.canvasId,
-        ctx.boardId,
+        record.canvasId,
+        record.boardId,
         {
+          producerAgentId: record.agentId,
           source: 'born',
           dataType: IMAGE_DATA_TYPE,
           label: image.label || `${record.requestKey}.png`,
@@ -812,7 +803,7 @@ class ImageArtifactsHostService implements HostService {
           ...(image.metadata ? { metadata: image.metadata } : {}),
           pluginId: manifest.id,
           bytes: image.bytes,
-          ...(req.attachToTurn !== false ? { attachTo: { turnIndex: record.turnIndex } } : {}),
+          ...(req.attachToTurn !== false && record.canvasId && record.boardId ? { attachTo: { turnIndex: record.turnIndex } } : {}),
         },
         {
           pluginId: manifest.id,

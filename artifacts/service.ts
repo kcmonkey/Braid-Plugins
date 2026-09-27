@@ -203,7 +203,9 @@ class ArtifactsHostService implements HostService {
 
   private obligationTarget(ctx: AgentToolContext | ToolMiddlewareContext): ObligationTarget | undefined {
     if (typeof ctx.turnIndex !== 'number') return undefined;
-    return { canvasId: ctx.canvasId, boardId: ctx.boardId, turnIndex: ctx.turnIndex };
+    if ('obligationTarget' in ctx && ctx.obligationTarget) return ctx.obligationTarget;
+    if (ctx.canvasId && ctx.boardId) return { canvasId: ctx.canvasId, boardId: ctx.boardId, turnIndex: ctx.turnIndex };
+    return ctx.agentId ? { agentId: ctx.agentId, turnIndex: ctx.turnIndex } : undefined;
   }
 
   private recordObligationEvent(event: ObligationLedgerEvent): void {
@@ -259,8 +261,8 @@ class ArtifactsHostService implements HostService {
 
   private async handleDeclare(ctx: AgentToolContext, req: ArtifactDeclareToolRequest): Promise<AgentToolResult> {
     if (ctx.signal.aborted) return { ok: false, result: 'Artifact declaration canceled.' };
-    if (ctx.presentation === 'headless' && req.attachToTurn) {
-      return { ok: false, result: 'A headless BraidAgent cannot attach an artifact to a Board turn; pass the exact ref to finish instead.' };
+    if (req.attachToTurn && (ctx.presentation === 'headless' || !ctx.canvasId || !ctx.boardId)) {
+      return { ok: false, result: 'Artifact attachment needs a current Board-turn presentation. Declare without attachToTurn and pass the exact artifact ref in your delivery.' };
     }
     const dataType = nonEmpty(req.dataType) ?? this.artifactTypes.metaDataType;
     const label = nonEmpty(req.label);
@@ -272,10 +274,12 @@ class ArtifactsHostService implements HostService {
     if (!hasText && !sourcePath) return { ok: false, result: 'artifact_declare needs either non-empty text or a workspace path.' };
     if (sourcePath && !storageMode) return { ok: false, result: 'artifact_declare path declarations need storageMode "external-ref" or "born".' };
     if (!sourcePath && nonEmpty(req.storageMode)) return { ok: false, result: 'artifact_declare storageMode only applies to path declarations.' };
+    const canvasId = ctx.canvasId;
+    const boardId = ctx.boardId;
 
     try {
       const result = sourcePath
-        ? await this.host.produceArtifact(ctx.canvasId, ctx.boardId, {
+        ? await this.host.produceArtifact(canvasId, boardId, {
           source: storageMode!,
           dataType,
           ...(nonEmpty(req.mime) ? { mime: nonEmpty(req.mime) } : {}),
@@ -285,7 +289,7 @@ class ArtifactsHostService implements HostService {
           ...(ctx.agentId ? { producerAgentId: ctx.agentId } : {}),
           ...(req.attachToTurn ? { attachTo: { turnIndex: ctx.turnIndex } } : {}),
         })
-        : await this.host.produceArtifact(ctx.canvasId, ctx.boardId, {
+        : await this.host.produceArtifact(canvasId, boardId, {
           source: 'declared',
           dataType,
           mime: nonEmpty(req.mime) ?? DEFAULT_MIME,
@@ -296,7 +300,13 @@ class ArtifactsHostService implements HostService {
           ...(req.attachToTurn ? { attachTo: { turnIndex: ctx.turnIndex } } : {}),
         });
       if (result.error || !result.ref) return { ok: false, result: result.error ?? 'artifact_declare failed.' };
-      if (sourcePath && req.attachToTurn) {
+      const target = this.obligationTarget(ctx);
+      if (!req.attachToTurn && target) {
+        this.recordObligationEvent({
+          type: 'artifact-produced', target, dataType: result.ref.dataType, refId: result.ref.id,
+        });
+      }
+      if (sourcePath && req.attachToTurn && ctx.canvasId && ctx.boardId) {
         this.coverCandidate(ctx.canvasId, ctx.boardId, ctx.turnIndex, sourcePath);
       }
       return {
@@ -325,7 +335,8 @@ class ArtifactsHostService implements HostService {
     if (dataType && expectsNothing) return { ok: false, result: 'artifact_expect accepts either dataType or nothing, not both.' };
     if (!dataType && !expectsNothing) return { ok: false, result: 'artifact_expect needs either dataType or nothing:true.' };
     const reason = nonEmpty(req.reason);
-    const target = { canvasId: ctx.canvasId, boardId: ctx.boardId, turnIndex: ctx.turnIndex };
+    const target = this.obligationTarget(ctx);
+    if (!target) return { ok: false, result: 'Artifact expectation needs an exact current Agent or Board-turn target.' };
 
     if (expectsNothing) {
       this.recordObligationEvent({
@@ -394,6 +405,13 @@ class ArtifactsHostService implements HostService {
     }
     const paths = collectDeliverableCandidatePaths(this.host.cwd(), ctx.toolName, ctx.input);
     if (!paths.length) return;
+    if (!ctx.canvasId || !ctx.boardId) {
+      // Candidate observations need no presentation-owned cache for autonomous Agent turns.
+      for (const candidatePath of paths) {
+        this.recordObligationEvent({ type: 'artifact-output-candidate-observed', target, path: candidatePath, toolName: ctx.toolName });
+      }
+      return;
+    }
     const key = turnCandidateKey(ctx.canvasId, ctx.boardId, ctx.turnIndex);
     const covered = this.coveredPaths.get(key) ?? new Set<string>();
     let bucket = this.candidates.get(key);

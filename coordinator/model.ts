@@ -8,6 +8,7 @@ export type NegotiationStatus = 'proposed' | 'accepted' | 'countered' | 'rejecte
 export type NegotiationAction = 'propose' | 'accept' | 'counter' | 'reject' | 'resolve' | 'needs-user-decision';
 
 export type CoordinationActorKind =
+  | 'agent'
   | 'topLevel'
   | 'providerSubagent'
   | 'providerThread'
@@ -15,7 +16,9 @@ export type CoordinationActorKind =
   | 'toolRun';
 
 export interface CoordinationActor {
-  boardId: string;
+  /** Exact execution subject; Board coordinates are presentation only. */
+  agentId?: string;
+  boardId?: string;
   provider?: EngineId;
   kind: CoordinationActorKind;
   actorId?: string;
@@ -35,8 +38,9 @@ export interface CoordinationCapabilityState {
 
 export interface FileClaim {
   id: string;
-  canvasId: string;
-  boardId: string;
+  agentId: string;
+  canvasId?: string;
+  boardId?: string;
   actor?: CoordinationActor;
   path: string;
   access: CoordinationAccess;
@@ -56,8 +60,9 @@ export interface ClaimConflict {
 
 export interface ResourceClaim {
   id: string;
-  canvasId: string;
-  boardId: string;
+  agentId: string;
+  canvasId?: string;
+  boardId?: string;
   actor?: CoordinationActor;
   resource: string;
   mode: ResourceClaimMode;
@@ -72,7 +77,7 @@ export interface ResourceClaim {
 }
 
 /** Task-owned claims live in the same foundation ledger, without Board/Canvas attribution or TTL. */
-export interface TaskResourceClaim extends Omit<ResourceClaim, 'canvasId' | 'boardId' | 'actor' | 'expiresAt'> {
+export interface TaskResourceClaim extends Omit<ResourceClaim, 'agentId' | 'canvasId' | 'boardId' | 'actor' | 'expiresAt'> {
   taskId: string;
   label: string;
 }
@@ -138,8 +143,9 @@ export interface WorkIntent {
 
 export interface BoardMessage {
   id: string;
-  canvasId: string;
-  fromBoardId: string;
+  canvasId?: string;
+  fromBoardId?: string;
+  toAgentId?: string;
   toBoardId?: string;
   actor?: CoordinationActor;
   kind: 'status' | 'release' | 'handoff' | 'question' | 'answer' | 'note';
@@ -153,7 +159,7 @@ export interface BoardMessage {
 
 export interface NegotiationTurn {
   id: string;
-  boardId: string;
+  boardId?: string;
   actor?: CoordinationActor;
   action: NegotiationAction;
   text: string;
@@ -162,7 +168,7 @@ export interface NegotiationTurn {
 
 export interface NegotiationThread {
   id: string;
-  canvasId: string;
+  canvasId?: string;
   topic: string;
   status: NegotiationStatus;
   boardIds: string[];
@@ -176,7 +182,7 @@ export interface NegotiationThread {
 }
 
 export interface CoordinationSnapshot {
-  canvasId: string;
+  canvasId?: string;
   claims: FileClaim[];
   resourceClaims: ResourceClaim[];
   taskResourceClaims: TaskResourceClaim[];
@@ -201,8 +207,9 @@ export interface CoordinationState {
 }
 
 export interface ClaimRequest {
-  canvasId: string;
-  boardId: string;
+  agentId: string;
+  canvasId?: string;
+  boardId?: string;
   actor?: CoordinationActor;
   path: string;
   access: CoordinationAccess;
@@ -225,8 +232,9 @@ export interface ResourceRequirementRequest {
 }
 
 export interface ResourceClaimRequest extends ResourceRequirementRequest {
-  canvasId: string;
-  boardId: string;
+  agentId: string;
+  canvasId?: string;
+  boardId?: string;
   actor?: CoordinationActor;
 }
 
@@ -251,8 +259,9 @@ export interface WorkIntentInput {
 }
 
 export interface BoardMessageInput {
-  canvasId: string;
-  fromBoardId: string;
+  canvasId?: string;
+  fromBoardId?: string;
+  toAgentId?: string;
   toBoardId?: string;
   actor?: CoordinationActor;
   kind: BoardMessage['kind'];
@@ -265,7 +274,7 @@ export interface BoardMessageInput {
 
 export interface NegotiationInput {
   id?: string;
-  canvasId: string;
+  canvasId?: string;
   topic: string;
   boardIds: string[];
   actor?: CoordinationActor;
@@ -278,7 +287,6 @@ export interface NegotiationInput {
   now?: number;
 }
 
-const DEFAULT_TTL_MS = 10 * 60_000;
 
 export const emptyCoordinationState = (): CoordinationState => ({
   claims: [],
@@ -489,9 +497,10 @@ const activeAt = (claim: { status: ClaimStatus; expiresAt?: number }, now: numbe
 const liveAt = (claim: { status: ClaimStatus; expiresAt?: number }, now: number): boolean =>
   (claim.status === 'active' || claim.status === 'pending') && (claim.expiresAt == null || claim.expiresAt > now);
 
-/** Stable coordination-record key; never an execution selector. */
-export function ownerKey(entry: { canvasId: string; boardId: string }): string {
-  return `${entry.canvasId}::${entry.boardId}`;
+/** Exact execution owner. Presentation changes never transfer a claim. */
+export function ownerKey(entry: { agentId: string }): string {
+  if (!entry.agentId?.trim()) throw new Error('Coordinator requires an exact Agent identity.');
+  return entry.agentId;
 }
 
 const touchesSamePath = (a: string, b: string): boolean => normalizeWorkspacePath(a) === normalizeWorkspacePath(b);
@@ -499,39 +508,36 @@ const touchesSamePath = (a: string, b: string): boolean => normalizeWorkspacePat
 export function compatibleClaims(existing: FileClaim, req: ClaimRequest, now: number): boolean {
   if (!activeAt(existing, now)) return true;
   if (!touchesSamePath(existing.path, req.path)) return true;
-  // Cross-canvas: a board only "re-enters" its OWN claim. Board ids are per-canvas (the webview mints `b${n}`
-  // from a per-canvas counter, so ids collide across canvases) → the owner is the (canvasId, boardId) pair. (cross-canvas)
-  if (existing.canvasId === req.canvasId && existing.boardId === req.boardId) return true;
+  if (ownerKey(existing) === ownerKey(req)) return true;
   return existing.access === 'read' && req.access === 'read';
 }
 
 export function findClaimConflict(state: CoordinationState, req: ClaimRequest): ClaimConflict | null {
   const now = req.now ?? Date.now();
   const path = normalizeWorkspacePath(req.path);
-  // Cross-canvas: file conflicts span every canvas in the project (shared filesystem). `compatibleClaims`
-  // scopes "own board" by the (canvasId, boardId) pair, so a different board in another canvas still conflicts.
+  // All exact Agents in the project share the same filesystem, including siblings presented by one Board.
   const blocking = state.claims.filter((claim) => !compatibleClaims(claim, { ...req, path }, now));
   if (!blocking.length) return null;
   return {
     path,
-    requestedBy: req.actor ?? { boardId: req.boardId, kind: 'topLevel' },
+    requestedBy: req.actor ?? { agentId: req.agentId, boardId: req.boardId, kind: 'agent' },
     requestedAccess: req.access,
     blocking,
   };
 }
 
 export function claimFile(state: CoordinationState, req: ClaimRequest): { state: CoordinationState; claim?: FileClaim; conflict?: ClaimConflict } {
+  ownerKey(req);
   const now = req.now ?? Date.now();
   const path = normalizeWorkspacePath(req.path);
   const conflict = findClaimConflict(state, { ...req, path, now });
   if (conflict) return { state, conflict };
 
   const existing = state.claims.find((claim) =>
-    claim.canvasId === req.canvasId &&
-    claim.boardId === req.boardId &&
+    ownerKey(claim) === ownerKey(req) &&
     claim.path === path &&
     claim.status !== 'released');
-  const expiresAt = now + (req.ttlMs ?? DEFAULT_TTL_MS);
+  const expiresAt = req.ttlMs === undefined ? undefined : now + req.ttlMs;
   if (existing) {
     const updated: FileClaim = {
       ...existing,
@@ -550,6 +556,7 @@ export function claimFile(state: CoordinationState, req: ClaimRequest): { state:
 
   const claim: FileClaim = {
     id: `claim-${state.seq + 1}`,
+    agentId: req.agentId,
     canvasId: req.canvasId,
     boardId: req.boardId,
     actor: req.actor,
@@ -632,13 +639,13 @@ function resourceModesCompatible(existing: Pick<ResourceClaim, 'resource' | 'mod
 }
 
 export function compatibleResourceClaims(existing: ResourceClaim, req: ResourceClaimRequest, now: number): boolean {
-  if (existing.canvasId === req.canvasId && existing.boardId === req.boardId) return true;
+  if (ownerKey(existing) === ownerKey(req)) return true;
   return resourceModesCompatible(existing, req, now);
 }
 
 export function findResourceClaimConflict(state: CoordinationState, req: ResourceClaimRequest): ResourceClaimConflict | null {
   const now = req.now ?? Date.now();
-  const own = state.resourceClaims.find((claim) => claim.canvasId === req.canvasId && claim.boardId === req.boardId && claim.resource === normalizeResourceKey(req.resource) && claim.status !== 'released');
+  const own = state.resourceClaims.find((claim) => ownerKey(claim) === ownerKey(req) && claim.resource === normalizeResourceKey(req.resource) && claim.status !== 'released');
   const normalizedReq = normalizeResourceClaimRequest(state, { ...req, queuedAt: own?.createdAt ?? req.queuedAt ?? now }, now);
   const { resource, mode } = normalizedReq;
   // Cross-canvas: resource conflicts span every canvas in the project (shared editor/build/etc.).
@@ -647,7 +654,7 @@ export function findResourceClaimConflict(state: CoordinationState, req: Resourc
   if (!blocking.length && !taskBlocking.length) return null;
   return {
     resource,
-    requestedBy: req.actor ?? { boardId: req.boardId, kind: 'topLevel' },
+    requestedBy: req.actor ?? { agentId: req.agentId, boardId: req.boardId, kind: 'agent' },
     requestedMode: mode,
     requestedState: normalizedReq.desiredState,
     requestedPriority: normalizedReq.priority,
@@ -668,7 +675,7 @@ function expandResourceClaimRequests<T extends ResourceRequirementRequest>(state
       inheritedPriority,
     );
     if (!normalized.resource) return;
-    const owner = 'taskId' in normalized ? normalized.taskId : 'boardId' in normalized ? `${'canvasId' in normalized ? normalized.canvasId : ''}:${normalized.boardId}` : '';
+    const owner = 'taskId' in normalized ? normalized.taskId : 'agentId' in normalized ? normalized.agentId : '';
     const key = `${owner}:${normalized.resource}:${normalized.mode}:${normalized.desiredState ?? ''}:${normalized.requiredBy ?? ''}`;
     if (!seen.has(key)) {
       seen.add(key);
@@ -763,17 +770,17 @@ function upsertResourceClaim(
   req: ResourceClaimRequest,
   status: 'active' | 'pending',
 ): { state: CoordinationState; claim?: ResourceClaim } {
+  ownerKey(req);
   const now = req.now ?? Date.now();
   const normalized = normalizeResourceClaimRequest(state, req, now);
   const { resource, desiredState, mode, priority } = normalized;
   if (!resource) return { state };
 
   const existing = state.resourceClaims.find((claim) =>
-    claim.canvasId === req.canvasId &&
-    claim.boardId === req.boardId &&
+    ownerKey(claim) === ownerKey(req) &&
     claim.resource === resource &&
     claim.status !== 'released');
-  const expiresAt = now + (req.ttlMs ?? DEFAULT_TTL_MS);
+  const expiresAt = req.ttlMs === undefined ? undefined : now + req.ttlMs;
   if (existing) {
     const updated: ResourceClaim = {
       ...existing,
@@ -795,6 +802,7 @@ function upsertResourceClaim(
 
   const claim: ResourceClaim = {
     id: `res-${state.seq + 1}`,
+    agentId: req.agentId,
     canvasId: req.canvasId,
     boardId: req.boardId,
     actor: req.actor,
@@ -840,46 +848,17 @@ export function claimResource(
   return { state: result.state, claim: result.claims[0], conflict: result.conflicts[0] };
 }
 
-export function releaseBoardClaims(state: CoordinationState, canvasId: string, boardId: string, now = Date.now()): CoordinationState {
+export function releaseAgentClaims(state: CoordinationState, agentId: string, now = Date.now()): CoordinationState {
   return {
     ...state,
     claims: state.claims.map((claim) =>
-      claim.canvasId === canvasId && claim.boardId === boardId && claim.status !== 'released'
+      claim.agentId === agentId && claim.status !== 'released'
         ? { ...claim, status: 'released', updatedAt: now, expiresAt: undefined }
         : claim),
     resourceClaims: state.resourceClaims.map((claim) =>
-      claim.canvasId === canvasId && claim.boardId === boardId && claim.status !== 'released'
+      claim.agentId === agentId && claim.status !== 'released'
         ? { ...claim, status: 'released', updatedAt: now, expiresAt: undefined }
         : claim),
-  };
-}
-
-export function releaseBoardTransientClaims(state: CoordinationState, canvasId: string, boardId: string, now = Date.now()): CoordinationState {
-  return {
-    ...state,
-    claims: state.claims.map((claim) =>
-      claim.canvasId === canvasId && claim.boardId === boardId && claim.status !== 'released'
-        ? { ...claim, status: 'released', updatedAt: now, expiresAt: undefined }
-        : claim),
-    resourceClaims: state.resourceClaims.map((claim) =>
-      claim.canvasId === canvasId &&
-      claim.boardId === boardId &&
-      claim.status === 'active' &&
-      claim.mode === 'exclusive' &&
-      !claim.desiredState
-        ? { ...claim, status: 'released', updatedAt: now, expiresAt: undefined }
-        : claim),
-  };
-}
-
-export function cleanupCanvas(state: CoordinationState, canvasId: string): CoordinationState {
-  return {
-    ...state,
-    claims: state.claims.filter((claim) => claim.canvasId !== canvasId),
-    resourceClaims: state.resourceClaims.filter((claim) => claim.canvasId !== canvasId),
-    intents: state.intents.filter((intent) => intent.canvasId !== canvasId),
-    messages: state.messages.filter((message) => message.canvasId !== canvasId),
-    negotiations: state.negotiations.filter((thread) => thread.canvasId !== canvasId),
   };
 }
 
@@ -914,8 +893,7 @@ export const RETIRED_PRUNE_AGE_MS = 30 * 60_000;
  * over a long session: `released` claims and `resolved`/`rejected` negotiations older than `maxAgeMs`. Pure +
  * behavior-preserving — returns the SAME `state` when nothing is old enough (zero allocation on the hot publish
  * path). Released claims are NEVER shown (`snapshotForCanvas` filters them) and conflict detection ignores them,
- * and the "Released N" count is taken at release time, so dropping aged ones is invisible. `cleanupCanvas` still
- * wholesale-clears on canvas close. (memory-footprint Phase 4) */
+ * and the "Released N" count is taken at release time, so dropping aged ones is invisible. */
 export function pruneRetiredCoordination(state: CoordinationState, now = Date.now(), maxAgeMs = RETIRED_PRUNE_AGE_MS): CoordinationState {
   const cutoff = now - maxAgeMs;
   const deadClaim = (c: { status: string; updatedAt: number }) => c.status === 'released' && c.updatedAt <= cutoff;
@@ -932,36 +910,27 @@ export function pruneRetiredCoordination(state: CoordinationState, now = Date.no
   };
 }
 
-/** The board that ORIGINATED a negotiation (the requester / the board whose attempt opened the thread): the first
- * turn's board, falling back to the first listed board id for hand-built threads with no turns. Used to decide whose
- * lifecycle owns the thread (retire-on-end) and whether it is still backed by a live board (context liveness gate). */
-export function negotiationOriginatorBoardId(thread: NegotiationThread): string {
-  return thread.turns[0]?.boardId ?? thread.boardIds[0];
+/** The exact Agent that originated this advisory negotiation, when one exists. */
+export function negotiationOriginatorAgentId(thread: NegotiationThread): string | undefined {
+  return thread.turns[0]?.actor?.agentId;
 }
 
-/** Retire the coordination footprint a FINISHED board leaves behind, so other boards stop seeing its request as an
- * active contender after its session is gone. Resolves the negotiations this board ORIGINATED and drops its
- * conflict(`note`)/request(`question`) messages; resource/file CLAIMS are released separately (releaseBoardClaims),
- * and release/status/answer/handoff messages are kept. Call ONLY on a FULL board end (settle / error / abort /
- * delete / explicit release) — NOT async-idle, where the board stays a live contender that may still resume. */
-export function retireBoardCoordination(
+/** Retire only this Agent's advisory request footprint when its execution ends or it releases resources. */
+export function retireAgentCoordination(
   state: CoordinationState,
-  canvasId: string,
-  boardId: string,
+  agentId: string,
   now = Date.now(),
 ): CoordinationState {
   return {
     ...state,
     negotiations: state.negotiations.map((thread) =>
-      thread.canvasId === canvasId &&
-      negotiationOriginatorBoardId(thread) === boardId &&
+      negotiationOriginatorAgentId(thread) === agentId &&
       thread.status !== 'resolved' &&
       thread.status !== 'rejected'
         ? { ...thread, status: 'resolved', updatedAt: now }
         : thread),
     messages: state.messages.filter((message) =>
-      !(message.canvasId === canvasId &&
-        message.fromBoardId === boardId &&
+      !(message.actor?.agentId === agentId &&
         (message.kind === 'note' || message.kind === 'question'))),
   };
 }
@@ -996,6 +965,7 @@ export function addBoardMessage(state: CoordinationState, input: BoardMessageInp
     canvasId: input.canvasId,
     fromBoardId: input.fromBoardId,
     toBoardId: input.toBoardId,
+    toAgentId: input.toAgentId,
     actor: input.actor,
     kind: input.kind,
     text: input.text,
@@ -1003,7 +973,7 @@ export function addBoardMessage(state: CoordinationState, input: BoardMessageInp
     relatedResources: normalizeResourceList(input.relatedResources),
     relatedIntentIds: [...new Set(input.relatedIntentIds ?? [])],
     createdAt: now,
-    readByBoardIds: [input.fromBoardId],
+    readByBoardIds: input.fromBoardId ? [input.fromBoardId] : [],
   };
   return { state: { ...state, seq: state.seq + 1, messages: [...state.messages, message] }, message };
 }
@@ -1087,7 +1057,7 @@ export function snapshotForCanvas(
  * canvases. `canvasId` is the recipient (display) canvas; each row carries its own `canvasId` for attribution. */
 export function projectSnapshot(
   state: CoordinationState,
-  canvasId: string,
+  canvasId: string | undefined,
   now = Date.now(),
 ): CoordinationSnapshot {
   const marked = markStaleClaims(state, now);

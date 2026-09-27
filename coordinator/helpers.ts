@@ -1,5 +1,5 @@
 import * as nodePath from 'path';
-import { normalizeWorkspacePath, ownerKey } from './model';
+import { normalizeWorkspacePath } from './model';
 
 const hasWindowsPathSyntax = (p: string): boolean => /^[a-z]:[\\/]/i.test(p) || /^\\\\/.test(p) || p.includes('\\');
 
@@ -8,12 +8,6 @@ const pathOpsFor = (cwd: string, filePath: string): typeof nodePath.win32 | type
 
 const isInsideRelative = (ops: typeof nodePath.win32 | typeof nodePath.posix, rel: string): boolean =>
   !!rel && rel !== '..' && !rel.startsWith(`..${ops.sep}`) && !ops.isAbsolute(rel);
-
-// Coordination-record identity is delegated to the model `ownerKey` so the
-// `${canvasId}::${boardId}` format has exactly one definition.
-export function actorKey(canvasId: string, boardId: string): string {
-  return ownerKey({ canvasId, boardId });
-}
 
 export function coordinationPath(cwd: string, filePath: string): string {
   const raw = filePath.trim();

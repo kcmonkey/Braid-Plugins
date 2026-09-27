@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import type {
   BoardElementPlugin,
   BoardPluginApi,
@@ -27,13 +27,15 @@ function vaultVersion(board: BoardData): string {
 
 // Discover skills by scanning `.braid/skills/<name>/SKILL.md` and reading each one's frontmatter. Confined to the
 // focused board (mirrors knowledge ADR-6) so a big canvas does not read the vault from every card.
-async function loadSkills(api: BoardPluginApi): Promise<SkillEntry[]> {
+async function loadSkills(api: BoardPluginApi): Promise<SkillEntry[] | undefined> {
   const dir = await api.listBraidDir(VAULT_DIR);
+  if (dir.error) return undefined;
   const out: SkillEntry[] = [];
   for (const e of dir.entries ?? []) {
     if (!e.isDir || e.name.startsWith('_') || e.name.startsWith('.')) continue;
     const mdPath = `${VAULT_DIR}/${e.name}/SKILL.md`;
     const file = await api.readBraidFile(mdPath);
+    if (file.error) return undefined;
     if (!file.text) continue;
     const entry = skillEntryFromFile(e.name, file.text, mdPath);
     if (entry) out.push(entry);
@@ -51,14 +53,16 @@ function sameEntries(a: readonly SkillEntry[], b: readonly SkillEntry[]): boolea
 // so a big canvas does not read the vault from every card.
 function SkillsLoader({ boardId, board, api }: { boardId: string; board: BoardData; api: BoardPluginApi }) {
   const version = vaultVersion(board);
+  const current = useRef({ board, api });
+  current.current = { board, api };
   useEffect(() => {
     let alive = true;
     (async () => {
-      const ss = await loadSkills(api);
-      if (!alive) return;
+      const ss = await loadSkills(current.current.api);
+      if (!alive || !ss) return;
       // Equality-guarded so the write converges (no render loop, no persistence churn for a stable vault).
-      if (!sameEntries(ss, cachedSkillEntries(board.elements?.skills))) {
-        void api.patchBoard(boardId, {
+      if (!sameEntries(ss, cachedSkillEntries(current.current.board.elements?.skills))) {
+        void current.current.api.patchBoard(boardId, {
           kind: 'replace-element-state',
           pluginId: 'skills',
           state: { index: ss.map(({ name, description, path }) => ({ name, description, path })) },
@@ -68,9 +72,9 @@ function SkillsLoader({ boardId, board, api }: { boardId: string; board: BoardDa
     return () => {
       alive = false;
     };
-    // Re-read once per settled turn; the post-write board change does not bump `version`, so this cannot loop.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [version, api, boardId]);
+    // Read on Board/turn changes only. Viewport and graph callbacks may replace
+    // the public API object; they are not changes to the skills vault.
+  }, [version, boardId]);
   return null;
 }
 
