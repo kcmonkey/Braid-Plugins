@@ -169,8 +169,6 @@ Existing links can still be removed after their plugin is disabled. Omit
 1. **Create a directory** with your plugin id as the name.
 2. **Add a `plugin.json`** manifest declaring `id`, `name`, `version`, `description`, and `contributes`.
 3. **Implement the contributed slots** as exported functions/components matching the plugin API contracts.
-4. **Verify the real plugin behavior** through its host and UI entrypoints, following
-   [test-engineering](../../.braid/skills/test-engineering/SKILL.md).
 
 ### Boundary Rules
 
@@ -183,11 +181,6 @@ Plugins use the public contracts in `src/plugin-api` and `src/protocol`:
 Plugins communicate with Braid exclusively through the **plugin contribution contracts** declared in their
 manifest. This isolation is what makes plugins portable across Braid's VS Code, standalone, Electron, and
 Chrome targets.
-
-## Testing
-
-Use the focused real E2E for the changed plugin behavior. Non-E2E exceptions and their rationale follow
-the project's [test-engineering skill](../../.braid/skills/test-engineering/SKILL.md).
 
 ## License
 

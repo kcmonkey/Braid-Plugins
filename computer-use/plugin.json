@@ -1,0 +1,14 @@
+{
+  "id": "computer-use",
+  "name": "Computer Use",
+  "version": "0.1.0",
+  "description": "Inspect and operate local applications through the native Cua Driver SDK.",
+  "defaultEnabled": true,
+  "canDisable": true,
+  "scope": "builtin",
+  "runtime": "builtin",
+  "contributes": {
+    "hostServices": ["computer-use.hostService"],
+    "agentTools": ["computer_use_tools", "computer_use"]
+  }
+}

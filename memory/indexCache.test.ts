@@ -9,6 +9,8 @@ import {
 } from './indexCache';
 import {
   emptyMemoryStore,
+  hybridEligibleRecords,
+  hybridRecallCandidates,
   recallMemoriesFromIndex,
   recordMemory,
   type MemoryStore,
@@ -26,6 +28,44 @@ function storeWith(title: string, scope = 'memory'): MemoryStore {
 }
 
 describe('memory index cache', () => {
+  it('reuses canonical current/scope indexes and invalidates them with the canonical revision', async () => {
+    let token = 'A';
+    const cache = new MemoryIndexCache(() => token);
+    const store = storeWith('Canonical target');
+    store.records[0].status = 'current';
+    let canonical = { store, corpusRevision: 'revision-A' };
+    const first = await cache.getCanonical('.', async () => canonical);
+    hybridEligibleRecords(first.index, { scope: 'memory' });
+    const bucket = first.index.current!.scopes.get('memory');
+    hybridRecallCandidates(first.index, { query: 'Canonical target', scope: 'memory' }, [], 'model');
+    const second = await cache.getCanonical('.', async () => canonical);
+    expect(second.index).toBe(first.index);
+    expect(second.index.current!.scopes.get('memory')).toBe(bucket);
+    expect((await cache.get('.', async () => { throw new Error('Should reuse the same cache'); })).index).toBe(first.index);
+    token = 'B';
+    canonical = { store: { version: 1, records: [{ ...store.records[0], status: 'superseded' }] }, corpusRevision: 'revision-B' };
+    const changed = await cache.getCanonical('.', async () => canonical);
+    expect(changed.index).not.toBe(first.index);
+    expect(hybridEligibleRecords(changed.index, {})).toEqual([]);
+  });
+
+  it('never tags an old canonical read with a newer token published during that read', async () => {
+    let token = 'A';
+    const cache = new MemoryIndexCache(() => token);
+    const a = storeWith('Before write');
+    const b = storeWith('After write');
+    const old = await cache.getCanonical('.', async () => {
+      const snapshot = { store: a, corpusRevision: 'revision-A' };
+      token = 'B'; // B commits after A was read but before cache publication.
+      return snapshot;
+    });
+    expect(old.token).toBe('A');
+    const lexical = await cache.get('.', async () => b);
+    expect(lexical.token).toBe('B');
+    expect(lexical.index.records[0].title).toBe('After write');
+    expect(lexical.index).not.toBe(old.index);
+  });
+
   it('reuses one built index for repeated recall while the revision token is unchanged', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-index-cache-'));
     try {

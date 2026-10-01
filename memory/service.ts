@@ -14,10 +14,13 @@ import {
   applyDirectSupersession,
   birthMemoryEnvelope,
   DEFAULT_MEMORY_SEMANTIC_CONFIG,
+  createMemoryRecallIndex,
   formatMemoryCatalog,
   formatMemoryOverview,
   normalizeMemorySemanticConfig,
   normalizeMemoryRefId,
+  hybridEligibleRecords,
+  hybridRecallCandidates,
   recallCandidatesFromIndex,
   recordMemoryEnvelope,
   recordMemory,
@@ -26,6 +29,7 @@ import {
   type MemoryRecallCandidate,
   type MemoryRoutingStatus,
   type MemoryRecallInput,
+  type MemorySemanticConfig,
   type MemoryRecord,
   type MemoryRecordInput,
   type MemoryStore,
@@ -53,14 +57,14 @@ import {
   type MemoryInspectionActionResult,
   type MemoryInspectionSnapshot,
 } from './inspection';
-import { getMemoryIndexSnapshot } from './indexCache';
+import { getCanonicalMemoryIndexSnapshot, getMemoryIndexSnapshot } from './indexCache';
 import {
-  DeterministicSessionSemanticCandidateSource,
   querySemanticCandidates,
   resolveSemanticRecallExecution,
   type SemanticCandidateSource,
   type SemanticCandidateSourceDescription,
 } from './semantic';
+import { LocalE5SemanticCandidateSource } from './localE5';
 
 const manifest = manifestJson as PluginManifest;
 export const MEMORY_COMPLETE_CATALOG_THRESHOLD = 24;
@@ -109,17 +113,13 @@ function formatRecallResult(
   staleIds: ReadonlySet<string>,
   semantic?: { description: SemanticCandidateSourceDescription; candidates: readonly MemoryRecallCandidate[] },
 ): string {
+  if (semantic) return formatHybridRecallResult(semantic.candidates, input, staleIds, semantic.description);
   const query = (input.query ?? '').trim();
   if (!records.length) return `No matching Braid memories for query "${query}".`;
   const lines = [
     `Braid memory recall: ${records.length} candidate${records.length === 1 ? '' : 's'} for "${query}".`,
-    semantic
-      ? 'These are ranked recall candidates; inspect source labels before relying on semantic expansion.'
-      : 'These are ranked lexical candidates; if they look off, use memory_catalog to browse a bounded slice or retry with a narrower query.',
+    'These are ranked lexical candidates; if they look off, use memory_catalog to browse a bounded slice or retry with a narrower query.',
   ];
-  if (semantic) {
-    lines.push(`Semantic expansion is candidate-not-truth; modelFingerprint=${semantic.description.modelFingerprint}.`);
-  }
   for (const [index, record] of records.entries()) {
     const tags = record.tags.length ? ` tags=${record.tags.join(',')}` : '';
     const scope = record.scope ? ` [${record.scope}]` : '';
@@ -129,16 +129,41 @@ function formatRecallResult(
       record.status && record.status !== 'current' ? '†' : '',
       staleIds.has(record.id) ? '⚠' : '',
     ].filter(Boolean).join(' ');
-    const candidate = semantic?.candidates[index];
-    const semanticMetadata = candidate
-      ? ` source=${candidate.source.kind}/${candidate.source.provenance} scoreFamily=${[...new Set(candidate.scores.map((score) => score.source.kind))].join('+')}`
-      : '';
-    lines.push(`- ${record.title}${scope}${tags}${status}${freshness} memory:${record.id}${marks ? ` ${marks}` : ''} updated=${record.updatedAt}${semanticMetadata}`);
+    lines.push(`- ${record.title}${scope}${tags}${status}${freshness} memory:${record.id}${marks ? ` ${marks}` : ''} updated=${record.updatedAt}`);
     lines.push(`  ${compactLine(record.content)}`);
     if (record.evidence) lines.push(`  evidence: ${compactLine(record.evidence, 240)}`);
     if (lines.join('\n').length >= MAX_RESULT_CHARS) break;
   }
   return lines.join('\n').slice(0, MAX_RESULT_CHARS);
+}
+
+/** Reserve every identity/source before assigning the remaining budget to excerpts.
+ * Hybrid's useful evidence often arrives below the anchor; truncating the tail
+ * would hide exactly those candidates. Default/off formatting stays unchanged.
+ */
+function formatHybridRecallResult(
+  candidates: readonly MemoryRecallCandidate[], input: MemoryRecallInput,
+  staleIds: ReadonlySet<string>, description: SemanticCandidateSourceDescription,
+): string {
+  const header = [
+    `Braid memory recall: ${candidates.length} candidate${candidates.length === 1 ? '' : 's'}, all shown in rank order.`,
+    `Semantic expansion is candidate-not-truth; modelFingerprint=${compactLine(description.modelFingerprint, 200)}.`,
+    'Excerpts are shortened; use memory_get for full records, scope, tags and evidence.',
+    `Query: ${compactLine(input.query ?? '', 200)}`,
+  ].join('\n');
+  const identities = candidates.map(({ record, source }) =>
+    `- memory:${record.id} source=${source.kind}/${source.provenance} status=${record.status ?? 'stale'} freshness=${record.freshness ?? 'unverified'}${staleIds.has(record.id) ? ' ⚠' : ''}`);
+  if (!candidates.length) return header;
+  // Normalized Memory IDs are at most 120 chars; the recall limit is at most 10.
+  // These identities always fit. Only optional titles/body excerpts are shortened.
+  const baseSize = [header, ...identities].join('\n').length;
+  const excerptSize = Math.max(0, Math.floor((MAX_RESULT_CHARS - baseSize) / candidates.length) - 3);
+  return [header, ...candidates.map(({ record }, index) => {
+    if (!excerptSize) return identities[index];
+    const excerpt = `${compactLine(record.title, 80)} — ${compactLine(record.content, MAX_CONTENT_CHARS)}`;
+    const bounded = excerpt.length > excerptSize ? `${excerpt.slice(0, Math.max(0, excerptSize - 1))}…` : excerpt;
+    return `${identities[index]}\n  ${bounded}`;
+  })].join('\n');
 }
 
 function formatGetResult(record: MemoryRecord): string {
@@ -242,15 +267,19 @@ class MemoryHostService implements HostService {
   private semanticSource?: SemanticCandidateSource;
   private semanticSourceFingerprint?: string;
   private semanticGeneration = 0;
-  private readonly semanticAbortController = new AbortController();
+  private semanticAbortController = new AbortController();
+  private semanticConfigKey?: string;
+  private semanticCleanupError?: Error;
+  private readonly activeCalls = new Set<Promise<unknown>>();
+  private draining = false;
   private disposed = false;
 
   constructor(private readonly host: Parameters<HostServicePlugin['create']>[0]) {}
 
   agentTools() {
     return createMemoryAgentTools({
-      record: (ctx, req) => this.handleRecord(ctx, req),
-      recall: (ctx, req) => this.handleRecall(ctx, req),
+      record: (ctx, req) => this.admit(() => this.handleRecord(ctx, req)),
+      recall: (ctx, req) => this.admit(() => this.handleRecall(ctx, req)),
       get: (ctx, req) => this.handleGet(ctx, req),
       catalog: (ctx, req) => this.handleCatalog(ctx, req),
     });
@@ -307,22 +336,61 @@ class MemoryHostService implements HostService {
     this.memoryWritesByTurn.delete(key);
   }
 
+  private admit<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.disposed || this.draining) return Promise.reject(this.semanticDisposedError());
+    return this.track(operation());
+  }
+
+  private track<T>(run: Promise<T>): Promise<T> {
+    this.activeCalls.add(run);
+    void run.then(() => this.activeCalls.delete(run), () => this.activeCalls.delete(run));
+    return run;
+  }
+
+  hasActiveWork(): boolean { return this.activeCalls.size > 0; }
+
+  async drain(): Promise<void> {
+    this.draining = true;
+    // Work can enqueue source retirement while it settles. That retirement is
+    // tracked by this same service, independently of the UI/Agent lifetime.
+    while (this.activeCalls.size) await Promise.allSettled([...this.activeCalls]);
+    await this.writeQueue;
+    await this.semanticQueue;
+    if (this.semanticCleanupError) throw this.semanticCleanupError;
+  }
+
   async dispose(): Promise<void> {
     if (!this.disposed) {
       this.disposed = true;
       this.semanticGeneration += 1;
       this.semanticAbortController.abort(this.semanticDisposedError());
     }
-    const source = this.semanticSource;
-    this.semanticSource = undefined;
-    this.semanticSourceFingerprint = undefined;
-    if (source) {
-      await this.enqueueSemantic(() => Promise.resolve(source.dispose()));
-      return;
-    }
-    // A replacement clears the active source before its deferred disposal runs.
-    // Settling this tail keeps service disposal behind that cleanup window.
+    await this.retireSemanticSource();
+    await this.drain();
     await this.semanticQueue;
+  }
+
+  private retireSemanticSource(): Promise<void> {
+    const source = this.semanticSource;
+    if (!source) return this.semanticQueue;
+    // Keep the source owned until its serialized cleanup begins. Another
+    // already queued query may replace it first; this retirement then is a no-op.
+    return this.track(this.enqueueSemantic(async () => {
+      if (this.semanticSource === source) await this.releaseSemanticSource();
+    }));
+  }
+
+  private async releaseSemanticSource(): Promise<void> {
+    const source = this.semanticSource;
+    try {
+      await source?.dispose();
+      this.semanticSource = undefined;
+      this.semanticSourceFingerprint = undefined;
+      this.semanticCleanupError = undefined;
+    } catch (error) {
+      this.semanticCleanupError = new Error(`Memory model release failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw this.semanticCleanupError;
+    }
   }
 
   private memoryTurnContext(): string | null | Promise<string | null> {
@@ -407,9 +475,7 @@ class MemoryHostService implements HostService {
     if (!req.query?.trim()) return { ok: false, result: 'memory_recall needs a non-empty query.' };
     await this.writeQueue;
     this.throwIfCallerAborted(ctx.signal);
-    const snapshot = await getMemoryIndexSnapshot(this.host.cwd(), () => readMemoryStore(this.host.cwd()));
-    this.throwIfCallerAborted(ctx.signal);
-    const recall = await this.recallCandidates(snapshot.index, req as MemoryRecallInput, ctx.signal);
+    const recall = await this.recallCandidates(req as MemoryRecallInput, ctx.signal);
     this.throwIfCallerAborted(ctx.signal);
     const records = recall.candidates.map((candidate) => candidate.record);
     // Recall stays read-only and OFF the O(N) full-store-reload + inspection-rebuild path: read usage is
@@ -423,56 +489,74 @@ class MemoryHostService implements HostService {
     this.throwIfCallerAborted(ctx.signal);
     const result = formatRecallResult(records, req, this.staleMemoryIds(records), recall.semantic);
     this.throwIfCallerAborted(ctx.signal);
-    return { ok: true, result: recall.notice ? `${result}\n${recall.notice}` : result };
+    return { ok: true, result: recall.notice ? `${recall.notice}\n${result}` : result };
   }
 
   private async recallCandidates(
-    index: Parameters<typeof recallCandidatesFromIndex>[0],
     input: MemoryRecallInput,
     signal: AbortSignal,
   ): Promise<RecallCandidatesOutcome> {
     this.throwIfCallerAborted(signal);
+    const config = this.observeSemanticConfig();
+    const configKey = JSON.stringify(config);
     const generation = this.semanticGeneration;
+    const execution = resolveSemanticRecallExecution(input, config);
+    const lexical = async (notice?: string): Promise<RecallCandidatesOutcome> => {
+      const snapshot = await getMemoryIndexSnapshot(this.host.cwd(), () => readMemoryStore(this.host.cwd()));
+      this.throwIfCallerAborted(signal);
+      if (this.disposed) throw this.semanticDisposedError();
+      return { status: 'ready', candidates: recallCandidatesFromIndex(snapshot.index, input), notice };
+    };
+    // An off/default recall never waits behind model preparation or inference.
+    if (execution.status !== 'enabled') {
+      return lexical(execution.status === 'unavailable'
+        ? `Semantic recall unavailable: ${execution.reason}. Lexical candidates were retained.` : undefined);
+    }
     return this.enqueueSemantic(async () => {
-      this.throwIfSemanticActive(generation, signal);
-      const lexical = () => {
-        this.throwIfSemanticActive(generation, signal);
-        const candidates = recallCandidatesFromIndex(index, input);
-        this.throwIfSemanticActive(generation, signal);
-        return candidates;
-      };
-      const execution = resolveSemanticRecallExecution(input, this.readMemorySemanticConfig());
-      if (execution.status === 'unavailable') {
-        return {
-          status: 'ready',
-          candidates: lexical(),
-          notice: `Semantic recall unavailable: ${execution.reason}. Lexical candidates were retained.`,
-        };
-      }
-      if (execution.status !== 'enabled') return { status: 'ready', candidates: lexical() };
-
       const linkedSignal = this.linkSemanticSignal(signal);
       try {
-        const source = await this.semanticSourceFor(execution.config.modelFingerprint, generation, signal);
+        this.observeSemanticConfig();
+        this.throwIfSemanticActive(generation, signal);
+        // Read at execution time, after any previous queued query/model cleanup.
+        const snapshot = await getCanonicalMemoryIndexSnapshot(this.host.cwd(), () => readCanonicalMemorySnapshot(this.host.cwd()));
+        this.throwIfSemanticActive(generation, signal);
+        const index = snapshot.index;
+        const records = hybridEligibleRecords(index, input);
+        const source = await this.semanticSourceFor(execution.config, generation, signal);
         this.throwIfSemanticActive(generation, signal);
         const outcome = await querySemanticCandidates(source, {
-          query: input.query ?? '',
-          records: index.records,
+          query: (input.query ?? '').trim().slice(0, 500),
+          records,
+          liveRecordIds: index.records.filter((record) => record.status === 'current').map((record) => record.id),
           signal: linkedSignal.signal,
         });
+        this.observeSemanticConfig();
         this.throwIfSemanticActive(generation, signal);
         if (outcome.status !== 'ready') {
-          return { status: 'ready', candidates: lexical() };
+          throw outcome.error;
         }
-        const candidates = recallCandidatesFromIndex(index, input, {
-          semantic: outcome.matches,
-          semanticModelFingerprint: outcome.description.modelFingerprint,
-        });
+        const current = await readCanonicalMemorySnapshot(this.host.cwd());
+        this.observeSemanticConfig();
         this.throwIfSemanticActive(generation, signal);
+        if (current.corpusRevision !== snapshot.corpusRevision || JSON.stringify(this.readMemorySemanticConfig()) !== configKey) {
+          return {
+            status: 'ready', candidates: recallCandidatesFromIndex(createMemoryRecallIndex(current.store), input),
+            notice: 'Semantic recall discarded: corpus or configuration changed during inference. Fresh lexical candidates were retained.',
+          };
+        }
+        const candidates = hybridRecallCandidates(index, input, outcome.matches, outcome.description.modelFingerprint);
         return { status: 'ready', candidates, semantic: { description: outcome.description, candidates } };
       } catch (error) {
-        this.throwIfSemanticActive(generation, signal);
-        return { status: 'ready', candidates: lexical() };
+        if (signal.aborted) {
+          if (!this.disposed && !this.semanticCleanupError) await this.releaseSemanticSource().catch(() => undefined);
+          this.throwIfCallerAborted(signal);
+        }
+        if (this.disposed) throw this.semanticDisposedError();
+        // Already inside the serialization boundary and the native call settled.
+        // Release here before any queued replacement can start.
+        if (!this.semanticCleanupError) await this.releaseSemanticSource().catch(() => undefined);
+        const reason = compactLine(this.semanticCleanupError?.message ?? (error instanceof Error ? error.message : String(error)), 300);
+        return lexical(`Semantic recall unavailable: ${reason}. Lexical candidates were retained.`);
       } finally {
         linkedSignal.release();
       }
@@ -481,28 +565,40 @@ class MemoryHostService implements HostService {
 
   private readMemorySemanticConfig() {
     try {
-      return normalizeMemorySemanticConfig(this.host.readPluginConfig?.(manifest.id, DEFAULT_MEMORY_SEMANTIC_CONFIG).config);
+      const entry = this.host.readPluginConfig?.(manifest.id, DEFAULT_MEMORY_SEMANTIC_CONFIG);
+      return entry?.enabled === false ? DEFAULT_MEMORY_SEMANTIC_CONFIG : normalizeMemorySemanticConfig(entry?.config);
     } catch {
       return DEFAULT_MEMORY_SEMANTIC_CONFIG;
     }
   }
 
+  private observeSemanticConfig(): MemorySemanticConfig {
+    const config = this.readMemorySemanticConfig();
+    const key = JSON.stringify(config);
+    if (key !== this.semanticConfigKey) {
+      this.semanticConfigKey = key;
+      this.semanticGeneration += 1;
+      this.semanticAbortController.abort(new Error('Memory semantic configuration changed.'));
+      this.semanticAbortController = new AbortController();
+      void this.retireSemanticSource().catch(() => undefined);
+    }
+    return config;
+  }
+
   private async semanticSourceFor(
-    modelFingerprint: string | undefined,
+    config: MemorySemanticConfig,
     generation: number,
     signal: AbortSignal,
   ): Promise<SemanticCandidateSource> {
     this.throwIfSemanticActive(generation, signal);
-    const fingerprint = modelFingerprint ?? 'deterministic-session-v1';
+    if (this.semanticCleanupError) throw this.semanticCleanupError;
+    const fingerprint = JSON.stringify(config);
     if (this.semanticSource && this.semanticSourceFingerprint === fingerprint) return this.semanticSource;
-    const previous = this.semanticSource;
-    this.semanticSource = undefined;
-    this.semanticSourceFingerprint = undefined;
-    if (previous) {
-      await previous.dispose();
+    if (this.semanticSource) {
+      await this.releaseSemanticSource();
       this.throwIfSemanticActive(generation, signal);
     }
-    const source = new DeterministicSessionSemanticCandidateSource({ modelFingerprint: fingerprint });
+    const source = new LocalE5SemanticCandidateSource(config);
     try {
       this.throwIfSemanticActive(generation, signal);
     } catch (error) {
@@ -561,9 +657,8 @@ class MemoryHostService implements HostService {
   private throwIfSemanticActive(generation: number, callerSignal: AbortSignal): void {
     this.throwIfCallerAborted(callerSignal);
     if (!this.disposed && generation === this.semanticGeneration) return;
-    const reason = this.semanticAbortController.signal.reason;
-    if (reason !== undefined) throw reason;
-    throw this.semanticDisposedError();
+    if (this.disposed) throw this.semanticDisposedError();
+    throw new Error('Memory semantic configuration changed.');
   }
 
   private linkSemanticSignal(callerSignal: AbortSignal): { signal: AbortSignal; release: () => void } {

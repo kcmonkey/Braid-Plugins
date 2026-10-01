@@ -8,7 +8,7 @@ import {
 } from './model';
 
 export interface SemanticCandidateSourceDescription {
-  kind: 'deterministic-session';
+  kind: 'deterministic-session' | 'local-e5';
   cache: 'session';
   modelFingerprint: string;
   candidateNotTruth: true;
@@ -17,18 +17,19 @@ export interface SemanticCandidateSourceDescription {
 export interface SemanticCandidateQuery {
   query: string;
   records: readonly MemoryRecord[];
+  /** Canonical current corpus IDs, before scope filtering. Omit only for a full-corpus query. */
+  liveRecordIds?: readonly string[];
   signal?: AbortSignal;
 }
 
 /**
- * Pure admission decision for a future recall integration. Project cache is
- * intentionally unavailable in C0: callers receive that explicit outcome
- * rather than silently treating it as a session-cache request.
+ * Installed-only admission. Legacy experimental config never activates the fake
+ * source in production. Project cache remains explicitly unavailable.
  */
 export type SemanticRecallExecution =
   | { status: 'off'; reason: 'not-requested' | 'caller-off' | 'config-off' | 'invalid-request' }
-  | { status: 'unavailable'; reason: 'project-cache-unavailable' }
-  | { status: 'enabled'; config: Readonly<MemorySemanticConfig & { mode: 'local-experimental'; cache: 'session' }> };
+  | { status: 'unavailable'; reason: 'project-cache-unavailable' | 'experimental-source-retired' | 'local-components-not-configured' }
+  | { status: 'enabled'; config: Readonly<MemorySemanticConfig & { mode: 'local-e5'; cache: 'session'; runtimePath: string; modelPath: string }> };
 
 export function resolveSemanticRecallExecution(
   input: MemoryRecallInput,
@@ -38,14 +39,18 @@ export function resolveSemanticRecallExecution(
   if (requested === 'off') return { status: 'off', reason: 'caller-off' };
   if (requested !== undefined && requested !== 'configured') return { status: 'off', reason: 'invalid-request' };
   if (requested !== 'configured') return { status: 'off', reason: 'not-requested' };
-  if (config.mode !== 'local-experimental') return { status: 'off', reason: 'config-off' };
+  if (config.mode === 'off') return { status: 'off', reason: 'config-off' };
   if (config.cache === 'project') return { status: 'unavailable', reason: 'project-cache-unavailable' };
+  if (config.mode === 'local-experimental') return { status: 'unavailable', reason: 'experimental-source-retired' };
+  if (!config.runtimePath || !config.modelPath) return { status: 'unavailable', reason: 'local-components-not-configured' };
   return {
     status: 'enabled',
     config: Object.freeze({
-      mode: 'local-experimental',
+      ...config,
+      mode: 'local-e5',
       cache: 'session',
-      ...(config.modelFingerprint ? { modelFingerprint: config.modelFingerprint } : {}),
+      runtimePath: config.runtimePath,
+      modelPath: config.modelPath,
     }),
   };
 }

@@ -19,7 +19,7 @@ describe('skills context injection', () => {
 
   it('instructs lazy skill selection instead of plan-run pre-reading', () => {
     const text = skillsContextText([
-      { name: 'test-engineering', description: 'Use when writing tests.', path: '.braid/skills/test-engineering/SKILL.md' },
+      { name: 'code-review', description: 'Use when reviewing code.', path: '.braid/skills/code-review/SKILL.md' },
       { name: 'ui-design', description: 'Use when polishing UI.', path: '.braid/skills/ui-design/SKILL.md' },
     ]) ?? '';
     expect(SKILLS_PROTOCOL.length).toBeLessThanOrEqual(450);

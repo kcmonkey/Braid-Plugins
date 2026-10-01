@@ -28,8 +28,8 @@ function store(): MemoryStore {
 }
 
 describe('memory semantic recall seam', () => {
-  it('admits the deterministic session source only for configured local-experimental session mode', () => {
-    const localSession = { mode: 'local-experimental', cache: 'session', modelFingerprint: 'fixture-fp' } as const;
+  it('admits only explicitly configured local components and retires the production fake', () => {
+    const localSession = { mode: 'local-e5', cache: 'session', runtimePath: '/installed/runtime', modelPath: '/installed/model' } as const;
 
     expect(resolveSemanticRecallExecution({ semantic: 'configured' }, localSession)).toMatchObject({
       status: 'enabled',
@@ -47,6 +47,10 @@ describe('memory semantic recall seam', () => {
     expect(resolveSemanticRecallExecution({ semantic: 'unexpected' } as any, localSession)).toEqual({
       status: 'off', reason: 'invalid-request',
     });
+    expect(resolveSemanticRecallExecution({ semantic: 'configured' }, { mode: 'local-experimental', cache: 'session' }))
+      .toEqual({ status: 'unavailable', reason: 'experimental-source-retired' });
+    expect(resolveSemanticRecallExecution({ semantic: 'configured' }, { mode: 'local-e5', cache: 'session' }))
+      .toEqual({ status: 'unavailable', reason: 'local-components-not-configured' });
   });
 
   it('preserves lexical-first candidates for non-admitted semantic paths without constructing a source', () => {

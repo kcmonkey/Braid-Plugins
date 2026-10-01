@@ -22,7 +22,7 @@ One folder per skill:
 
     # Commit helper
 
-    1. Run the project's lint/test gate.
+    1. Review the intended changes.
     2. Stage only intended files.
     3. Write a conventional-commit subject + body.
 

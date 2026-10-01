@@ -55,9 +55,13 @@ export interface MemoryRecallInput {
  * changes the Memory plugin's lexical recall availability.
  */
 export interface MemorySemanticConfig {
-  mode: 'off' | 'local-experimental';
+  mode: 'off' | 'local-experimental' | 'local-e5';
   modelFingerprint?: string;
   cache: 'session' | 'project';
+  /** Absolute directory of an explicitly installed @huggingface/transformers package. */
+  runtimePath?: string;
+  /** Absolute directory containing the pinned E5-small q8 model files. */
+  modelPath?: string;
 }
 
 export const DEFAULT_MEMORY_SEMANTIC_CONFIG: Readonly<MemorySemanticConfig> = Object.freeze({
@@ -73,9 +77,11 @@ export const DEFAULT_MEMORY_SEMANTIC_CONFIG: Readonly<MemorySemanticConfig> = Ob
 export function normalizeMemorySemanticConfig(value: unknown): MemorySemanticConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return DEFAULT_MEMORY_SEMANTIC_CONFIG;
   const raw = value as Record<string, unknown>;
-  if ((raw.mode !== 'off' && raw.mode !== 'local-experimental')
+  if ((raw.mode !== 'off' && raw.mode !== 'local-experimental' && raw.mode !== 'local-e5')
     || (raw.cache !== 'session' && raw.cache !== 'project')
-    || (raw.modelFingerprint !== undefined && typeof raw.modelFingerprint !== 'string')) {
+    || (raw.modelFingerprint !== undefined && typeof raw.modelFingerprint !== 'string')
+    || (raw.runtimePath !== undefined && typeof raw.runtimePath !== 'string')
+    || (raw.modelPath !== undefined && typeof raw.modelPath !== 'string')) {
     return DEFAULT_MEMORY_SEMANTIC_CONFIG;
   }
   const modelFingerprint = raw.modelFingerprint?.trim();
@@ -84,6 +90,8 @@ export function normalizeMemorySemanticConfig(value: unknown): MemorySemanticCon
     mode: raw.mode,
     cache: raw.cache,
     ...(modelFingerprint ? { modelFingerprint: modelFingerprint.slice(0, 200) } : {}),
+    ...(typeof raw.runtimePath === 'string' ? { runtimePath: raw.runtimePath.trim() } : {}),
+    ...(typeof raw.modelPath === 'string' ? { modelPath: raw.modelPath.trim() } : {}),
   });
 }
 
@@ -94,6 +102,7 @@ export function normalizeMemorySemanticConfig(value: unknown): MemorySemanticCon
 export type RecallSource =
   | { kind: 'lexical'; provenance: 'minisearch' }
   | { kind: 'semantic'; provenance: 'session-local'; modelFingerprint: string }
+  | { kind: 'hybrid'; provenance: 'rrf-k10-lexical1-dense2'; modelFingerprint: string }
   | { kind: 'recency'; provenance: 'updatedAt' };
 
 export interface RecallScore {
@@ -653,6 +662,8 @@ export interface MemoryRecallIndex {
   facets: MemoryFacetStats;
   all: MemorySearchBucket;
   scopes: Map<string, MemorySearchBucket>;
+  /** Derived current-only buckets share this index's existing cache lifetime. */
+  current?: { all: MemorySearchBucket; scopes: Map<string, MemorySearchBucket> };
 }
 
 export interface MemoryOverviewOptions {
@@ -947,6 +958,80 @@ export function recallCandidatesFromIndex(
 
 export function recallMemoriesFromIndex(index: MemoryRecallIndex, input: MemoryRecallInput): MemoryRecord[] {
   return recallCandidatesFromIndex(index, input).map((candidate) => candidate.record);
+}
+
+// Frozen natural-language query matching: no prefix/fuzzy expansion and no topic rules.
+const FOCUSED_QUERY_STOPS = new Set('a an the this that these those i we our you your it its is are was were be been being do does did have has had how what which who where why would could should can may might will shall to of in on at for from by with and or as then than so about into through whether'.split(' '));
+
+export function focusedMemoryQueryTokens(query: string): string[] {
+  const tokens = tokenizeMemoryText(query);
+  const focused = tokens.filter((token) => !FOCUSED_QUERY_STOPS.has(token)
+    && !/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]$/u.test(token));
+  return focused.length ? focused : tokens;
+}
+
+/** The evaluated hybrid corpus is current-only; scope is applied before either route. */
+export function hybridEligibleRecords(index: MemoryRecallIndex, input: MemoryRecallInput): MemoryRecord[] {
+  return currentScopedBucket(index, input).records;
+}
+
+function currentScopedBucket(index: MemoryRecallIndex, input: MemoryRecallInput): MemorySearchBucket {
+  if (!index.current) {
+    const records = index.records.filter((record) => record.status === 'current');
+    index.current = {
+      all: records.length === index.records.length ? index.all : buildMemoryBucket(records), scopes: new Map(),
+    };
+  }
+  const scope = clampText(input.scope, MAX_SCOPE).toLowerCase();
+  if (!scope) return index.current.all;
+  const previous = index.current.scopes.get(scope);
+  if (previous) return previous;
+  const bucket = buildMemoryBucket(index.current.all.records.filter((record) => record.scope.toLowerCase() === scope));
+  index.current.scopes.set(scope, bucket);
+  return bucket;
+}
+
+/** Preserve the original genuine lexical first result, then frozen 1:2 RRF (k=10, depth=50).
+ * The caller supplies the same index used to select eligible records, so neither route
+ * can introduce a foreign-scope/non-current record or a recency anchor.
+ */
+export function hybridRecallCandidates(
+  index: MemoryRecallIndex, input: MemoryRecallInput, matches: readonly SemanticRecallMatch[], modelFingerprint: string,
+): MemoryRecallCandidate[] {
+  const query = clampText(input.query, 500);
+  const limit = parseRecallLimit(input.limit);
+  const bucket = currentScopedBucket(index, input);
+  const anchor = tokenizeMemoryText(query).length ? lexicalCandidates(bucket, query)[0] : undefined;
+  const focused = bucket.search.search(query, {
+    boost: MEMORY_SEARCH_BOOST, combineWith: 'OR', prefix: false, fuzzy: false, tokenize: focusedMemoryQueryTokens,
+  }).sort((a, b) => b.score - a.score || String(a.id).localeCompare(String(b.id)));
+  const denseById = new Map<string, number>();
+  for (const match of matches) {
+    if (bucket.byId.has(match.id) && Number.isFinite(match.score)) {
+      denseById.set(match.id, Math.max(denseById.get(match.id) ?? -Infinity, match.score));
+    }
+  }
+  const dense = [...denseById].map(([id, score]) => ({ id, score }))
+    .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  const scores = new Map<string, { value: number; evidence: RecallScore[] }>();
+  const denseSource = semanticSource(modelFingerprint);
+  for (const [route, weight, source] of [[focused, 1, LEXICAL_SOURCE], [dense, 2, denseSource]] as const) {
+    route.slice(0, 50).forEach((row, rank) => {
+      const id = String(row.id);
+      const entry = scores.get(id) ?? { value: 0, evidence: [] };
+      entry.value += weight / (10 + rank + 1);
+      entry.evidence.push(Object.freeze({ source, value: row.score }));
+      scores.set(id, entry);
+    });
+  }
+  const source: RecallSource = Object.freeze({ kind: 'hybrid', provenance: 'rrf-k10-lexical1-dense2', modelFingerprint });
+  const fused = [...scores].sort(([a, av], [b, bv]) => bv.value - av.value || a.localeCompare(b))
+    .filter(([id]) => id !== anchor?.record.id)
+    .map(([id, entry]): MemoryRecallCandidate => Object.freeze({
+      record: bucket.byId.get(id)!, source,
+      scores: Object.freeze([...entry.evidence, Object.freeze({ source, value: entry.value })]),
+    }));
+  return (anchor ? [anchor, ...fused] : fused).slice(0, limit);
 }
 
 export function recallMemories(store: MemoryStore, input: MemoryRecallInput): MemoryRecord[] {

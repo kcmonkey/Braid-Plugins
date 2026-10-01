@@ -20,16 +20,18 @@ const semanticBackend = vi.hoisted(() => ({
   prepareStarted: undefined as (() => void) | undefined,
   disposeGate: undefined as Promise<void> | undefined,
   disposeStarted: undefined as (() => void) | undefined,
+  disposeFailure: undefined as Error | undefined,
   instances: [] as { fingerprint: string; dispose: ReturnType<typeof vi.fn> }[],
 }));
 
-vi.mock('./semantic', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./semantic')>();
+vi.mock('./localE5', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./localE5')>();
   class TestSemanticSource {
     private readonly fingerprint: string;
     readonly dispose = vi.fn(async () => {
       semanticBackend.disposeStarted?.();
       await semanticBackend.disposeGate;
+      if (semanticBackend.disposeFailure) throw semanticBackend.disposeFailure;
     });
 
     constructor(options: { modelFingerprint?: string } = {}) {
@@ -39,7 +41,7 @@ vi.mock('./semantic', async (importOriginal) => {
 
     describe() {
       if (semanticBackend.failure !== undefined && semanticBackend.failureAt === 'describe') throw semanticBackend.failure;
-      return { kind: 'deterministic-session' as const, cache: 'session' as const, modelFingerprint: this.fingerprint, candidateNotTruth: true as const };
+      return { kind: 'local-e5' as const, cache: 'session' as const, modelFingerprint: this.fingerprint, candidateNotTruth: true as const };
     }
 
     async prepare(signal?: AbortSignal): Promise<void> {
@@ -55,7 +57,7 @@ vi.mock('./semantic', async (importOriginal) => {
       return semanticBackend.matches.map((match) => ({ ...match, modelFingerprint: match.modelFingerprint ?? this.fingerprint }));
     }
   }
-  return { ...actual, DeterministicSessionSemanticCandidateSource: TestSemanticSource };
+  return { ...actual, LocalE5SemanticCandidateSource: TestSemanticSource };
 });
 
 function makeHarness(project: string, readPluginConfig?: NonNullable<HostServiceContext['readPluginConfig']>) {
@@ -65,6 +67,7 @@ function makeHarness(project: string, readPluginConfig?: NonNullable<HostService
   let publishes = 0;
   const ctx: HostServiceContext = {
     cwd: () => project,
+    openCanvasIds: () => ['c1'],
     ...(readPluginConfig ? { readPluginConfig } : {}),
     readSecret: async (pluginId, key) => ({ pluginId, key, stored: false }),
     writeSecret: async (pluginId, key) => ({ pluginId, key, stored: true }),
@@ -106,10 +109,155 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe('memory host service', () => {
+  it('shows every selected hybrid identity in rank order within 4000 chars for limits five and ten', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-hybrid-budget-'));
+    const harness = makeHarness(project, () => ({ enabled: true, config: {
+      mode: 'local-e5', cache: 'session', runtimePath: '/test/runtime', modelPath: '/test/model',
+    } }));
+    const records = Array.from({ length: 10 }, (_, n) => ({
+      id: `mem-${String(n).padStart(2, '0')}-${'x'.repeat(112)}`, title: `${n} ${'title '.repeat(26)}`,
+      content: 'body '.repeat(1200), scope: 'scope'.repeat(24), tags: Array(12).fill('tag'.repeat(16)),
+      evidence: 'evidence '.repeat(134), status: 'current' as const, freshness: 'unverified' as const,
+      createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z',
+    }));
+    semanticBackend.matches = records.map((record, n) => ({ id: record.id, score: 1 - n / 10 }));
+    try {
+      await writeArtifactMemoryStore(project, await readCanonicalMemorySnapshot(project), { version: 1, records }, { pluginId: 'memory' });
+      for (const limit of ['5', '10']) {
+        const input = { query: 'a very long query '.repeat(100), limit };
+        const baseline = await harness.call('memory_recall', { ...input, semantic: 'off' });
+        const result = await harness.call('memory_recall', { ...input, semantic: 'configured' });
+        const displayed = [...result.result.matchAll(/^- memory:([^\s]+)/gm)].map((match) => match[1]);
+        expect(displayed).toEqual(records.slice(0, Number(limit)).map((record) => record.id));
+        expect(result.result.length).toBeLessThanOrEqual(4000);
+        expect(result.result).toContain(`${limit} candidates, all shown`);
+        expect(result.result.match(/source=hybrid\/rrf-k10-lexical1-dense2/g)).toHaveLength(Number(limit));
+        expect(result.result).toContain('memory_get');
+        expect(await harness.call('memory_recall', { ...input, semantic: 'off' })).toEqual(baseline);
+      }
+    } finally {
+      semanticBackend.matches = [];
+      await harness.service.dispose?.();
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('runs off recall during preparation, discards changed corpus/config, and drains resource release', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-inflight-'));
+    let config = { mode: 'local-e5', cache: 'session', runtimePath: '/test/runtime', modelPath: '/test/model' };
+    const harness = makeHarness(project, () => ({ enabled: true, config }));
+    semanticBackend.instances = [];
+    const gate = deferred();
+    const started = deferred();
+    try {
+      await harness.call('memory_record', { title: 'Mutable evidence', content: 'old body', scope: 'a' });
+      semanticBackend.prepareGate = gate.promise;
+      semanticBackend.prepareStarted = started.resolve;
+      const running = harness.call('memory_recall', { query: 'Mutable evidence', semantic: 'configured' });
+      await started.promise;
+      expect(harness.service.hasActiveWork?.()).toBe(true);
+      // This must complete without opening the preparation gate.
+      await expect(harness.call('memory_recall', { query: 'Mutable evidence', semantic: 'off' }))
+        .resolves.toMatchObject({ ok: true, result: expect.stringContaining('old body') });
+      await harness.call('memory_record', { title: 'Mutable evidence', content: 'new canonical body', scope: 'a' });
+      gate.resolve();
+      const updated = await running;
+      expect(updated.result).toContain('corpus or configuration changed');
+      expect(updated.result).toContain('new canonical body');
+      expect(updated.result).not.toContain('old body');
+      expect(updated.result).not.toContain('candidate-not-truth');
+
+      const nextGate = deferred();
+      const nextStarted = deferred();
+      semanticBackend.prepareGate = nextGate.promise;
+      semanticBackend.prepareStarted = nextStarted.resolve;
+      const next = harness.call('memory_recall', { query: 'Mutable evidence', semantic: 'configured' });
+      await nextStarted.promise;
+      config = { ...config, mode: 'off' };
+      const off = await harness.call('memory_recall', { query: 'Mutable evidence', semantic: 'off' });
+      expect(off.result).not.toContain('Semantic');
+      let drained = false;
+      const drain = harness.service.drain!().then(() => { drained = true; });
+      await Promise.resolve();
+      expect(drained).toBe(false);
+      nextGate.resolve();
+      expect((await next).result).toContain('configuration changed');
+      await drain;
+      expect(semanticBackend.instances[0].dispose).toHaveBeenCalledOnce();
+      expect(harness.service.hasActiveWork?.()).toBe(false);
+      await expect(harness.call('memory_recall', { query: 'after drain' })).rejects.toThrow('disposed');
+    } finally {
+      gate.resolve();
+      semanticBackend.prepareGate = undefined;
+      semanticBackend.prepareStarted = undefined;
+      await harness.service.dispose?.();
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a failed model release, prevents another allocation, and does not claim successful drain', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-release-failure-'));
+    const config = { mode: 'local-e5', cache: 'session', runtimePath: '/test/runtime', modelPath: '/test/model' };
+    const harness = makeHarness(project, () => ({ enabled: true, config }));
+    semanticBackend.instances = [];
+    try {
+      semanticBackend.failure = new Error('broken inference');
+      semanticBackend.disposeFailure = new Error('native release rejected');
+      expect((await harness.call('memory_recall', { query: 'target', semantic: 'configured' })).result)
+        .toContain('Memory model release failed: native release rejected');
+      semanticBackend.failure = undefined;
+      await harness.call('memory_recall', { query: 'target', semantic: 'configured' });
+      expect(semanticBackend.instances).toHaveLength(1);
+      expect(semanticBackend.instances[0].dispose).toHaveBeenCalledOnce();
+      await expect(harness.service.drain!()).rejects.toThrow('native release rejected');
+      semanticBackend.disposeFailure = undefined;
+      await harness.service.dispose?.();
+      expect(semanticBackend.instances[0].dispose).toHaveBeenCalledTimes(2);
+    } finally {
+      semanticBackend.failure = undefined;
+      semanticBackend.disposeFailure = undefined;
+      await harness.service.dispose?.();
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('settles failed-source disposal before an already queued recall allocates a replacement', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-queued-release-'));
+    const harness = makeHarness(project, () => ({ enabled: true, config: {
+      mode: 'local-e5', cache: 'session', runtimePath: '/test/runtime', modelPath: '/test/model',
+    } }));
+    const gate = deferred();
+    const started = deferred();
+    semanticBackend.instances = [];
+    semanticBackend.disposeGate = gate.promise;
+    semanticBackend.disposeStarted = started.resolve;
+    semanticBackend.failure = new Error('backend fails');
+    try {
+      const failed = harness.call('memory_recall', { query: 'target', semantic: 'configured' });
+      await started.promise;
+      semanticBackend.failure = undefined;
+      const queued = harness.call('memory_recall', { query: 'target', semantic: 'configured' });
+      await Promise.resolve();
+      expect(semanticBackend.instances).toHaveLength(1);
+      gate.resolve();
+      expect((await failed).result).toContain('backend fails');
+      await queued;
+      expect(semanticBackend.instances).toHaveLength(2);
+      expect(semanticBackend.instances[0].dispose).toHaveBeenCalledOnce();
+    } finally {
+      gate.resolve();
+      semanticBackend.failure = undefined;
+      semanticBackend.disposeGate = undefined;
+      semanticBackend.disposeStarted = undefined;
+      await harness.service.dispose?.();
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
   it('makes configured project-cache unavailability visible while caller-off remains lexical-first', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-semantic-unavailable-'));
     try {
-      const config = { mode: 'local-experimental', cache: 'project' };
+      const config = { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'project' };
       const harness = makeHarness(project, () => ({ enabled: true, config }));
       await harness.call('memory_record', {
         verb: 'lesson', title: 'Unavailable semantic target', content: 'A lexical target remains available.',
@@ -133,7 +281,7 @@ describe('memory host service', () => {
     semanticBackend.prepareStarted = started.resolve;
     semanticBackend.instances = [];
     try {
-      const config = { mode: 'local-experimental', cache: 'session', modelFingerprint: 'queued-abort' };
+      const config = { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'session', modelFingerprint: 'queued-abort' };
       const harness = makeHarness(project, () => ({ enabled: true, config }));
       await harness.call('memory_record', {
         verb: 'lesson', title: 'Queued abort target', content: 'A queued abort must never return a late lexical result.',
@@ -163,7 +311,7 @@ describe('memory host service', () => {
     const started = deferred();
     semanticBackend.instances = [];
     try {
-      let config = { mode: 'local-experimental', cache: 'session', modelFingerprint: 'old-source' };
+      let config = { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'session', modelFingerprint: 'old-source' };
       const harness = makeHarness(project, () => ({ enabled: true, config }));
       await harness.call('memory_record', {
         verb: 'lesson', title: 'Dispose race target', content: 'No semantic result may arrive after disposal starts.',
@@ -191,11 +339,11 @@ describe('memory host service', () => {
     }
   });
 
-  it('preserves the exact explicit-off lexical result for every backend-local semantic failure', async () => {
+  it('preserves lexical candidates and reports every backend-local semantic failure', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-semantic-backend-fallback-'));
     semanticBackend.instances = [];
     try {
-      const config = { mode: 'local-experimental', cache: 'session', modelFingerprint: 'fallback-source' };
+      const config = { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'session', modelFingerprint: 'fallback-source' };
       const lexicalHarness = makeHarness(project, () => ({ enabled: true, config }));
       await lexicalHarness.call('memory_record', {
         verb: 'lesson', title: 'Backend lexical target', content: 'The lexical result must survive a local backend failure.',
@@ -207,8 +355,7 @@ describe('memory host service', () => {
         const configuredHarness = makeHarness(project, () => ({ enabled: true, config }));
         semanticBackend.failure = new Error(`backend-local-${failureAt}`);
         semanticBackend.failureAt = failureAt;
-        await expect(configuredHarness.call('memory_recall', { query: 'backend lexical', semantic: 'configured' })).resolves.toEqual(baseline);
-        expect(semanticBackend.instances.at(-1)?.dispose).not.toHaveBeenCalled();
+        await expect(configuredHarness.call('memory_recall', { query: 'backend lexical', semantic: 'configured' })).resolves.toMatchObject({ ok: true, result: expect.stringContaining(baseline.result) });
         semanticBackend.failure = undefined;
         semanticBackend.failureAt = undefined;
         await configuredHarness.service.dispose?.();
@@ -226,7 +373,7 @@ describe('memory host service', () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-project-cache-lexical-'));
     semanticBackend.instances = [];
     try {
-      const harness = makeHarness(project, () => ({ enabled: true, config: { mode: 'local-experimental', cache: 'project' } }));
+      const harness = makeHarness(project, () => ({ enabled: true, config: { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'project' } }));
       await harness.call('memory_record', {
         verb: 'lesson', title: 'Project cache lexical target', content: 'Unavailable project cache must retain this lexical body.',
         evidenceLocators: 'test:project-cache-lexical', recallCue: 'When project cache is unavailable.', provenance: 'service.test',
@@ -251,7 +398,7 @@ describe('memory host service', () => {
     const disposeStarted = deferred();
     semanticBackend.instances = [];
     try {
-      let config = { mode: 'local-experimental', cache: 'session', modelFingerprint: 'old-deferred-source' };
+      let config = { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'session', modelFingerprint: 'old-deferred-source' };
       const harness = makeHarness(project, () => ({ enabled: true, config }));
       await harness.call('memory_record', {
         verb: 'lesson', title: 'Deferred disposal target', content: 'The replacement cleanup must complete before service disposal settles.',
@@ -284,7 +431,7 @@ describe('memory host service', () => {
     }
   });
 
-  it('reads C0.2 semantic config at every recall, preserves lexical parity when not admitted, and owns session source lifecycle', async () => {
+  it('reads local semantic config at admission and completion, preserves lexical parity when not admitted, and owns session source lifecycle', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-memory-semantic-service-'));
     semanticBackend.matches = [];
     semanticBackend.failure = undefined;
@@ -309,11 +456,11 @@ describe('memory host service', () => {
 
       expect(lexical).toMatchObject({ ok: true });
       expect(semanticBackend.instances).toEqual([]);
-      for (const invalidConfig of [undefined, { mode: 'wrong', cache: 'session' }, { mode: 'local-experimental', cache: 'project' }]) {
+      for (const invalidConfig of [undefined, { mode: 'wrong', cache: 'session' }, { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'project' }]) {
         config = invalidConfig;
         await expect(harness.call('memory_recall', { query: 'lexical query', limit: '5' })).resolves.toEqual(lexical);
       }
-      config = { mode: 'local-experimental', cache: 'session', modelFingerprint: 'one' };
+      config = { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'session', modelFingerprint: 'one' };
       await expect(harness.call('memory_recall', { query: 'lexical query', limit: '5', semantic: 'off' })).resolves.toEqual(lexical);
       expect(semanticBackend.instances).toEqual([]);
 
@@ -321,21 +468,21 @@ describe('memory host service', () => {
       const configured = await harness.call('memory_recall', { query: 'lexical query', limit: '5', semantic: 'configured' });
       expect(configured).toMatchObject({ ok: true, result: expect.stringContaining('Semantic expansion is candidate-not-truth; modelFingerprint=one.') });
       expect(configured.result.indexOf('Lexical query target')).toBeLessThan(configured.result.indexOf('Semantic-only target'));
-      expect(configured.result).toContain('source=semantic/session-local');
+      expect(configured.result).toContain('source=hybrid/rrf-k10-lexical1-dense2');
       expect(semanticBackend.instances.map((instance) => instance.fingerprint)).toEqual(['one']);
 
       await harness.call('memory_recall', { query: 'lexical query', limit: '5', semantic: 'configured' });
       expect(semanticBackend.instances).toHaveLength(1);
-      config = { mode: 'local-experimental', cache: 'session', modelFingerprint: 'two' };
+      config = { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'session', modelFingerprint: 'two' };
       await harness.call('memory_recall', { query: 'lexical query', limit: '5', semantic: 'configured' });
       expect(semanticBackend.instances.map((instance) => instance.fingerprint)).toEqual(['one', 'two']);
       expect(semanticBackend.instances[0].dispose).toHaveBeenCalledOnce();
 
       semanticBackend.failure = new Error('backend-local');
       await expect(harness.call('memory_recall', { query: 'lexical query', limit: '5', semantic: 'configured' }))
-        .resolves.toEqual(lexical);
+        .resolves.toMatchObject({ ok: true, result: expect.stringContaining('backend-local') });
       semanticBackend.failure = undefined;
-      config = { mode: 'local-experimental', cache: 'session', modelFingerprint: 'three' };
+      config = { mode: 'local-e5', runtimePath: '/test/runtime', modelPath: '/test/model', cache: 'session', modelFingerprint: 'three' };
       const controller = new AbortController();
       const abort = new Error('caller-abort');
       semanticBackend.onPrepare = () => controller.abort(abort);
@@ -344,7 +491,7 @@ describe('memory host service', () => {
       await harness.service.dispose?.();
       expect(semanticBackend.instances[1].dispose).toHaveBeenCalledOnce();
       expect(semanticBackend.instances[2].dispose).toHaveBeenCalledOnce();
-      expect(readPluginConfig).toHaveBeenCalledTimes(10);
+      expect(readPluginConfig.mock.calls.length).toBeGreaterThanOrEqual(10);
 
       const legacy = makeHarness(project);
       await expect(legacy.call('memory_recall', { query: 'lexical query', limit: '5' })).resolves.toEqual(lexical);

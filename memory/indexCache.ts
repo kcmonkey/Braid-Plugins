@@ -12,6 +12,8 @@ const MEMORY_REVISION_FILE = path.join('.braid', 'artifacts', 'memory-index.rev'
 
 export interface MemoryIndexSnapshot {
   token: string;
+  /** Present only when the index was built from this exact canonical snapshot. */
+  corpusRevision?: string;
   store: MemoryStore;
   index: MemoryRecallIndex;
   facets: MemoryFacetStats;
@@ -19,6 +21,7 @@ export interface MemoryIndexSnapshot {
 }
 
 type MemoryStoreLoader = () => Promise<MemoryStore>;
+type CanonicalMemoryLoader = () => Promise<{ store: MemoryStore; corpusRevision: string }>;
 type RevisionTokenProvider = (cwd: string) => string;
 
 export function memoryRevisionToken(cwd: string): string {
@@ -84,6 +87,22 @@ export class MemoryIndexCache {
     return promise;
   }
 
+  async getCanonical(cwd: string, load: CanonicalMemoryLoader): Promise<MemoryIndexSnapshot & { corpusRevision: string }> {
+    // Capture BEFORE the read. If B commits while A is read/indexed, publishing
+    // A may never attach B's token and fool a later ordinary lexical cache hit.
+    const token = this.tokenProvider(path.resolve(cwd || process.cwd()));
+    const canonical = await load();
+    const index = this.snapshot?.corpusRevision === canonical.corpusRevision
+      ? this.snapshot.index : createMemoryRecallIndex(canonical.store);
+    const snapshot = {
+      token, corpusRevision: canonical.corpusRevision,
+      store: { version: 1 as const, records: index.records }, index, facets: index.facets,
+      builtAt: index === this.snapshot?.index ? this.snapshot.builtAt : Date.now(),
+    };
+    this.snapshot = snapshot;
+    return snapshot;
+  }
+
   invalidate(): void {
     this.snapshot = undefined;
     this.inFlight = undefined;
@@ -95,7 +114,7 @@ export class MemoryIndexCache {
 const MAX_WORKSPACE_CACHES = 8;
 const workspaceCaches = new Map<string, MemoryIndexCache>();
 
-export function getMemoryIndexSnapshot(cwd: string, loadStore: MemoryStoreLoader): Promise<MemoryIndexSnapshot> {
+function memoryCacheForWorkspace(cwd: string): MemoryIndexCache {
   const workspace = path.resolve(cwd || process.cwd());
   let cache = workspaceCaches.get(workspace);
   if (!cache) {
@@ -107,7 +126,15 @@ export function getMemoryIndexSnapshot(cwd: string, loadStore: MemoryStoreLoader
       workspaceCaches.delete(oldest);
     }
   }
-  return cache.get(workspace, loadStore);
+  return cache;
+}
+
+export function getMemoryIndexSnapshot(cwd: string, loadStore: MemoryStoreLoader): Promise<MemoryIndexSnapshot> {
+  return memoryCacheForWorkspace(cwd).get(cwd, loadStore);
+}
+
+export function getCanonicalMemoryIndexSnapshot(cwd: string, load: CanonicalMemoryLoader): Promise<MemoryIndexSnapshot & { corpusRevision: string }> {
+  return memoryCacheForWorkspace(cwd).getCanonical(cwd, load);
 }
 
 export function resetMemoryIndexCachesForTest(): void {
