@@ -82,7 +82,7 @@ function makeHarness(project: string, artifactDefaults?: ArtifactGenerationDefau
   const call = (args: Record<string, unknown>, signal = new AbortController().signal): Promise<AgentToolResult> => {
     const tool = byName.get('model_generate');
     if (!tool) throw new Error('missing model_generate tool');
-    return tool.call({ canvasId: 'c1', boardId: 'b1', turnIndex: 3, provider: 'codex', signal }, args);
+    return tool.call({ canvasId: 'c1', boardId: 'b1', agentId: 'agent-b1', turnIndex: 3, provider: 'codex', signal }, args);
   };
   return { service, tools, call, ...host };
 }
@@ -420,18 +420,20 @@ describe('model artifacts host service', () => {
       const harness = makeHarness(project, { image: '', 'model-3d': fake.provider.providerId });
       const first = await harness.call({ requestId: 'reload-1', prompt: 'a reload-safe object' });
       expect(first.ok).toBe(true);
-      await harness.service.onBoardAbort?.({ canvasId: 'c1', boardId: 'b1', provider: 'codex' });
-      const releaseEvents = [...harness.aggregates.values()].flat().filter((event: any) => event.kind === 'model-generation-released');
-      expect(releaseEvents).toHaveLength(1);
-      expect(releaseEvents[0].payload).toMatchObject({
+      // Board abort is no longer an execution release. The current service stops watchers
+      // on dispose and keeps the exact-agent pending record so the same requestId resumes.
+      harness.service.dispose?.();
+      const pendingEvents = [...harness.aggregates.values()].flat().filter((event: any) => event.payload?.requestKey === 'reload-1' && event.payload?.status === 'pending');
+      expect(pendingEvents.length).toBeGreaterThan(0);
+      expect(pendingEvents.at(-1)?.payload).toMatchObject({
         requestKey: 'reload-1',
+        agentId: 'agent-b1',
         status: 'pending',
-        error: expect.stringContaining('resume'),
       });
 
       const recreated = modelArtifactsHostServicePlugin.create(harness.ctx);
       const tool = recreated.agentTools?.()[0] as AgentToolPlugin<Record<string, unknown>>;
-      const second = await tool.call({ canvasId: 'c1', boardId: 'b1', turnIndex: 3, provider: 'codex', signal: new AbortController().signal }, {
+      const second = await tool.call({ canvasId: 'c1', boardId: 'b1', agentId: 'agent-b1', turnIndex: 3, provider: 'codex', signal: new AbortController().signal }, {
         requestId: 'reload-1',
         prompt: 'a reload-safe object',
       });

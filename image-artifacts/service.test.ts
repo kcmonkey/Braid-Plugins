@@ -192,6 +192,8 @@ function makeHarness(project: string, artifactDefaults?: ArtifactGenerationDefau
     return tool.call({
       canvasId,
       boardId,
+      // Presentation is not execution identity. Distinct boards in these fixtures are distinct Agents.
+      agentId: `agent-${boardId}`,
       turnIndex: options.turnIndex ?? 2,
       provider: 'codex',
       signal,
@@ -581,7 +583,7 @@ describe('image artifacts host service', () => {
       expect(first.ok).toBe(true);
       const collision = await harness.callAs('c1', 'b2', { requestId: 'board-bound-image', prompt: 'another poster', confirmCost: true });
       expect(collision.ok).toBe(false);
-      expect(parse(collision).error).toContain('different Canvas/Board');
+      expect(parse(collision).error).toContain('another Agent');
       expect(fake.counts.generate).toBe(1);
       expect(harness.produceCalls).toHaveLength(1);
     } finally {
@@ -732,18 +734,21 @@ describe('image artifacts host service', () => {
     const artifactStore = ArtifactStore.forWorkspace(project);
     const pluginStateStore = PluginStateStore.forWorkspace(project);
     const aggregateId = imageGenerationAggregateId('real-store-compensation');
-    const originalRename = fs.promises.rename;
     let armed = false;
     let injected = false;
-    const renameSpy = vi.spyOn(fs.promises, 'rename').mockImplementation(async (from, to) => {
-      if (armed && !injected && String(to).endsWith(`${path.sep}${aggregateId}.json`)) {
+    // Terminal PluginStateStore appends are in-place SQLite writes. The old aggregate-file
+    // rename no longer runs after the pending record is migrated, so inject the one-shot
+    // terminal failure at the store boundary the settlement helper actually calls.
+    const originalAppend = pluginStateStore.appendEvents.bind(pluginStateStore);
+    pluginStateStore.appendEvents = async (pluginId, aggregateIdArg, events) => {
+      if (armed && !injected && aggregateIdArg === aggregateId) {
         injected = true;
-        const error = new Error('synthetic terminal PluginStateStore rename failure') as NodeJS.ErrnoException;
+        const error = new Error('synthetic terminal PluginStateStore append failure') as NodeJS.ErrnoException;
         error.code = 'EIO';
         throw error;
       }
-      return originalRename(from, to);
-    });
+      return originalAppend(pluginId, aggregateIdArg, events);
+    };
     const fake = registerFakeProvider({
       generate: () => {
         // Pending state has already been durably written before provider dispatch returns.
@@ -788,7 +793,6 @@ describe('image artifacts host service', () => {
       expect((await pluginStateStore.readAggregate('image-artifacts', aggregateId)).events).toHaveLength(4);
     } finally {
       fake.unregister();
-      renameSpy.mockRestore();
       fs.rmSync(project, { recursive: true, force: true });
     }
   });

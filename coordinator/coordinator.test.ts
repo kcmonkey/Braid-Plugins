@@ -27,6 +27,8 @@ function makeHarness(project: string, opts: {
   const agentIds = new Map(Object.entries(opts.agentIds ?? {}));
   const ctx = {
     cwd: () => project,
+    // Canvas ids are publication audience only. Claims still carry their own canvasId.
+    openCanvasIds: () => ['c1'],
     readSecret: async (pluginId: string, key: string) => ({ pluginId, key, stored: false }),
     writeSecret: async (pluginId: string, key: string) => ({ pluginId, key, stored: true }),
     clearSecret: async (pluginId: string, key: string) => ({ pluginId, key, cleared: true }),
@@ -50,7 +52,14 @@ function makeHarness(project: string, opts: {
     boardId: string,
     args: Record<string, unknown>,
     signal = new AbortController().signal,
-  ): Promise<AgentToolResult> => tool.call({ canvasId, boardId, turnIndex: 0, provider: 'claude', signal }, args);
+  ): Promise<AgentToolResult> => tool.call({
+    canvasId,
+    boardId,
+    agentId: agentIds.get(`${canvasId}::${boardId}`) ?? `agent-${boardId}`,
+    turnIndex: 0,
+    provider: 'claude',
+    signal,
+  }, args);
   return { call, delivered, states };
 }
 

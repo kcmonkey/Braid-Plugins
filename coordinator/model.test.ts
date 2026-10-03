@@ -17,6 +17,7 @@ import {
 
 const fileClaim = (over: Partial<FileClaim> = {}): FileClaim => ({
   id: 'claim-1',
+  agentId: 'agent-holder',
   canvasId: 'c1',
   boardId: 'holder',
   path: 'src/shared.ts',
@@ -28,7 +29,7 @@ const fileClaim = (over: Partial<FileClaim> = {}): FileClaim => ({
   ...over,
 });
 
-const writerReq = { canvasId: 'c1', boardId: 'writer', path: 'src/shared.ts', access: 'edit' as const, now: 1 };
+const writerReq = { agentId: 'agent-writer', canvasId: 'c1', boardId: 'writer', path: 'src/shared.ts', access: 'edit' as const, now: 1 };
 
 describe('coordination model — memory-footprint Phase 4 (markStaleClaims short-circuit / pruneRetiredCoordination)', () => {
   const neg = (id: string, status: NegotiationThread['status'], updatedAt: number): NegotiationThread => ({
@@ -76,12 +77,14 @@ describe('coordination model — memory-footprint Phase 4 (markStaleClaims short
 
 describe('coordination model — record-key formatting', () => {
   it('ownerKey builds a coordination-record key, never an execution selector', () => {
-    expect(ownerKey({ canvasId: 'c1', boardId: 'b7' })).toBe('c1::b7');
+    expect(ownerKey({ agentId: 'agent-b7' })).toBe('agent-b7');
+    expect(() => ownerKey({ agentId: '  ' })).toThrow(/exact Agent identity/);
   });
 });
 
 const resClaim = (over: Partial<ResourceClaim> = {}): ResourceClaim => ({
   id: 'res-1',
+  agentId: 'agent-holder',
   canvasId: 'c1',
   boardId: 'holder',
   resource: 'editor',
@@ -94,7 +97,7 @@ const resClaim = (over: Partial<ResourceClaim> = {}): ResourceClaim => ({
   ...over,
 });
 
-const resReq = { canvasId: 'c1', boardId: 'writer', resource: 'editor', mode: 'exclusive' as const, now: 1 };
+const resReq = { agentId: 'agent-writer', canvasId: 'c1', boardId: 'writer', resource: 'editor', mode: 'exclusive' as const, now: 1 };
 
 describe('coordination model — resource enforcement honors TTL', () => {
   it('within TTL an active resource claim blocks', () => {

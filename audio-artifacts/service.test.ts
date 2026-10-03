@@ -78,7 +78,7 @@ function makeHarness(project: string, artifactDefaults?: ArtifactGenerationDefau
   const call = (args: Record<string, unknown>, signal = new AbortController().signal, toolName = 'speech_generate'): Promise<AgentToolResult> => {
     const tool = byName.get(toolName);
     if (!tool) throw new Error(`missing ${toolName} tool`);
-    return tool.call({ canvasId: 'c1', boardId: 'b1', turnIndex: 6, provider: 'codex', signal }, args);
+    return tool.call({ canvasId: 'c1', boardId: 'b1', agentId: 'agent-b1', turnIndex: 6, provider: 'codex', signal }, args);
   };
   return { service, tools, call, ...host };
 }
